@@ -1,0 +1,32 @@
+# agyc — Ignorados
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv/
+
+# Credenciales (NUNCA subir tokens)
+**/antigravity-oauth-token
+**/accounts/*.json
+**/.gemini/
+
+# Backups locales
+*.tar.gz
+*.zip
+backup_*/
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Logs
+*.log

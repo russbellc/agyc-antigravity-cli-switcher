@@ -545,6 +545,8 @@ def prepare_isolated_home(alias: str) -> str:
     isolated_gemini = os.path.join(isolated_home, ".gemini", "antigravity-cli")
     os.makedirs(isolated_gemini, exist_ok=True)
 
+    shared_base = get_base_dir()
+
     # ── Enlazar .gemini/config para compartir servidores MCP globales (mcp_config.json) ──
     user_gemini_config = os.path.join(os.path.expanduser("~"), ".gemini", "config")
     iso_gemini_config = os.path.join(isolated_home, ".gemini", "config")

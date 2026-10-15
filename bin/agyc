@@ -545,7 +545,14 @@ def prepare_isolated_home(alias: str) -> str:
     isolated_gemini = os.path.join(isolated_home, ".gemini", "antigravity-cli")
     os.makedirs(isolated_gemini, exist_ok=True)
 
-    shared_base = get_base_dir()
+    # ── Enlazar .gemini/config para compartir servidores MCP globales (mcp_config.json) ──
+    user_gemini_config = os.path.join(os.path.expanduser("~"), ".gemini", "config")
+    iso_gemini_config = os.path.join(isolated_home, ".gemini", "config")
+    if os.path.exists(user_gemini_config) and not os.path.lexists(iso_gemini_config):
+        try:
+            os.symlink(user_gemini_config, iso_gemini_config)
+        except Exception:
+            pass
 
     # ── Token: copiar el token activo (ya switcha al alias) como archivo propio ──
     token_src = os.path.join(shared_base, "antigravity-oauth-token")

@@ -534,8 +534,9 @@ def prepare_isolated_home(alias: str) -> str:
     Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/.
     - El token de la cuenta queda blindado (copiado, no symlink) para no competir
       con otros paneles de herdr que usen cuentas distintas.
-    - settings.json, accounts/, projects/ y brain/ son symlinks al directorio
-      compartido ~/.gemini/antigravity-cli/ para no duplicar configuración.
+    - settings.json, accounts/, projects/, brain/, conversations/, annotations/
+      y las bases de datos de resúmenes son symlinks al directorio compartido
+      ~/.gemini/antigravity-cli/ para compartir contexto, sesiones e historial completo.
 
     Retorna la ruta del HOME aislado (ej. /home/aidev/.agyc_homes/agy02).
     """
@@ -551,20 +552,66 @@ def prepare_isolated_home(alias: str) -> str:
     token_dst = os.path.join(isolated_gemini, "antigravity-oauth-token")
     if os.path.exists(token_src):
         shutil.copy2(token_src, token_dst)
-        os.chmod(token_dst, 0o600)
+        try:
+            os.chmod(token_dst, 0o600)
+        except Exception:
+            pass
 
-    # ── Symlinks a recursos compartidos (se crean solo si no existen ya) ──
-    shared_links = {
-        "settings.json": os.path.join(shared_base, "settings.json"),
-        "accounts":      os.path.join(shared_base, "accounts"),
-        "projects":      os.path.join(shared_base, "projects"),
-        "brain":         os.path.join(shared_base, "brain"),
-    }
-    for name, target in shared_links.items():
-        link = os.path.join(isolated_gemini, name)
-        if not os.path.lexists(link):
-            if os.path.exists(target):
-                os.symlink(target, link)
+    # ── Recursos compartidos para unificar conversaciones, contexto y settings ──
+    shared_items = [
+        "settings.json",
+        "accounts",
+        "projects",
+        "brain",
+        "conversations",
+        "conversation_summaries.db",
+        "conversation_summaries.db-wal",
+        "conversation_summaries.db-shm",
+        "annotations",
+        "history.jsonl",
+        "installation_id",
+        "jetbox_summaries_proto.pb",
+        "jetski_state.pbtxt",
+        "skills",
+        "builtin",
+    ]
+
+    for item in shared_items:
+        target = os.path.join(shared_base, item)
+        link = os.path.join(isolated_gemini, item)
+        if not os.path.exists(target):
+            continue
+
+        # Si ya es un symlink apuntando al target correcto, no tocar
+        if os.path.islink(link):
+            try:
+                if os.readlink(link) == target:
+                    continue
+                os.unlink(link)
+            except Exception:
+                pass
+
+        # Si es un directorio local vacío, eliminarlo para poner el symlink
+        if os.path.isdir(link) and not os.path.islink(link):
+            if not os.listdir(link):
+                try:
+                    os.rmdir(link)
+                except Exception:
+                    continue
+            else:
+                continue
+
+        # Si es un archivo local redundante (ej. settings o db vacía), reemplazarlo
+        if os.path.isfile(link) and not os.path.islink(link):
+            try:
+                os.remove(link)
+            except Exception:
+                continue
+
+        try:
+            os.symlink(target, link)
+        except Exception:
+            pass
 
     return isolated_home
 

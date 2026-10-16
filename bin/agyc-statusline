@@ -16,6 +16,9 @@ import time
 import select
 import subprocess
 import urllib.request
+import urllib.parse
+import urllib.error
+import base64
 from datetime import datetime, timezone, timedelta
 
 # ANSI Colors
@@ -31,6 +34,13 @@ C_RED     = "\033[38;5;196m"   # Bright red
 C_MAGENTA = "\033[38;5;177m"   # Light purple/magenta
 C_PURPLE  = "\033[38;5;147m"   # Soft lavender/purple for models
 C_GRAY    = "\033[38;5;244m"   # Muted gray
+
+# OAuth credentials for token refresh (same as in agyc)
+GOOGLE_CLIENT_ID     = "moc.tnetnocresuelgoog.sppa.pe304g4hjolotv532ercl12h2nisshmt-1950606001701"[::-1]
+GOOGLE_CLIENT_SECRET = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG"[::-1]
+
+# Real home directory (not the agy-isolated one)
+REAL_HOME = "/home/aidev"
 
 def make_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
     """Generates a colored text progress linebar."""
@@ -93,21 +103,26 @@ def format_countdown(reset_iso: str | None) -> str:
         return "5h"
 
 def detect_active_account() -> str:
+    """Detect the active agyc account alias.
+    
+    When running inside agy, HOME=/home/aidev/.agyc_homes/agy02.
+    We also check ANTIGRAVITY_APP_DATA_DIR which contains the alias.
+    """
     # 1. Check HOME path (e.g., /home/aidev/.agyc_homes/agy02)
     home = os.environ.get("HOME", "")
     m = re.search(r"agy\d+", home)
     if m:
         return m.group(0)
     
-    # 2. Check ANTIGRAVITY_APP_DATA_DIR
+    # 2. Check ANTIGRAVITY_APP_DATA_DIR (e.g., /home/aidev/.agyc_homes/agy02/.gemini/...)
     app_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
     m = re.search(r"agy\d+", app_dir)
     if m:
         return m.group(0)
         
-    # 3. Check config.json in accounts
+    # 3. Check config.json in REAL_HOME accounts (not the isolated home)
     config_paths = [
-        os.path.expanduser("~/.gemini/antigravity-cli/accounts/config.json"),
+        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/config.json",
         "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
         "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/config.json",
     ]
@@ -149,64 +164,108 @@ def get_git_branch() -> str | None:
         pass
     return None
 
-def do_fetch_and_save_quota(alias: str) -> dict | None:
-    """Synchronously queries Google CloudCode PA API and saves cache."""
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
-    now_ts = time.time()
-    
+def get_account_file_path(alias: str) -> str | None:
+    """Returns the path to the account JSON file, searching REAL_HOME first."""
     acc_paths = [
-        os.path.expanduser(f"~/.gemini/antigravity-cli/accounts/{alias}.json"),
+        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json",
         f"/home/aidev/.gemini/antigravity-cli/accounts/{alias}.json",
         f"/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/{alias}.json",
     ]
-    acc_data = None
     for ap in acc_paths:
         if os.path.exists(ap):
-            try:
-                with open(ap, "r") as f:
-                    acc_data = json.load(f)
-                    break
-            except Exception:
-                pass
+            return ap
+    return None
+
+def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
+    """Refresh OAuth access token if expired or expiring within 5 minutes."""
+    token_obj = token_data.get("token", {})
+    refresh_token = token_obj.get("refresh_token")
+    expiry_str = token_obj.get("expiry")
+    needs_refresh = False
+
+    if not token_obj.get("access_token") or not expiry_str:
+        needs_refresh = True
+    else:
+        try:
+            if expiry_str.endswith("Z"):
+                expiry_str_fixed = expiry_str[:-1] + "+00:00"
+            else:
+                expiry_str_fixed = expiry_str
+            exp_dt = datetime.fromisoformat(expiry_str_fixed)
+            if (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300:
+                needs_refresh = True
+        except Exception:
+            needs_refresh = True
+
+    if not needs_refresh:
+        return token_data, False
+
+    if not refresh_token:
+        return token_data, False
+
+    payload = urllib.parse.urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://oauth2.googleapis.com/token",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        token_obj["access_token"] = res["access_token"]
+        if "refresh_token" in res:
+            token_obj["refresh_token"] = res["refresh_token"]
+        expires_in = res.get("expires_in", 3600)
+        token_obj["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+        token_data["token"] = token_obj
+        return token_data, True
+    except Exception:
+        return token_data, False
+
+def do_fetch_and_save_quota(alias: str) -> dict | None:
+    """Synchronously queries Google CloudCode PA API and saves cache.
+    
+    IMPORTANT: Account file is always read from REAL_HOME (/home/aidev),
+    not from the agy-isolated home, because that's where agyc stores tokens.
+    """
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    now_ts = time.time()
+    
+    acc_path = get_account_file_path(alias)
+    if not acc_path:
+        return None
+
+    try:
+        with open(acc_path, "r") as f:
+            acc_data = json.load(f)
+    except Exception:
+        return None
                 
     if not acc_data:
         return None
 
     fallback_quota = acc_data.get("quota", {})
-    token = acc_data.get("token_data", {}).get("token", {}).get("access_token")
+    token_data = acc_data.get("token_data", {})
+    
+    # Refresh token if needed before calling API
+    token_data, refreshed = refresh_token_if_needed(token_data)
+    if refreshed:
+        # Persist the refreshed token back to the file
+        try:
+            acc_data["token_data"] = token_data
+            with open(acc_path, "w") as f:
+                json.dump(acc_data, f, indent=2)
+        except Exception:
+            pass
+    
+    token = token_data.get("token", {}).get("access_token")
     if not token:
-        return fallback_quota
-
-    try:
-        req = urllib.request.Request(
-            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-            data=b"{}",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-                "User-Agent": "antigravity/1.2.11 linux/amd64"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            
-        metrics = {
-            "gemini_5h_fraction": 1.0,
-            "gemini_5h_reset": None,
-            "cached_at": now_ts
-        }
-        for grp in data.get("groups", []):
-            if "gemini" in grp.get("displayName", "").lower():
-                for b in grp.get("buckets", []):
-                    b_id = b.get("bucketId", "").lower()
-                    if "5h" in b_id or b.get("window", "").lower() == "5h":
-                        metrics["gemini_5h_fraction"] = b.get("remainingFraction", 1.0)
-                        metrics["gemini_5h_reset"] = b.get("resetTime")
-                        
-        with open(cache_file, "w") as f:
-            json.dump(metrics, f)
-        return metrics
-    except Exception:
         if fallback_quota:
             res = {
                 "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
@@ -221,8 +280,79 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             return res
         return None
 
+    endpoints = [
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    ]
+    
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/1.2.11 linux/amd64"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                
+            metrics = {
+                "gemini_5h_fraction": 1.0,
+                "gemini_5h_reset": None,
+                "cached_at": now_ts
+            }
+            for grp in data.get("groups", []):
+                grp_name = grp.get("displayName", "").lower()
+                if "gemini" in grp_name:
+                    for b in grp.get("buckets", []):
+                        b_id = b.get("bucketId", "").lower()
+                        b_window = b.get("window", "").lower()
+                        if "5h" in b_id or b_window == "5h":
+                            metrics["gemini_5h_fraction"] = b.get("remainingFraction", 1.0)
+                            metrics["gemini_5h_reset"] = b.get("resetTime")
+                            break
+                    break
+                    
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(metrics, f)
+            except Exception:
+                pass
+            return metrics
+
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                break  # Token invalid, don't retry different endpoint
+            continue
+        except Exception:
+            continue
+    
+    # All endpoints failed - use fallback
+    if fallback_quota:
+        res = {
+            "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
+            "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
+            "cached_at": now_ts
+        }
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(res, f)
+        except Exception:
+            pass
+        return res
+    return None
+
 def fetch_online_quota(alias: str) -> dict | None:
-    """Fetches quota using stale-while-revalidate pattern to avoid blocking the statusline."""
+    """Fetches quota using tiered stale-while-revalidate pattern.
+    
+    TTL tiers:
+    - < 60s  : use cache as-is (very fresh)
+    - 60s-5m : use cache + background refresh
+    - > 5m   : synchronous fetch (discard stale cache)
+    """
     cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
     now_ts = time.time()
     cached = None
@@ -234,24 +364,30 @@ def fetch_online_quota(alias: str) -> dict | None:
         except Exception:
             pass
 
-    # If cache is valid and fresh (< 60s), return immediately
-    if cached and (now_ts - cached.get("cached_at", 0) < 60):
+    cache_age = now_ts - cached.get("cached_at", 0) if cached else float("inf")
+
+    # TIER 1: Cache is very fresh (< 60s) — return immediately
+    if cached and cache_age < 60:
         return cached
 
-    # If cache exists but is older than 60s, return old cache and refresh in background!
-    if cached:
+    # TIER 2: Cache is stale (60s–5min) — return old + refresh in background
+    if cached and cache_age < 300:
         try:
+            # Pass REAL_HOME so the subprocess finds account files correctly
+            env = os.environ.copy()
+            env["HOME"] = REAL_HOME
             subprocess.Popen(
                 [sys.executable, __file__, "--refresh-quota-bg", alias],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=True
+                start_new_session=True,
+                env=env
             )
         except Exception:
             pass
         return cached
 
-    # If no cache exists, do a quick fetch
+    # TIER 3: Cache is very stale (> 5min) or non-existent — synchronous fetch
     return do_fetch_and_save_quota(alias)
 
 def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
@@ -296,12 +432,13 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
 
     # 3. Check settings.json
     if not model_name:
+        # ANTIGRAVITY_APP_DATA_DIR is set correctly even inside agy
+        app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
         candidate_paths = [
-            os.path.expanduser(f"~/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json"),
+            os.path.join(app_data, "settings.json") if app_data else "",
+            f"{REAL_HOME}/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json",
             f"/home/aidev/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json",
-            os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "") + "/settings.json" if os.environ.get("ANTIGRAVITY_APP_DATA_DIR") else "",
-            os.path.expanduser("~/.gemini/antigravity-cli/settings.json"),
-            "/home/aidev/.gemini/antigravity-cli/settings.json",
+            f"{REAL_HOME}/.gemini/antigravity-cli/settings.json",
         ]
         for cp in candidate_paths:
             if cp and os.path.exists(cp):
@@ -346,7 +483,12 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     return f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
 
 def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
-    """Returns (fraction, estimated_tokens, max_tokens)."""
+    """Returns (fraction, estimated_tokens, max_tokens).
+    
+    Uses ANTIGRAVITY_APP_DATA_DIR + ANTIGRAVITY_CONVERSATION_ID env vars
+    (both injected by agy into subprocess environment) to locate the transcript.
+    Uses transcript_full.jsonl when available (larger/more accurate).
+    """
     max_tokens = 1_000_000
     
     # Check if stdin_data has context data
@@ -361,38 +503,55 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
         except Exception:
             pass
 
-    # Fallback: estimate from active conversation transcript
-    base_dirs = [
-        os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
-        os.path.expanduser("~/.gemini/antigravity-cli"),
-        "/home/aidev/.gemini/antigravity-cli",
-    ]
+    # Use env vars directly — agy injects these into subprocess environment
+    app_data_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
     conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+
     transcript_path = None
 
-    for bd in base_dirs:
-        if not bd: continue
-        brain_dir = os.path.join(bd, "brain")
-        if not os.path.exists(brain_dir): continue
-        
-        if conv_id:
-            cand = os.path.join(brain_dir, conv_id, ".system_generated", "logs", "transcript.jsonl")
+    if app_data_dir and conv_id:
+        # Primary path using injected env vars
+        log_dir = os.path.join(app_data_dir, "brain", conv_id, ".system_generated", "logs")
+        # Prefer transcript_full.jsonl (more complete, larger = more accurate estimate)
+        for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+            cand = os.path.join(log_dir, fname)
             if os.path.exists(cand):
                 transcript_path = cand
                 break
-        else:
-            # Find most recently modified conversation
+
+    if not transcript_path and app_data_dir:
+        # Fallback: find most recently modified conversation in the brain dir
+        brain_dir = os.path.join(app_data_dir, "brain")
+        if os.path.isdir(brain_dir):
             try:
                 entries = [os.path.join(brain_dir, d) for d in os.listdir(brain_dir)]
                 entries = [e for e in entries if os.path.isdir(e)]
                 if entries:
                     latest = max(entries, key=os.path.getmtime)
-                    cand = os.path.join(latest, ".system_generated", "logs", "transcript.jsonl")
+                    log_dir = os.path.join(latest, ".system_generated", "logs")
+                    for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                        cand = os.path.join(log_dir, fname)
+                        if os.path.exists(cand):
+                            transcript_path = cand
+                            break
+            except Exception:
+                pass
+
+    if not transcript_path:
+        # Last resort: search known agyc homes
+        for agy_home in [f"{REAL_HOME}/.agyc_homes/agy01", f"{REAL_HOME}/.agyc_homes/agy02", f"{REAL_HOME}/.agyc_homes/agy03"]:
+            brain_dir = os.path.join(agy_home, ".gemini", "antigravity-cli", "brain")
+            if not os.path.isdir(brain_dir):
+                continue
+            if conv_id:
+                log_dir = os.path.join(brain_dir, conv_id, ".system_generated", "logs")
+                for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                    cand = os.path.join(log_dir, fname)
                     if os.path.exists(cand):
                         transcript_path = cand
                         break
-            except Exception:
-                pass
+            if transcript_path:
+                break
 
     if transcript_path and os.path.exists(transcript_path):
         size_bytes = os.path.getsize(transcript_path)
@@ -401,7 +560,8 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
         fraction = min(1.0, estimated_tokens / float(max_tokens))
         return (fraction, estimated_tokens, max_tokens)
 
-    return (0.15, 150_000, max_tokens)
+    # If nothing found — return 0 to show "unknown" rather than misleading 15%
+    return (0.0, 0, max_tokens)
 
 def main():
     # Read stdin non-blocking once if available
@@ -464,6 +624,8 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--refresh-quota-bg":
         alias = sys.argv[2]
+        # When running in background, ensure HOME points to real home for token lookup
+        os.environ["HOME"] = REAL_HOME
         do_fetch_and_save_quota(alias)
         sys.exit(0)
     main()

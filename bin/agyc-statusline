@@ -265,19 +265,29 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             pass
     
     token = token_data.get("token", {}).get("access_token")
+    fallback_res = {
+        "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
+        "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
+        "gemini_weekly_fraction": fallback_quota.get("gemini_weekly_fraction", 1.0),
+        "gemini_weekly_reset": fallback_quota.get("gemini_weekly_reset"),
+        "claude_5h_fraction": fallback_quota.get("claude_5h_fraction", 1.0),
+        "claude_5h_reset": fallback_quota.get("claude_5h_reset"),
+        "claude_weekly_fraction": fallback_quota.get("claude_weekly_fraction", 1.0),
+        "claude_weekly_reset": fallback_quota.get("claude_weekly_reset"),
+        "claude_disabled": False,
+        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction", 1.0),
+        "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
+        "cached_at": now_ts
+    }
+
     if not token:
         if fallback_quota:
-            res = {
-                "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
-                "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
-                "cached_at": now_ts
-            }
             try:
                 with open(cache_file, "w") as f:
-                    json.dump(res, f)
+                    json.dump(fallback_res, f)
             except Exception:
                 pass
-            return res
+            return fallback_res
         return None
 
     endpoints = [
@@ -302,20 +312,60 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             metrics = {
                 "gemini_5h_fraction": 1.0,
                 "gemini_5h_reset": None,
+                "gemini_weekly_fraction": 1.0,
+                "gemini_weekly_reset": None,
+                "claude_5h_fraction": 1.0,
+                "claude_5h_reset": None,
+                "claude_weekly_fraction": 1.0,
+                "claude_weekly_reset": None,
+                "claude_disabled": False,
+                "argon_weekly_fraction": 1.0,
+                "argon_weekly_reset": None,
                 "cached_at": now_ts
             }
             for grp in data.get("groups", []):
                 grp_name = grp.get("displayName", "").lower()
-                if "gemini" in grp_name:
-                    for b in grp.get("buckets", []):
+                buckets = grp.get("buckets", [])
+                
+                # Gemini Models
+                if "gemini" in grp_name and "argon" not in grp_name:
+                    for b in buckets:
                         b_id = b.get("bucketId", "").lower()
-                        b_window = b.get("window", "").lower()
-                        if "5h" in b_id or b_window == "5h":
-                            metrics["gemini_5h_fraction"] = b.get("remainingFraction", 1.0)
-                            metrics["gemini_5h_reset"] = b.get("resetTime")
-                            break
-                    break
-                    
+                        b_win = b.get("window", "").lower()
+                        frac = b.get("remainingFraction", 1.0)
+                        reset_t = b.get("resetTime")
+                        if "5h" in b_id or b_win == "5h":
+                            metrics["gemini_5h_fraction"] = frac
+                            metrics["gemini_5h_reset"] = reset_t
+                        elif "weekly" in b_id or b_win == "weekly":
+                            metrics["gemini_weekly_fraction"] = frac
+                            metrics["gemini_weekly_reset"] = reset_t
+
+                # Claude and GPT Models
+                elif any(k in grp_name for k in ("claude", "gpt", "3p")):
+                    for b in buckets:
+                        b_id = b.get("bucketId", "").lower()
+                        b_win = b.get("window", "").lower()
+                        frac = b.get("remainingFraction", 1.0)
+                        reset_t = b.get("resetTime")
+                        dis = b.get("disabled", False)
+                        if "5h" in b_id or b_win == "5h":
+                            metrics["claude_5h_fraction"] = frac
+                            metrics["claude_5h_reset"] = reset_t
+                            if dis:
+                                metrics["claude_disabled"] = True
+                        elif "weekly" in b_id or b_win == "weekly":
+                            metrics["claude_weekly_fraction"] = frac
+                            metrics["claude_weekly_reset"] = reset_t
+                            if frac == 0 or dis:
+                                metrics["claude_disabled"] = True
+
+                # Argon Models
+                elif "argon" in grp_name:
+                    for b in buckets:
+                        metrics["argon_weekly_fraction"] = b.get("remainingFraction", 1.0)
+                        metrics["argon_weekly_reset"] = b.get("resetTime")
+                        
             try:
                 with open(cache_file, "w") as f:
                     json.dump(metrics, f)
@@ -332,17 +382,12 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     
     # All endpoints failed - use fallback
     if fallback_quota:
-        res = {
-            "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
-            "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
-            "cached_at": now_ts
-        }
         try:
             with open(cache_file, "w") as f:
-                json.dump(res, f)
+                json.dump(fallback_res, f)
         except Exception:
             pass
-        return res
+        return fallback_res
     return None
 
 def fetch_online_quota(alias: str) -> dict | None:
@@ -480,16 +525,58 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     else:
         effort_color = C_DIM
 
-    return f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
+    badge = f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
+    return badge, model_name, effort_lower
 
-def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
+def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, str]:
+    """Returns (fraction, reset_time_iso, label) based on active model family."""
+    if not quota:
+        return 1.0, None, "5H"
+
+    m = (model_name or "").lower()
+    
+    # 1. Claude & GPT Models
+    if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
+        frac = quota.get("claude_5h_fraction")
+        if frac is None:
+            frac = 1.0
+        reset_t = quota.get("claude_5h_reset")
+        weekly_frac = quota.get("claude_weekly_fraction", 1.0)
+        is_disabled = quota.get("claude_disabled", False)
+        
+        # If weekly limit is 0 or disabled, quota is locked
+        if weekly_frac == 0 or is_disabled:
+            reset_t = quota.get("claude_weekly_reset") or reset_t
+            frac = 0.0
+            return frac, reset_t, "5H (Claude)"
+        return frac, reset_t, "5H (Claude)"
+
+    # 2. Gemini 4 Argon Models
+    elif "argon" in m:
+        frac = quota.get("argon_weekly_fraction", 1.0)
+        reset_t = quota.get("argon_weekly_reset")
+        return frac, reset_t, "Sem (Argon)"
+
+    # 3. Standard Gemini Models (Flash, Pro)
+    else:
+        frac = quota.get("gemini_5h_fraction", 1.0)
+        reset_t = quota.get("gemini_5h_reset")
+        return frac, reset_t, "5H"
+
+def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[float, int, int]:
     """Returns (fraction, estimated_tokens, max_tokens).
     
-    Uses ANTIGRAVITY_APP_DATA_DIR + ANTIGRAVITY_CONVERSATION_ID env vars
-    (both injected by agy into subprocess environment) to locate the transcript.
-    Uses transcript_full.jsonl when available (larger/more accurate).
+    Adapts max_tokens based on active model:
+    - Claude / GPT models: 200,000 tokens
+    - Gemini models: 1,000,000 tokens
+    Uses ANTIGRAVITY_APP_DATA_DIR + ANTIGRAVITY_CONVERSATION_ID env vars.
+    Prefers transcript.jsonl (compact prompt tokens).
     """
-    max_tokens = 1_000_000
+    m = (model_name or "").lower()
+    if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
+        max_tokens = 200_000
+    else:
+        max_tokens = 1_000_000
     
     # Check if stdin_data has context data
     if stdin_data:
@@ -510,17 +597,14 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
     transcript_path = None
 
     if app_data_dir and conv_id:
-        # Primary path using injected env vars
         log_dir = os.path.join(app_data_dir, "brain", conv_id, ".system_generated", "logs")
-        # Prefer transcript_full.jsonl (more complete, larger = more accurate estimate)
-        for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
             cand = os.path.join(log_dir, fname)
             if os.path.exists(cand):
                 transcript_path = cand
                 break
 
     if not transcript_path and app_data_dir:
-        # Fallback: find most recently modified conversation in the brain dir
         brain_dir = os.path.join(app_data_dir, "brain")
         if os.path.isdir(brain_dir):
             try:
@@ -529,7 +613,7 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
                 if entries:
                     latest = max(entries, key=os.path.getmtime)
                     log_dir = os.path.join(latest, ".system_generated", "logs")
-                    for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                    for fname in ("transcript.jsonl", "transcript_full.jsonl"):
                         cand = os.path.join(log_dir, fname)
                         if os.path.exists(cand):
                             transcript_path = cand
@@ -538,14 +622,13 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
                 pass
 
     if not transcript_path:
-        # Last resort: search known agyc homes
         for agy_home in [f"{REAL_HOME}/.agyc_homes/agy01", f"{REAL_HOME}/.agyc_homes/agy02", f"{REAL_HOME}/.agyc_homes/agy03"]:
             brain_dir = os.path.join(agy_home, ".gemini", "antigravity-cli", "brain")
             if not os.path.isdir(brain_dir):
                 continue
             if conv_id:
                 log_dir = os.path.join(brain_dir, conv_id, ".system_generated", "logs")
-                for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                for fname in ("transcript.jsonl", "transcript_full.jsonl"):
                     cand = os.path.join(log_dir, fname)
                     if os.path.exists(cand):
                         transcript_path = cand
@@ -560,7 +643,6 @@ def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
         fraction = min(1.0, estimated_tokens / float(max_tokens))
         return (fraction, estimated_tokens, max_tokens)
 
-    # If nothing found — return 0 to show "unknown" rather than misleading 15%
     return (0.0, 0, max_tokens)
 
 def main():
@@ -584,23 +666,18 @@ def main():
     branch_badge = f"{C_BOLD}{C_GREEN}🌿 {branch}{C_RESET}" if branch else None
 
     # 3. Model & Effort (placed before 5h quota)
-    model_badge = get_model_and_effort(stdin_data, account)
+    model_badge, model_name, effort = get_model_and_effort(stdin_data, account)
 
-    # 4. 5-Hour Quota
+    # 4. 5-Hour Quota (dynamically matching active model)
     quota = fetch_online_quota(account)
-    if quota:
-        q_frac = quota.get("gemini_5h_fraction")
-        if q_frac is None:
-            q_frac = 1.0
-        q_percent = int(round(q_frac * 100))
-        q_bar = make_linebar(q_frac, length=8)
-        q_countdown = format_countdown(quota.get("gemini_5h_reset"))
-        quota_badge = f"{C_YELLOW}5H:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
-    else:
-        quota_badge = f"{C_YELLOW}5H:{C_RESET} [████████] 100% (⏳ 5h)"
+    q_frac, q_reset, q_label = get_quota_for_model(quota, model_name)
+    q_percent = int(round(q_frac * 100))
+    q_bar = make_linebar(q_frac, length=8)
+    q_countdown = format_countdown(q_reset)
+    quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
 
-    # 5. Context Usage
-    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data)
+    # 5. Context Usage (adjusted for model max context window)
+    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name)
     ctx_percent = int(round(ctx_frac * 100))
     ctx_bar = make_context_linebar(ctx_frac, length=8)
     tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)

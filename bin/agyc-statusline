@@ -563,14 +563,60 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
         reset_t = quota.get("gemini_5h_reset")
         return frac, reset_t, "5H"
 
+def find_active_transcript(conv_id: str | None = None) -> str | None:
+    """Finds the active conversation transcript file across all known homes and brain dirs."""
+    candidate_bases = [
+        os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
+        os.path.expanduser("~/.gemini/antigravity-cli"),
+        f"{REAL_HOME}/.gemini/antigravity-cli",
+        f"{REAL_HOME}/.agyc_homes/agy01/.gemini/antigravity-cli",
+        f"{REAL_HOME}/.agyc_homes/agy02/.gemini/antigravity-cli",
+        f"{REAL_HOME}/.agyc_homes/agy03/.gemini/antigravity-cli",
+    ]
+    
+    # 1. If explicit conv_id is provided, try that first
+    if conv_id:
+        for base in candidate_bases:
+            if not base or not os.path.isdir(base):
+                continue
+            log_dir = os.path.join(base, "brain", conv_id, ".system_generated", "logs")
+            for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+                cand = os.path.join(log_dir, fname)
+                if os.path.isfile(cand):
+                    return cand
+
+    # 2. Otherwise, find newest transcript.jsonl across all brain directories
+    seen = set()
+    candidates = []
+    for base in candidate_bases:
+        if not base or not os.path.isdir(base):
+            continue
+        brain_dir = os.path.join(base, "brain")
+        if not os.path.isdir(brain_dir):
+            continue
+        real_brain = os.path.realpath(brain_dir)
+        if real_brain in seen:
+            continue
+        seen.add(real_brain)
+        try:
+            for d in os.listdir(real_brain):
+                t = os.path.join(real_brain, d, ".system_generated", "logs", "transcript.jsonl")
+                if os.path.isfile(t):
+                    candidates.append((os.path.getmtime(t), t))
+        except Exception:
+            pass
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+    return None
+
 def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[float, int, int]:
     """Returns (fraction, estimated_tokens, max_tokens).
     
     Adapts max_tokens based on active model:
     - Claude / GPT models: 200,000 tokens
     - Gemini models: 1,000,000 tokens
-    Uses ANTIGRAVITY_APP_DATA_DIR + ANTIGRAVITY_CONVERSATION_ID env vars.
-    Prefers transcript.jsonl (compact prompt tokens).
     """
     m = (model_name or "").lower()
     if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
@@ -590,51 +636,8 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
         except Exception:
             pass
 
-    # Use env vars directly — agy injects these into subprocess environment
-    app_data_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
     conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-
-    transcript_path = None
-
-    if app_data_dir and conv_id:
-        log_dir = os.path.join(app_data_dir, "brain", conv_id, ".system_generated", "logs")
-        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-            cand = os.path.join(log_dir, fname)
-            if os.path.exists(cand):
-                transcript_path = cand
-                break
-
-    if not transcript_path and app_data_dir:
-        brain_dir = os.path.join(app_data_dir, "brain")
-        if os.path.isdir(brain_dir):
-            try:
-                entries = [os.path.join(brain_dir, d) for d in os.listdir(brain_dir)]
-                entries = [e for e in entries if os.path.isdir(e)]
-                if entries:
-                    latest = max(entries, key=os.path.getmtime)
-                    log_dir = os.path.join(latest, ".system_generated", "logs")
-                    for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-                        cand = os.path.join(log_dir, fname)
-                        if os.path.exists(cand):
-                            transcript_path = cand
-                            break
-            except Exception:
-                pass
-
-    if not transcript_path:
-        for agy_home in [f"{REAL_HOME}/.agyc_homes/agy01", f"{REAL_HOME}/.agyc_homes/agy02", f"{REAL_HOME}/.agyc_homes/agy03"]:
-            brain_dir = os.path.join(agy_home, ".gemini", "antigravity-cli", "brain")
-            if not os.path.isdir(brain_dir):
-                continue
-            if conv_id:
-                log_dir = os.path.join(brain_dir, conv_id, ".system_generated", "logs")
-                for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-                    cand = os.path.join(log_dir, fname)
-                    if os.path.exists(cand):
-                        transcript_path = cand
-                        break
-            if transcript_path:
-                break
+    transcript_path = find_active_transcript(conv_id)
 
     if transcript_path and os.path.exists(transcript_path):
         size_bytes = os.path.getsize(transcript_path)
@@ -674,7 +677,11 @@ def main():
     q_percent = int(round(q_frac * 100))
     q_bar = make_linebar(q_frac, length=8)
     q_countdown = format_countdown(q_reset)
-    quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
+
+    if q_percent >= 100:
+        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(Disponible){C_RESET}"
+    else:
+        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
 
     # 5. Context Usage (adjusted for model max context window)
     ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name)

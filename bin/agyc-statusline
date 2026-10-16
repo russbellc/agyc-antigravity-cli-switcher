@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""
+agyc-statusline: Custom Status Line Generator for Antigravity CLI (agy).
+Renders:
+  - Active agyc profile (agy01, agy02, agy03)
+  - Current git branch (with clean/dirty indicator)
+  - 5-Hour Gemini Quota (Online live remaining fraction, linebar, countdown to reset)
+  - Session Context Consumption (% used, linebar, token estimate)
+"""
+
+import sys
+import os
+import re
+import json
+import time
+import select
+import subprocess
+import urllib.request
+from datetime import datetime, timezone, timedelta
+
+# ANSI Colors
+C_RESET   = "\033[0m"
+C_BOLD    = "\033[1m"
+C_DIM     = "\033[2m"
+C_GREEN   = "\033[38;5;48m"    # Bright green
+C_CYAN    = "\033[38;5;51m"    # Electric cyan
+C_BLUE    = "\033[38;5;75m"    # Soft blue
+C_YELLOW  = "\033[38;5;220m"   # Gold/Yellow
+C_ORANGE  = "\033[38;5;208m"   # Orange
+C_RED     = "\033[38;5;196m"   # Bright red
+C_MAGENTA = "\033[38;5;177m"   # Light purple/magenta
+C_GRAY    = "\033[38;5;244m"   # Muted gray
+
+def make_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
+    """Generates a colored text progress linebar."""
+    if fraction is None:
+        fraction = 1.0
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled_len = int(round(fraction * length))
+    empty_len = length - filled_len
+    
+    # Color coding based on fraction remaining
+    if fraction >= 0.50:
+        bar_color = C_GREEN
+    elif fraction >= 0.20:
+        bar_color = C_YELLOW
+    else:
+        bar_color = C_RED
+        
+    bar = f"{bar_color}{fill_char * filled_len}{C_GRAY}{empty_char * empty_len}{C_RESET}"
+    return f"[{bar}]"
+
+def make_context_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
+    """Generates a colored text progress linebar for context usage (inverse color coding)."""
+    if fraction is None:
+        fraction = 0.0
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled_len = int(round(fraction * length))
+    empty_len = length - filled_len
+    
+    # Inverted color coding: low usage is green, high usage is red
+    if fraction < 0.50:
+        bar_color = C_GREEN
+    elif fraction < 0.75:
+        bar_color = C_YELLOW
+    elif fraction < 0.85:
+        bar_color = C_ORANGE
+    else:
+        bar_color = C_RED
+        
+    bar = f"{bar_color}{fill_char * filled_len}{C_GRAY}{empty_char * empty_len}{C_RESET}"
+    return f"[{bar}]"
+
+def format_countdown(reset_iso: str | None) -> str:
+    if not reset_iso:
+        return "5h 00m"
+    try:
+        if reset_iso.endswith("Z"):
+            reset_iso = reset_iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(reset_iso)
+        now = datetime.now(timezone.utc)
+        diff = dt - now
+        total_sec = int(diff.total_seconds())
+        if total_sec <= 0:
+            return "Listo"
+        hrs = total_sec // 3600
+        mins = (total_sec % 3600) // 60
+        if hrs > 0:
+            return f"{hrs}h {mins:02d}m"
+        return f"{mins}m"
+    except Exception:
+        return "5h"
+
+def detect_active_account() -> str:
+    # 1. Check HOME path (e.g., /home/aidev/.agyc_homes/agy02)
+    home = os.environ.get("HOME", "")
+    m = re.search(r"agy\d+", home)
+    if m:
+        return m.group(0)
+    
+    # 2. Check ANTIGRAVITY_APP_DATA_DIR
+    app_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
+    m = re.search(r"agy\d+", app_dir)
+    if m:
+        return m.group(0)
+        
+    # 3. Check config.json in accounts
+    config_paths = [
+        os.path.expanduser("~/.gemini/antigravity-cli/accounts/config.json"),
+        "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
+        "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/config.json",
+    ]
+    for cp in config_paths:
+        if os.path.exists(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    act = data.get("active_account")
+                    if act:
+                        return act
+            except Exception:
+                pass
+    return "agy01"
+
+def get_git_branch() -> str | None:
+    try:
+        # Check current branch
+        res = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=1
+        )
+        if res.returncode == 0:
+            branch = res.stdout.strip()
+            # Check if dirty (quick)
+            status_res = subprocess.run(
+                ["git", "status", "--porcelain", "-uno"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=1
+            )
+            is_dirty = bool(status_res.stdout.strip())
+            return f"{branch}*" if is_dirty else branch
+    except Exception:
+        pass
+    return None
+
+def do_fetch_and_save_quota(alias: str) -> dict | None:
+    """Synchronously queries Google CloudCode PA API and saves cache."""
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    now_ts = time.time()
+    
+    acc_paths = [
+        os.path.expanduser(f"~/.gemini/antigravity-cli/accounts/{alias}.json"),
+        f"/home/aidev/.gemini/antigravity-cli/accounts/{alias}.json",
+        f"/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/{alias}.json",
+    ]
+    acc_data = None
+    for ap in acc_paths:
+        if os.path.exists(ap):
+            try:
+                with open(ap, "r") as f:
+                    acc_data = json.load(f)
+                    break
+            except Exception:
+                pass
+                
+    if not acc_data:
+        return None
+
+    fallback_quota = acc_data.get("quota", {})
+    token = acc_data.get("token_data", {}).get("token", {}).get("access_token")
+    if not token:
+        return fallback_quota
+
+    try:
+        req = urllib.request.Request(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            data=b"{}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "User-Agent": "antigravity/1.2.11 linux/amd64"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            
+        metrics = {
+            "gemini_5h_fraction": 1.0,
+            "gemini_5h_reset": None,
+            "cached_at": now_ts
+        }
+        for grp in data.get("groups", []):
+            if "gemini" in grp.get("displayName", "").lower():
+                for b in grp.get("buckets", []):
+                    b_id = b.get("bucketId", "").lower()
+                    if "5h" in b_id or b.get("window", "").lower() == "5h":
+                        metrics["gemini_5h_fraction"] = b.get("remainingFraction", 1.0)
+                        metrics["gemini_5h_reset"] = b.get("resetTime")
+                        
+        with open(cache_file, "w") as f:
+            json.dump(metrics, f)
+        return metrics
+    except Exception:
+        if fallback_quota:
+            res = {
+                "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
+                "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
+                "cached_at": now_ts
+            }
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(res, f)
+            except Exception:
+                pass
+            return res
+        return None
+
+def fetch_online_quota(alias: str) -> dict | None:
+    """Fetches quota using stale-while-revalidate pattern to avoid blocking the statusline."""
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    now_ts = time.time()
+    cached = None
+    
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cached = json.load(f)
+        except Exception:
+            pass
+
+    # If cache is valid and fresh (< 60s), return immediately
+    if cached and (now_ts - cached.get("cached_at", 0) < 60):
+        return cached
+
+    # If cache exists but is older than 60s, return old cache and refresh in background!
+    if cached:
+        try:
+            subprocess.Popen(
+                [sys.executable, __file__, "--refresh-quota-bg", alias],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+        except Exception:
+            pass
+        return cached
+
+    # If no cache exists, do a quick fetch
+    return do_fetch_and_save_quota(alias)
+
+def get_context_usage() -> tuple[float, int, int]:
+    """Returns (fraction, estimated_tokens, max_tokens)."""
+    max_tokens = 1_000_000
+    
+    # Check if agy passes context data via stdin
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0.01)
+        if r:
+            raw = sys.stdin.read()
+            if raw.strip().startswith("{"):
+                d = json.loads(raw)
+                ctx = d.get("context_window", {}) or d.get("context", {})
+                used = ctx.get("used_tokens") or ctx.get("total_tokens")
+                max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
+                if used:
+                    frac = min(1.0, float(used) / float(max_t))
+                    return (frac, int(used), int(max_t))
+    except Exception:
+        pass
+
+    # Fallback: estimate from active conversation transcript
+    base_dirs = [
+        os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
+        os.path.expanduser("~/.gemini/antigravity-cli"),
+        "/home/aidev/.gemini/antigravity-cli",
+    ]
+    conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    transcript_path = None
+
+    for bd in base_dirs:
+        if not bd: continue
+        brain_dir = os.path.join(bd, "brain")
+        if not os.path.exists(brain_dir): continue
+        
+        if conv_id:
+            cand = os.path.join(brain_dir, conv_id, ".system_generated", "logs", "transcript.jsonl")
+            if os.path.exists(cand):
+                transcript_path = cand
+                break
+        else:
+            # Find most recently modified conversation
+            try:
+                entries = [os.path.join(brain_dir, d) for d in os.listdir(brain_dir)]
+                entries = [e for e in entries if os.path.isdir(e)]
+                if entries:
+                    latest = max(entries, key=os.path.getmtime)
+                    cand = os.path.join(latest, ".system_generated", "logs", "transcript.jsonl")
+                    if os.path.exists(cand):
+                        transcript_path = cand
+                        break
+            except Exception:
+                pass
+
+    if transcript_path and os.path.exists(transcript_path):
+        size_bytes = os.path.getsize(transcript_path)
+        # Approximate ~4 bytes per token for typical JSON transcript content
+        estimated_tokens = int(size_bytes / 4.0)
+        fraction = min(1.0, estimated_tokens / float(max_tokens))
+        return (fraction, estimated_tokens, max_tokens)
+
+    return (0.15, 150_000, max_tokens)
+
+def main():
+    # 1. Active Account
+    account = detect_active_account()
+    acc_badge = f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}"
+
+    # 2. Git Branch
+    branch = get_git_branch()
+    branch_badge = f"{C_BOLD}{C_GREEN}🌿 {branch}{C_RESET}" if branch else None
+
+    # 3. 5-Hour Quota
+    quota = fetch_online_quota(account)
+    if quota:
+        q_frac = quota.get("gemini_5h_fraction")
+        if q_frac is None:
+            q_frac = 1.0
+        q_percent = int(round(q_frac * 100))
+        q_bar = make_linebar(q_frac, length=8)
+        q_countdown = format_countdown(quota.get("gemini_5h_reset"))
+        # Quota display: Saldo restante y cuenta regresiva
+        quota_badge = f"{C_YELLOW}5H:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
+    else:
+        quota_badge = f"{C_YELLOW}5H:{C_RESET} [████████] 100% (⏳ 5h)"
+
+    # 4. Context Usage
+    ctx_frac, ctx_tokens, ctx_max = get_context_usage()
+    ctx_percent = int(round(ctx_frac * 100))
+    ctx_bar = make_context_linebar(ctx_frac, length=8)
+    tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)
+    max_k = f"{ctx_max // 1_000_000}M" if ctx_max >= 1_000_000 else f"{ctx_max // 1000}k"
+    ctx_badge = f"{C_BLUE}Ctx:{C_RESET} {ctx_bar} {C_BOLD}{ctx_percent}%{C_RESET} {C_DIM}({tokens_k}/{max_k}){C_RESET}"
+
+    # Separator
+    sep = f" {C_GRAY}│{C_RESET} "
+    
+    # Build complete statusline
+    parts = [acc_badge]
+    if branch_badge:
+        parts.append(branch_badge)
+    parts.append(quota_badge)
+    parts.append(ctx_badge)
+
+    line = sep.join(parts)
+    print(line)
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "--refresh-quota-bg":
+        alias = sys.argv[2]
+        do_fetch_and_save_quota(alias)
+        sys.exit(0)
+    main()

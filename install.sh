@@ -76,25 +76,42 @@ fi
 echo -e "${GREEN}✓ Directorios creados${RESET}"
 echo ""
 
-# ── Paso 3: Instalar agyc ─────────────────────────────────────────────────────
-echo -e "${BOLD}[3/7] Instalando agyc...${RESET}"
+# ── Paso 3: Instalar agyc y wrapper agy ────────────────────────────────────────
+echo -e "${BOLD}[3/7] Instalando agyc y wrapper agy...${RESET}"
 
 cp -f "$SCRIPT_DIR/bin/agyc" "$AGY_BIN_DIR/agyc"
 chmod +x "$AGY_BIN_DIR/agyc"
 echo -e "  ${DIM}→ $AGY_BIN_DIR/agyc${RESET}"
+
+if [ -f "$SCRIPT_DIR/bin/agy" ]; then
+    cp -f "$SCRIPT_DIR/bin/agy" "$AGY_BIN_DIR/agy"
+    chmod +x "$AGY_BIN_DIR/agy"
+    echo -e "  ${DIM}→ $AGY_BIN_DIR/agy${RESET}"
+fi
 
 # Sincronizar a ruta snap si existe
 if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
     cp -f "$SCRIPT_DIR/bin/agyc" "$SNAP_BIN_DIR/agyc" 2>/dev/null && \
     chmod +x "$SNAP_BIN_DIR/agyc" && \
     echo -e "  ${DIM}→ $SNAP_BIN_DIR/agyc${RESET}" || true
+
+    if [ -f "$SCRIPT_DIR/bin/agy" ]; then
+        cp -f "$SCRIPT_DIR/bin/agy" "$SNAP_BIN_DIR/agy" 2>/dev/null && \
+        chmod +x "$SNAP_BIN_DIR/agy" || true
+    fi
 fi
 
 # Symlink global
 ln -sf "$AGY_BIN_DIR/agyc" "$LOCAL_BIN/agyc" 2>/dev/null || \
     cp -f "$AGY_BIN_DIR/agyc" "$LOCAL_BIN/agyc"
 chmod +x "$LOCAL_BIN/agyc"
-echo -e "${GREEN}✓ agyc instalado${RESET}"
+
+if [ -f "$AGY_BIN_DIR/agy" ]; then
+    ln -sf "$AGY_BIN_DIR/agy" "$LOCAL_BIN/agy" 2>/dev/null || \
+        cp -f "$AGY_BIN_DIR/agy" "$LOCAL_BIN/agy"
+    chmod +x "$LOCAL_BIN/agy"
+fi
+echo -e "${GREEN}✓ agyc y wrapper agy instalados${RESET}"
 echo ""
 
 # ── Paso 4: Crear lanzadores directos agy01..agy15 ───────────────────────────

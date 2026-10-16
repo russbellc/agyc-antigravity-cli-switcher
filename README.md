@@ -22,8 +22,9 @@
 
 - 🔒 **Perfiles HOME aislados** — Cada cuenta tiene su propio `antigravity-oauth-token` blindado. Dos paneles con cuentas distintas nunca compiten por el mismo token.
 - ⚡ **Lanzadores directos** — Escribe `agy02` para entrar directo a esa cuenta. Sin menús, sin preguntas.
-- 📊 **Panel visual de cuotas** — Barras de progreso en tiempo real para Gemini (5H/Semanal) y Claude & GPT (5H/Semanal).
-- 🔄 **Rotación automática inteligente** — `agyc auto` detecta el modelo activo y conmuta a la cuenta con mayor saldo disponible.
+- 📊 **Panel visual de cuotas** — Barras de progreso en tiempo real para Gemini (5H/Semanal), Gemini 4 Argon (Semanal) y Claude & GPT (5H/Semanal).
+- 🔄 **Rotación automática inteligente** — `agyc auto` detecta el modelo activo (Claude, Gemini o Argon) y conmuta a la cuenta con mayor saldo disponible.
+- 🚀 **Actualizador integrado** — `agyc update` (o `agy update`) sincroniza cambios desde GitHub, actualiza todos los binarios locales y verifica Snap.
 - 🔑 **Sin keyring** — File-based auth. No requiere GNOME Keyring ni D-Bus.
 - 🤖 **Skill para agentes** — El agente de Antigravity puede ejecutar `agyc auto` automáticamente cuando detecta cuota agotada.
 
@@ -87,9 +88,10 @@ agyc          # tabla visual con barras de consumo
 ### Rotación automática
 
 ```bash
-agyc auto         # rota a la cuenta con más cuota (detecta Claude o Gemini automáticamente)
+agyc auto         # rota a la cuenta con más cuota (detecta Claude, Gemini o Argon automáticamente)
 agyc auto claude  # fuerza evaluación para modelos Claude
-agyc auto gemini  # fuerza evaluación para modelos Gemini
+agyc auto gemini  # fuerza evaluación para modelos Gemini Pro/Flash
+agyc auto argon   # fuerza evaluación para Gemini 4 Argon (límite semanal independiente)
 ```
 
 ---
@@ -129,7 +131,9 @@ herdr
 | `agyc renew <alias>` | Re-vincula una cuenta cuando Google pide re-autenticación |
 | `agyc auto` | Rota automáticamente a la cuenta con mayor cuota disponible |
 | `agyc auto claude` | Rota priorizando cuota de Claude & GPT |
-| `agyc auto gemini` | Rota priorizando cuota de Gemini |
+| `agyc auto gemini` | Rota priorizando cuota de Gemini Pro/Flash |
+| `agyc auto argon` | Rota priorizando cuota semanal de Gemini 4 Argon |
+| `agyc update` / `agy update` | Actualiza `agyc` desde GitHub, sincroniza binarios y verifica Snap |
 | `agyc switch <alias>` | Cambia la cuenta activa sin abrir Antigravity |
 | `agyc default <alias>` | Fija la cuenta predeterminada para `agy` a secas |
 | `agyc quota <alias>` | Reporte detallado de modelos y ventanas de reinicio |
@@ -173,8 +177,9 @@ Esto crea perfiles completamente aislados:
 ### Algoritmo de Rotación (`agyc auto`)
 
 ```
-Para Claude/GPT:   score = (semanal × 0.7) + (5H × 0.3)
-Para Gemini:       prioriza 5H, desempata con semanal
+Para Claude/GPT:       score = (semanal × 0.7) + (5H × 0.3)
+Para Gemini 4 Argon:   score = (semanal × 0.8) + (5H × 0.2)
+Para Gemini Pro/Flash: prioriza 5H, desempata con semanal
 ```
 
 Selecciona siempre la cuenta con mayor score y descarta cuentas con token revocado.
@@ -183,7 +188,7 @@ Selecciona siempre la cuenta con mayor score y descarta cuentas con token revoca
 
 ## Origen y Desarrollo
 
-Este proyecto nació en una sesión de pair-programming con Google Antigravity (AGY) el 13-15 de Octubre de 2026.
+Este proyecto nació en una sesión de pair-programming con Google Antigravity (AGY) el 13-16 de Octubre de 2026.
 
 - **Conversación de origen:** `328759be-6f6e-439e-a6c5-e98f6d138850`
 - **Entorno:** Ubuntu Linux x86_64, Snap `antigravity-cli` v23
@@ -198,6 +203,7 @@ Este proyecto nació en una sesión de pair-programming con Google Antigravity (
 | v1.1 | Oct 14, 2026 | `agyc auto`, rotación inteligente, bypass keyring |
 | v1.2 | Oct 15, 2026 | `agyc renew`, `agyc wipe`, corrección bug PermissionError |
 | v1.3 | Oct 15, 2026 | Perfiles HOME aislados (`prepare_isolated_home()`), eliminación del guardián, README GitHub |
+| v1.4 | Oct 16, 2026 | Soporte para Gemini 4 Argon (cuota semanal independiente) y comando `agyc update` / `agy update` |
 
 ---
 

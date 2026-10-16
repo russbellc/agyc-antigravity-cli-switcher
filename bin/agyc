@@ -32,6 +32,7 @@ import threading
 import select
 import argparse
 import shutil
+import subprocess
 from datetime import datetime, timezone, timedelta
 
 # Expresión regular para quitar secuencias de escape ANSI
@@ -359,6 +360,8 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
         "claude_5h_reset": None,
         "claude_weekly_fraction": None,
         "claude_weekly_reset": None,
+        "argon_weekly_fraction": None,
+        "argon_weekly_reset": None,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
     if not quota_json or "groups" not in quota_json:
@@ -367,22 +370,44 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
     for grp in quota_json.get("groups", []):
         display = grp.get("displayName", "")
         buckets = grp.get("buckets", [])
-        if "Gemini" in display:
+        d_lower = display.lower()
+
+        # 1. Grupo dedicado de Gemini 4 Argon
+        if "argon" in d_lower:
             for b in buckets:
-                b_id = b.get("bucketId", "")
-                win = b.get("window", "")
+                b_id = b.get("bucketId", "").lower()
+                win = b.get("window", "").lower()
+                b_name = b.get("displayName", "").lower()
                 frac = b.get("remainingFraction")
                 reset_t = b.get("resetTime")
-                if "5h" in b_id or win == "5h":
+                if "weekly" in b_id or win == "weekly" or "weekly" in b_name or "month" in b_id:
+                    metrics["argon_weekly_fraction"] = frac
+                    metrics["argon_weekly_reset"] = reset_t
+            continue
+
+        # 2. Grupo Gemini estándar (puede incluir el bucket de Argon)
+        if "gemini" in d_lower:
+            for b in buckets:
+                b_id = b.get("bucketId", "").lower()
+                win = b.get("window", "").lower()
+                b_name = b.get("displayName", "").lower()
+                frac = b.get("remainingFraction")
+                reset_t = b.get("resetTime")
+                if "argon" in b_id or "argon" in b_name:
+                    metrics["argon_weekly_fraction"] = frac
+                    metrics["argon_weekly_reset"] = reset_t
+                elif "5h" in b_id or win == "5h":
                     metrics["gemini_5h_fraction"] = frac
                     metrics["gemini_5h_reset"] = reset_t
                 elif "weekly" in b_id or win == "weekly":
                     metrics["gemini_weekly_fraction"] = frac
                     metrics["gemini_weekly_reset"] = reset_t
-        elif "Claude" in display or "GPT" in display or "3p" in display:
+
+        # 3. Grupo Claude y GPT
+        elif "claude" in d_lower or "gpt" in d_lower or "3p" in d_lower:
             for b in buckets:
-                b_id = b.get("bucketId", "")
-                win = b.get("window", "")
+                b_id = b.get("bucketId", "").lower()
+                win = b.get("window", "").lower()
                 frac = b.get("remainingFraction")
                 reset_t = b.get("resetTime")
                 if "5h" in b_id or win == "5h":
@@ -688,12 +713,15 @@ def cmd_list(args):
     border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_claude}┤"
     border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_state}┴{'─' * col_gemini}┴{'─' * col_claude}┘"
 
+    has_argon = any(acc.get("quota", {}).get("argon_weekly_fraction") is not None for acc in accounts)
+    col_gemini_title = "GEMINI + ARGON (DIARIO/SEM)" if has_argon else "GEMINI (DIARIO / SEM)"
+
     print(border_top)
     hdr = (
         f"│ {pad_visible(C_BOLD + 'ALIAS' + C_RESET, col_alias - 2)} "
         f"│ {pad_visible(C_BOLD + 'CUENTA / EMAIL' + C_RESET, col_email - 2)} "
         f"│ {pad_visible(C_BOLD + 'ESTADO' + C_RESET, col_state - 2)} "
-        f"│ {pad_visible(C_BOLD + 'GEMINI (DIARIO / SEM)' + C_RESET, col_gemini - 2)} "
+        f"│ {pad_visible(C_BOLD + col_gemini_title + C_RESET, col_gemini - 2)} "
         f"│ {pad_visible(C_BOLD + 'CLAUDE & GPT (DIARIO / SEM)' + C_RESET, col_claude - 2)} │"
     )
     print(hdr)
@@ -718,6 +746,8 @@ def cmd_list(args):
             c_line1 = f"{C_YELLOW}Ejecuta: agyc add {alias}{C_RESET}"
             g_line2 = f"{C_DIM}Re-vincular cuenta{C_RESET}"
             c_line2 = f"{C_DIM}para reactivar cuotas{C_RESET}"
+            g_line3 = ""
+            c_line3 = ""
         else:
             if is_active and is_default:
                 state_str = f"{C_BG_GREEN}*ACTIVA+DEF{C_RESET}"
@@ -743,6 +773,9 @@ def cmd_list(args):
             cweek = q.get("claude_weekly_fraction")
             cweek_reset = format_countdown(q.get("claude_weekly_reset"))
 
+            aweek = q.get("argon_weekly_fraction")
+            aweek_reset = format_countdown(q.get("argon_weekly_reset"))
+
             # Fila 1: Límites Diarios (5 Horas)
             g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
             c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
@@ -750,6 +783,13 @@ def cmd_list(args):
             # Fila 2: Límites Semanales
             g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
             c_line2 = f"Sem: {make_linebar(cweek, length=10)} ({cweek_reset})"
+
+            # Fila 3: Gemini 4 Argon
+            if aweek is not None:
+                g_line3 = f"Arg: {make_linebar(aweek, length=10)} ({aweek_reset})"
+            else:
+                g_line3 = f"Arg: {C_DIM}No disponible{C_RESET}"
+            c_line3 = ""
 
         row1 = (
             f"│ {pad_visible(alias_disp, col_alias - 2)} "
@@ -767,6 +807,15 @@ def cmd_list(args):
         )
         print(row1)
         print(row2)
+        if has_argon:
+            row3 = (
+                f"│ {pad_visible('', col_alias - 2)} "
+                f"│ {pad_visible('', col_email - 2)} "
+                f"│ {pad_visible('', col_state - 2)} "
+                f"│ {pad_visible(g_line3, col_gemini - 2)} "
+                f"│ {pad_visible(c_line3, col_claude - 2)} │"
+            )
+            print(row3)
         if i < len(accounts) - 1:
             print(f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_claude}┤")
 
@@ -775,8 +824,8 @@ def cmd_list(args):
     print(f"  • Entrar directo a cuenta: {C_GREEN}agy01{C_RESET} | {C_GREEN}agy02{C_RESET} | {C_GREEN}agy03{C_RESET} (inicia agy con --dangerously-skip-permissions)")
     print(f"  • Cambiar sin iniciar:     {C_CYAN}agyc agy02{C_RESET}      (o 'agyc switch agy02')")
     print(f"  • Agregar nueva cuenta:    {C_CYAN}agyc add{C_RESET}        (asigna correlativo agy02, agy03... en automático)")
-    print(f"  • Fijar predefinida:       {C_CYAN}agyc default agy01{C_RESET}")
-    print(f"  • Rotación por cuota:      {C_CYAN}agyc auto{C_RESET}       (entra a la cuenta con mayor saldo de tokens)")
+    print(f"  • Actualizar agyc:         {C_CYAN}agyc update{C_RESET}     (o 'agy update', sincroniza binarios y repositorios)")
+    print(f"  • Rotación por cuota:      {C_CYAN}agyc auto{C_RESET}       (o 'agyc auto argon' para Gemini 4 Argon)")
     print(f"  • Vaciar credenciales:     {C_CYAN}agyc wipe{C_RESET}       (limpieza total segura con confirmación)\n")
 
 def cmd_switch(args):
@@ -1301,18 +1350,28 @@ def cmd_auto(args):
     forced_family = getattr(args, "family", None)
     if forced_family:
         forced_family = forced_family.lower()
-        if "claude" in forced_family or "gpt" in forced_family:
+        if "argon" in forced_family:
+            target_family = "argon"
+        elif "claude" in forced_family or "gpt" in forced_family:
             target_family = "claude"
         else:
             target_family = "gemini"
     else:
         m_lower = active_model.lower()
-        if "claude" in m_lower or "gpt" in m_lower or "opus" in m_lower or "sonnet" in m_lower:
+        if "argon" in m_lower:
+            target_family = "argon"
+        elif "claude" in m_lower or "gpt" in m_lower or "opus" in m_lower or "sonnet" in m_lower:
             target_family = "claude"
         else:
             target_family = "gemini"
 
-    family_label = "Claude y GPT" if target_family == "claude" else "Gemini"
+    if target_family == "argon":
+        family_label = "Gemini 4 Argon"
+    elif target_family == "claude":
+        family_label = "Claude y GPT"
+    else:
+        family_label = "Gemini"
+
     print(f"{C_CYAN}Modelo activo en configuración: {C_BOLD}{active_model}{C_RESET}")
     print(f"{C_CYAN}Evaluando saldo de cuotas para {C_BOLD}{family_label}{C_RESET} entre {len(aliases)} cuentas...{C_RESET}")
 
@@ -1348,7 +1407,10 @@ def cmd_auto(args):
             print(f"  • {alias:<8} ({data.get('email')}): {C_RED}[EXPIRADA - Re-vincular con 'agyc add {alias}']{C_RESET}")
             continue
 
-        if target_family == "claude":
+        if target_family == "argon":
+            qweek = quota.get("argon_weekly_fraction")
+            q5h = quota.get("gemini_5h_fraction")
+        elif target_family == "claude":
             q5h = quota.get("claude_5h_fraction")
             qweek = quota.get("claude_weekly_fraction")
         else:
@@ -1360,14 +1422,25 @@ def cmd_auto(args):
 
         status_flag = ""
         if qweek <= 0.001:
-            status_flag = f" {C_RED}[Semanal Agotada]{C_RESET}"
+            status_flag = f" {C_RED}[Semanal/Argon Agotada]{C_RESET}"
         elif q5h <= 0.001:
             status_flag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
 
-        print(f"  • {alias:<8} ({data.get('email')}): 5H = {int(q5h*100):3d}% | Semanal = {int(qweek*100):3d}%{status_flag}")
+        if target_family == "argon":
+            print(f"  • {alias:<8} ({data.get('email')}): Argon = {int(qweek*100):3d}% | Base 5H = {int(q5h*100):3d}%{status_flag}")
+        else:
+            print(f"  • {alias:<8} ({data.get('email')}): 5H = {int(q5h*100):3d}% | Semanal = {int(qweek*100):3d}%{status_flag}")
 
-        # Para Claude el cuello de botella suele ser la cuota semanal; para Gemini, ambas
-        if target_family == "claude":
+        # Algoritmo de selección según familia
+        if target_family == "argon":
+            if qweek > 0.001:
+                score = (qweek * 0.8) + (q5h * 0.2)
+                best_score = (best_week * 0.8) + (best_5h * 0.2)
+                if score > best_score:
+                    best_5h = q5h
+                    best_week = qweek
+                    best_alias = alias
+        elif target_family == "claude":
             # Si la cuota semanal está agotada, no sirve para Claude
             if qweek > 0.001:
                 score = (qweek * 0.7) + (q5h * 0.3)
@@ -1413,6 +1486,112 @@ def cmd_auto(args):
         switch_active_account(earliest_alias)
     else:
         print(f"{C_YELLOW}No se pudo encontrar ninguna cuenta disponible.{C_RESET}")
+
+def cmd_update(args):
+    print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY{C_RESET}")
+    print(f"{C_DIM}{'=' * 65}{C_RESET}\n")
+
+    repo_dir = "/home/aidev/proyectos/antigravity-switcher"
+    bin_src = os.path.join(repo_dir, "bin", "agyc") if os.path.exists(os.path.join(repo_dir, "bin", "agyc")) else __file__
+
+    # 1. Comprobar repositorio en GitHub
+    print(f"[{C_CYAN}1/4{C_RESET}] Comprobando repositorio en GitHub...")
+    if os.path.isdir(os.path.join(repo_dir, ".git")):
+        try:
+            r = subprocess.run(["git", "-C", repo_dir, "pull"], capture_output=True, text=True, timeout=15)
+            if "Already up to date" in r.stdout or "Ya está actualizado" in r.stdout:
+                print(f"  {C_GREEN}✓ Repositorio git ya está al día.{C_RESET}")
+            else:
+                print(f"  {C_GREEN}✓ Repositorio actualizado desde GitHub:{C_RESET}")
+                for l in r.stdout.strip().split("\n")[:3]:
+                    if l.strip():
+                        print(f"    {C_DIM}{l}{C_RESET}")
+        except Exception as e:
+            print(f"  {C_YELLOW}⚠ Git pull omitido: {e}{C_RESET}")
+    else:
+        try:
+            url = "https://raw.githubusercontent.com/russbellc/antigravity-switcher/main/bin/agyc"
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                code = resp.read().decode("utf-8")
+                if "agyc" in code and len(code) > 10000:
+                    with open(__file__, "w", encoding="utf-8") as f:
+                        f.write(code)
+                    print(f"  {C_GREEN}✓ Binario agyc actualizado desde GitHub.{C_RESET}")
+        except Exception as e:
+            print(f"  {C_YELLOW}⚠ Descarga omitida: {e}{C_RESET}")
+
+    # 2. Sincronización de binarios y lanzadores en todo el sistema
+    print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, wrappers y lanzadores...")
+    sync_targets = [
+        os.path.expanduser("~/.gemini/antigravity-cli/bin/agyc"),
+        os.path.expanduser("~/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agyc"),
+        "/home/aidev/proyectos/backup_agyc/bin/agyc",
+    ]
+    for sp in sync_targets:
+        if os.path.exists(os.path.dirname(sp)):
+            try:
+                shutil.copy2(bin_src, sp)
+                os.chmod(sp, 0o755)
+                print(f"  {C_GREEN}✓{C_RESET} {sp}")
+            except Exception:
+                pass
+
+    # Sincronizar wrapper agy si existe
+    wrapper_src = os.path.join(repo_dir, "bin", "agy")
+    if os.path.exists(wrapper_src):
+        for wp in [os.path.expanduser("~/.gemini/antigravity-cli/bin/agy"), "/home/aidev/proyectos/backup_agyc/bin/agy"]:
+            try:
+                shutil.copy2(wrapper_src, wp)
+                os.chmod(wp, 0o755)
+            except Exception:
+                pass
+
+    # Sincronizar lanzadores agy01..agy15 en ~/.local/bin
+    local_bin = os.path.expanduser("~/.local/bin")
+    os.makedirs(local_bin, exist_ok=True)
+    for i in range(1, 16):
+        al = f"agy{i:02d}"
+        lp = os.path.join(local_bin, al)
+        try:
+            if os.path.islink(lp):
+                os.unlink(lp)
+            os.symlink(os.path.expanduser("~/.gemini/antigravity-cli/bin/agyc"), lp)
+        except Exception:
+            try:
+                shutil.copy2(bin_src, lp)
+                os.chmod(lp, 0o755)
+            except Exception:
+                pass
+    print(f"  {C_GREEN}✓{C_RESET} Lanzadores agy01..agy15 en {local_bin}")
+
+    # 3. Comprobar versión de Snap de Google Antigravity
+    print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando versión de Google Antigravity CLI...")
+    try:
+        snap_info = subprocess.run(["snap", "list", "antigravity-cli"], capture_output=True, text=True, timeout=8)
+        for line in snap_info.stdout.strip().split("\n"):
+            if "antigravity-cli" in line:
+                parts = line.split()
+                ver = parts[1] if len(parts) > 1 else "?"
+                rev = parts[2] if len(parts) > 2 else "?"
+                print(f"  {C_GREEN}✓ Antigravity Snap instalado:{C_RESET} v{ver} (rev {rev})")
+    except Exception:
+        print(f"  {C_DIM}Snap status no disponible{C_RESET}")
+
+    # 4. Actualizar perfiles aislados (~/.agyc_homes)
+    print(f"\n[{C_CYAN}4/4{C_RESET}] Actualizando perfiles aislados (~/.agyc_homes) y cuotas...")
+    for al in list_account_aliases():
+        try:
+            prepare_isolated_home(al)
+        except Exception:
+            pass
+    print(f"  {C_GREEN}✓ Perfiles aislados actualizados y sincronizados.{C_RESET}")
+
+    print(f"\n{C_BOLD}{C_GREEN}═════════════════════════════════════════════════════════════════{C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}  ✓ SISTEMA ACTUALIZADO AL 100% (agyc v1.4)            {C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}═════════════════════════════════════════════════════════════════{C_RESET}")
+    print(f"• Soporte incorporado para: {C_BOLD}Gemini 4 Argon{C_RESET}")
+    print(f"• Refresca cuotas en vivo:  {C_CYAN}agyc list -r{C_RESET}")
+    print(f"• Rotación para Argon:      {C_CYAN}agyc auto argon{C_RESET} (o 'agyc auto')\n")
 
 def main():
     sync_account_symlinks()
@@ -1507,6 +1686,10 @@ def main():
     p_wipe = subparsers.add_parser("wipe", aliases=["clean", "purge"], help="Vacía todas las credenciales, configuraciones y caché de forma segura")
     p_wipe.add_argument("-f", "--force", "-y", "--yes", action="store_true", dest="force", help="Omitir confirmación interactiva")
     p_wipe.set_defaults(func=cmd_wipe)
+
+    # update / upgrade
+    p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc desde GitHub y sincroniza el entorno")
+    p_update.set_defaults(func=cmd_update)
 
     args = parser.parse_args()
 

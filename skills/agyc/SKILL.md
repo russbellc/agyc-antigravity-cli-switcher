@@ -16,11 +16,13 @@ Esta habilidad permite al agente consultar y administrar múltiples cuentas de G
 - `agyc` o `agyc list`: Muestra la tabla completa de cuentas con barras de progreso de consumo de tokens:
   - Gemini: 5H (diario) y Semanal.
   - Claude & GPT: 5H (diario) y Semanal.
+  - Gemini 4 Argon: Cuota separada si está habilitada en la cuenta.
   - Estado de cada cuenta (ACTIVA, DEFAULT, LISTA, EXPIRADA).
 - `agyc list -r`: Fuerza la consulta en vivo a los servidores de Google para refrescar contadores de cuota y renovar tokens de acceso.
 - `agyc <alias>` o `agyc switch <alias>`: Cambia la sesión activa a otra cuenta (ej. `agyc agy02`).
 - `agyc auto`: Evalúa el saldo restante de todas las cuentas y cambia automáticamente a la que tenga mayor cuota disponible según el modelo activo en `settings.json`.
-- `agyc auto claude` o `agyc auto gemini`: Fuerza la rotación evaluando específicamente esa familia de modelos.
+- `agyc auto claude`, `agyc auto gemini` o `agyc auto argon`: Fuerza la rotación evaluando específicamente esa familia de modelos.
+- `agyc update` (o `agy update`): Actualiza el switcher desde GitHub, sincroniza binarios, actualiza los lanzadores `agy01..agy15` y verifica la versión de Antigravity.
 - `agyc add [alias]`: Registra una nueva cuenta asignando automáticamente el correlativo (`agy02`, `agy03`, etc.). Abre el navegador forzando la selección de cuenta y consentimiento (`select_account consent`).
 - `agyc renew <alias>` o `agyc reauth <alias>`: Re-vincula y renueva la autenticación de una cuenta existente cuando Google solicita verificación de elegibilidad o cuando el token expira (ej. `agyc renew agy03`).
 - `agyc quota [alias]`: Muestra el reporte detallado de modelos y ventanas de reinicio exactas.
@@ -30,8 +32,7 @@ Esta habilidad permite al agente consultar y administrar múltiples cuentas de G
 
 ## Lanzadores Directos
 
-- `agy01`, `agy02`, `agy03`... hasta `agy15`: Entra directamente a la cuenta con `--dangerously-skip-permissions` activo por defecto.
-- Cuentan con Guardián Anti-Colisiones: si se intenta abrir una cuenta distinta a la activa, pide confirmación previa para no cruzar sesiones.
+- `agy01`, `agy02`, `agy03`... hasta `agy15`: Entra directamente a la cuenta con `--dangerously-skip-permissions` activo por defecto y perfiles HOME completamente aislados (sin fricción ni preguntas confirmatorias).
 
 ## Casos de Uso del Agente
 

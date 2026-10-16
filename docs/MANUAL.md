@@ -1,7 +1,7 @@
 # Manual Completo de `agyc`
 ## Google Antigravity Multi-Account Switcher
 
-> **Versión:** v1.3 | **Fecha:** Octubre 2026
+> **Versión:** v1.4 | **Fecha:** Octubre 2026
 > **Plataforma:** Ubuntu Linux x86_64 con Snap `antigravity-cli`
 
 ---
@@ -19,7 +19,8 @@
 9. [Gestión de tokens y elegibilidad](#9-gestión-de-tokens-y-elegibilidad)
 10. [Skill para el agente de Antigravity](#10-skill-para-el-agente-de-antigravity)
 11. [agyc wipe — Reinicio limpio](#11-agyc-wipe--reinicio-limpio)
-12. [Historia de versiones y decisiones de diseño](#12-historia-de-versiones-y-decisiones-de-diseño)
+12. [agyc update — Actualizador automático](#12-agyc-update--actualizador-automático)
+13. [Historia de versiones y decisiones de diseño](#13-historia-de-versiones-y-decisiones-de-diseño)
 
 ---
 
@@ -153,9 +154,17 @@ agyc default agy01        # Fija la cuenta predeterminada para `agy` a secas
 ```bash
 agyc quota                # Reporte detallado de la cuenta activa
 agyc quota agy02          # Reporte de una cuenta específica
-agyc auto                 # Rota a la cuenta con mayor cuota (detecta Claude/Gemini)
+agyc auto                 # Rota a la cuenta con mayor cuota (detecta Claude/Gemini/Argon)
 agyc auto claude          # Fuerza evaluación para modelos Claude & GPT
-agyc auto gemini          # Fuerza evaluación para modelos Gemini
+agyc auto gemini          # Fuerza evaluación para modelos Gemini Pro/Flash
+agyc auto argon           # Fuerza evaluación para Gemini 4 Argon (límite semanal independiente)
+```
+
+### Actualización del sistema
+
+```bash
+agyc update               # Actualiza agyc desde GitHub, sincroniza binarios y verifica Snap
+agy update                # Alias directo interceptado por el wrapper de agy
 ```
 
 ---
@@ -264,14 +273,18 @@ Puedes abrir `agy02` en dos paneles distintos simultáneamente sin problema. Amb
 
 ### Algoritmo de selección
 
-`agyc auto` evalúa todas las cuentas registradas y selecciona la mejor:
+`agyc auto` evalúa todas las cuentas registradas y selecciona la mejor según el modelo en uso:
 
 ```
 Para Claude & GPT:
   score = (cuota_semanal × 0.7) + (cuota_5h × 0.3)
   → Prioriza reserva semanal, usa la ventana de 5H como desempate
 
-Para Gemini:
+Para Gemini 4 Argon:
+  score = (cuota_semanal × 0.8) + (cuota_5h × 0.2)
+  → Prioriza la cuota semanal independiente de Argon (168h)
+
+Para Gemini Pro / Flash:
   → Prioriza cuota de 5H (ventana más corta)
   → Desempata con cuota semanal
 ```
@@ -280,12 +293,13 @@ Descarta automáticamente cuentas con token revocado (`is_revoked=True`).
 
 ### Detección automática del modelo
 
-`agyc auto` (sin argumentos) lee `settings.json` para detectar si estás usando Claude o Gemini y aplica el algoritmo correspondiente:
+`agyc auto` (sin argumentos) lee `settings.json` para detectar el modelo activo y aplica el algoritmo correspondiente:
 
 ```bash
-agyc auto          # detecta: Claude → usa algoritmo Claude
-agyc auto claude   # fuerza evaluación Claude
-agyc auto gemini   # fuerza evaluación Gemini
+agyc auto          # detecta: Claude, Gemini o Argon y rota inteligentemente
+agyc auto claude   # fuerza evaluación Claude & GPT
+agyc auto gemini   # fuerza evaluación Gemini Pro/Flash
+agyc auto argon    # fuerza evaluación Gemini 4 Argon
 ```
 
 ---
@@ -378,7 +392,31 @@ agyc wipe -y       # alias de --force
 
 ---
 
-## 12. Historia de Versiones y Decisiones de Diseño
+---
+
+## 12. agyc update — Actualizador Automático
+
+Permite mantener `agyc` y las herramientas del ecosistema Antigravity siempre al día:
+
+```bash
+agyc update      # actualiza repositorio, binarios y perfiles
+agy update       # wrapper directo equivalente
+```
+
+### Proceso de actualización en 4 fases
+
+1. **GitHub Sync**: Detecta si el repositorio local está clonado de Git y ejecuta `git pull --rebase`. Si se instaló sin Git, descarga la última versión estable del binario desde GitHub.
+2. **Sincronización de Binarios**: Copia la versión actualizada a todas las rutas activas:
+   - `~/.gemini/antigravity-cli/bin/agyc`
+   - `~/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agyc`
+   - `~/.local/bin/agy01..15`
+   - `~/proyectos/backup_agyc/`
+3. **Inspección de Snap Antigravity**: Consulta `snap list antigravity-cli` para alertar si hay actualizaciones pendientes del motor principal de Antigravity o sugerir `snap refresh`.
+4. **Mantenimiento de Perfiles**: Verifica y sincroniza los symlinks compartidos en todos los perfiles de `~/.agyc_homes/`.
+
+---
+
+## 13. Historia de Versiones y Decisiones de Diseño
 
 ### v1.0 — MVP (Oct 13, 2026)
 
@@ -411,3 +449,10 @@ agyc wipe -y       # alias de --force
 **Eliminación del Guardián Anti-Colisiones:** Con perfiles aislados, el aviso de confirmación al abrir una cuenta no activa es fricción innecesaria. Se eliminó. El lanzador ahora entra directo sin preguntas.
 
 **Por qué symlinks y no copias completas:** Solo el token es exclusivo por cuenta. El resto (`settings.json`, `accounts/`, `brain/`) son symlinks al directorio compartido para que `agyc list`, `agyc auto` y el historial funcionen correctamente desde cualquier perfil.
+
+### v1.4 — Gemini 4 Argon y Actualizador Automático (Oct 16, 2026)
+
+**Funcionalidades:**
+- **Soporte para `Gemini 4 Argon`**: Reconoce la nueva cuota semanal separada (168h) introducida por Google en Antigravity. Visualización en barra `Arg:` en `agyc list` y rotación inteligente con `agyc auto argon` o autodetección cuando el modelo activo es Argon.
+- **Comando `agyc update` / `agy update`**: Actualizador de 4 fases que descarga desde GitHub, sincroniza binarios locales, inspecciona Snap y refresca perfiles aislados.
+- **Wrapper `bin/agy`**: Intercepta `agy update` y `agy upgrade` ejecutando `agyc update`.

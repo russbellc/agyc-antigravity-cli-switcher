@@ -6,9 +6,12 @@ if [ "$1" = "update" ] || [ "$1" = "upgrade" ]; then
   exec agyc update "${@:2}"
 fi
 
-REAL_AGY="/snap/antigravity-cli/current/bin/agy"
+REAL_AGY="$HOME/.gemini/antigravity-cli/bin/agy-real"
 if [ ! -x "$REAL_AGY" ]; then
-  REAL_AGY="/snap/antigravity-cli/23/bin/agy"
+  REAL_AGY="/snap/antigravity-cli/current/bin/agy"
+  if [ ! -x "$REAL_AGY" ]; then
+    REAL_AGY="/snap/antigravity-cli/23/bin/agy"
+  fi
 fi
 
 # Forzar almacenamiento basado en archivo para evitar prompts de keyring en desktop

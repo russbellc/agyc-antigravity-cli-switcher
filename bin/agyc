@@ -583,7 +583,9 @@ def switch_active_account(alias: str, silent: bool = False) -> dict:
 
 def launch_real_agy(extra_args: list[str], alias: str | None = None):
     """Ejecuta el binario oficial de agy con --dangerously-skip-permissions por defecto."""
-    real_agy = "/snap/antigravity-cli/current/bin/agy"
+    real_agy = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
+    if not os.path.exists(real_agy):
+        real_agy = "/snap/antigravity-cli/current/bin/agy"
     if not os.path.exists(real_agy):
         real_agy = "/snap/antigravity-cli/23/bin/agy"
 
@@ -1635,18 +1637,42 @@ def cmd_update(args):
                 pass
     print(f"  {C_GREEN}✓{C_RESET} Lanzadores agy01..agy15 en {local_bin}")
 
-    # 3. Comprobar versión de Snap de Google Antigravity
-    print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando versión de Google Antigravity CLI...")
+    # 3. Comprobar motor oficial de Google Antigravity CLI
+    print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando motor oficial de Google Antigravity CLI...")
+    native_bin = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
+    current_ver = None
+    if os.path.exists(native_bin):
+        try:
+            ver_res = subprocess.run([native_bin, "--version"], capture_output=True, text=True, timeout=5)
+            current_ver = ver_res.stdout.strip()
+        except Exception:
+            pass
+
     try:
-        snap_info = subprocess.run(["snap", "list", "antigravity-cli"], capture_output=True, text=True, timeout=8)
-        for line in snap_info.stdout.strip().split("\n"):
-            if "antigravity-cli" in line:
-                parts = line.split()
-                ver = parts[1] if len(parts) > 1 else "?"
-                rev = parts[2] if len(parts) > 2 else "?"
-                print(f"  {C_GREEN}✓ Antigravity Snap instalado:{C_RESET} v{ver} (rev {rev})")
-    except Exception:
-        print(f"  {C_DIM}Snap status no disponible{C_RESET}")
+        manifest_url = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json"
+        req = urllib.request.Request(manifest_url, headers={"User-Agent": "curl/7.88.1"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            mani = json.loads(resp.read().decode("utf-8"))
+            latest_ver = mani.get("version")
+            download_url = mani.get("url")
+
+        if (not current_ver or current_ver != latest_ver) and download_url:
+            print(f"  {C_CYAN}→ Descargando release oficial de Google Antigravity CLI v{latest_ver}...{C_RESET}")
+            scratch_tar = "/tmp/antigravity_cli_latest.tar.gz"
+            urllib.request.urlretrieve(download_url, scratch_tar)
+            import tarfile
+            with tarfile.open(scratch_tar, "r:gz") as tar:
+                tar.extract("antigravity", path="/tmp/")
+            shutil.move("/tmp/antigravity", native_bin)
+            os.chmod(native_bin, 0o755)
+            print(f"  {C_GREEN}✓ Antigravity CLI actualizado al release oficial v{latest_ver}{C_RESET}")
+        else:
+            print(f"  {C_GREEN}✓ Antigravity CLI nativo en su última versión oficial: v{current_ver or '1.4.0'}{C_RESET}")
+    except Exception as e:
+        if current_ver:
+            print(f"  {C_GREEN}✓ Antigravity CLI nativo instalado: v{current_ver}{C_RESET}")
+        else:
+            print(f"  {C_YELLOW}⚠ Aviso comprobando release oficial de Google: {e}{C_RESET}")
 
     # 4. Actualizar perfiles aislados (~/.agyc_homes)
     print(f"\n[{C_CYAN}4/4{C_RESET}] Actualizando perfiles aislados (~/.agyc_homes) y cuotas...")

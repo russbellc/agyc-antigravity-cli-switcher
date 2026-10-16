@@ -1491,7 +1491,17 @@ def cmd_update(args):
     print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY{C_RESET}")
     print(f"{C_DIM}{'=' * 65}{C_RESET}\n")
 
-    repo_dir = "/home/aidev/proyectos/antigravity-switcher"
+    repo_candidates = [
+        "/home/aidev/proyectos/agyc-antigravity-cli-switcher",
+        "/home/aidev/proyectos/agyc",
+        "/home/aidev/proyectos/antigravity-switcher",
+    ]
+    repo_dir = "/home/aidev/proyectos/agyc-antigravity-cli-switcher"
+    for cand in repo_candidates:
+        if os.path.isdir(os.path.join(cand, ".git")):
+            repo_dir = cand
+            break
+
     bin_src = os.path.join(repo_dir, "bin", "agyc") if os.path.exists(os.path.join(repo_dir, "bin", "agyc")) else __file__
 
     # 1. Comprobar repositorio en GitHub
@@ -1510,7 +1520,7 @@ def cmd_update(args):
             print(f"  {C_YELLOW}⚠ Git pull omitido: {e}{C_RESET}")
     else:
         try:
-            url = "https://raw.githubusercontent.com/russbellc/antigravity-switcher/main/bin/agyc"
+            url = "https://raw.githubusercontent.com/russbellc/agyc-antigravity-cli-switcher/main/bin/agyc"
             with urllib.request.urlopen(url, timeout=10) as resp:
                 code = resp.read().decode("utf-8")
                 if "agyc" in code and len(code) > 10000:

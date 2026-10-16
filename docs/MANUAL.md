@@ -51,8 +51,8 @@ Google Antigravity CLI (`agy`) está diseñado para operar con una sola cuenta d
 ### Instalación desde GitHub
 
 ```bash
-git clone https://github.com/russbellc/antigravity-switcher.git
-cd antigravity-switcher
+git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
+cd agyc-antigravity-cli-switcher
 chmod +x install.sh
 ./install.sh
 source ~/.bashrc

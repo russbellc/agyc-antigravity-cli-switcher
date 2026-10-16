@@ -33,8 +33,8 @@
 ## Instalación Rápida
 
 ```bash
-git clone https://github.com/russbellc/antigravity-switcher.git
-cd antigravity-switcher
+git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
+cd agyc-antigravity-cli-switcher
 chmod +x install.sh
 ./install.sh
 ```
@@ -218,8 +218,8 @@ MIT License — ver [LICENSE](LICENSE)
 Issues y PRs bienvenidos. Si encuentras un bug o quieres añadir soporte para otra distribución, abre un issue.
 
 ```bash
-git clone https://github.com/russbellc/antigravity-switcher.git
-cd antigravity-switcher
+git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
+cd agyc-antigravity-cli-switcher
 # Editar bin/agyc
 # Probar con: python3 -m py_compile bin/agyc
 ```

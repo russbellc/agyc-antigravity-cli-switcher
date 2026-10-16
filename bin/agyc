@@ -704,24 +704,23 @@ def cmd_list(args):
     print(f"{C_DIM}Desarrollo a tiempo completo: consumo de tokens Gemini y Claude/GPT diarios y semanales.{C_RESET}\n")
 
     col_alias = 10
-    col_email = 26
-    col_state = 14
-    col_gemini = 35
-    col_claude = 35
+    col_email = 25
+    col_state = 13
+    col_gemini = 34
+    col_gem4 = 34
+    col_claude = 34
 
-    border_top = f"┌{'─' * col_alias}┬{'─' * col_email}┬{'─' * col_state}┬{'─' * col_gemini}┬{'─' * col_claude}┐"
-    border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_claude}┤"
-    border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_state}┴{'─' * col_gemini}┴{'─' * col_claude}┘"
-
-    has_argon = any(acc.get("quota", {}).get("argon_weekly_fraction") is not None for acc in accounts)
-    col_gemini_title = "GEMINI + ARGON (DIARIO/SEM)" if has_argon else "GEMINI (DIARIO / SEM)"
+    border_top = f"┌{'─' * col_alias}┬{'─' * col_email}┬{'─' * col_state}┬{'─' * col_gemini}┬{'─' * col_gem4}┬{'─' * col_claude}┐"
+    border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_gem4}┼{'─' * col_claude}┤"
+    border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_state}┴{'─' * col_gemini}┴{'─' * col_gem4}┴{'─' * col_claude}┘"
 
     print(border_top)
     hdr = (
         f"│ {pad_visible(C_BOLD + 'ALIAS' + C_RESET, col_alias - 2)} "
         f"│ {pad_visible(C_BOLD + 'CUENTA / EMAIL' + C_RESET, col_email - 2)} "
         f"│ {pad_visible(C_BOLD + 'ESTADO' + C_RESET, col_state - 2)} "
-        f"│ {pad_visible(C_BOLD + col_gemini_title + C_RESET, col_gemini - 2)} "
+        f"│ {pad_visible(C_BOLD + 'GEMINI (DIARIO / SEM)' + C_RESET, col_gemini - 2)} "
+        f"│ {pad_visible(C_BOLD + 'GEMINI 4 (DIARIO / SEM)' + C_RESET, col_gem4 - 2)} "
         f"│ {pad_visible(C_BOLD + 'CLAUDE & GPT (DIARIO / SEM)' + C_RESET, col_claude - 2)} │"
     )
     print(hdr)
@@ -743,11 +742,11 @@ def cmd_list(args):
             state_str = f"{C_BOLD}{C_RED}EXPIRADA{C_RESET}"
             alias_disp = f"  {C_RED}{alias}{C_RESET}"
             g_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
-            c_line1 = f"{C_YELLOW}Ejecuta: agyc add {alias}{C_RESET}"
             g_line2 = f"{C_DIM}Re-vincular cuenta{C_RESET}"
+            g4_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
+            g4_line2 = f"{C_YELLOW}Ejecuta: agyc add {alias}{C_RESET}"
+            c_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
             c_line2 = f"{C_DIM}para reactivar cuotas{C_RESET}"
-            g_line3 = ""
-            c_line3 = ""
         else:
             if is_active and is_default:
                 state_str = f"{C_BG_GREEN}*ACTIVA+DEF{C_RESET}"
@@ -774,28 +773,30 @@ def cmd_list(args):
             cweek_reset = format_countdown(q.get("claude_weekly_reset"))
 
             aweek = q.get("argon_weekly_fraction")
-            aweek_reset = format_countdown(q.get("argon_weekly_reset"))
+            aweek_reset = q.get("argon_weekly_reset")
+            if aweek is not None:
+                aweek_val = aweek
+                aweek_reset_str = format_countdown(aweek_reset)
+            else:
+                aweek_val = 1.0
+                aweek_reset_str = "168h"
 
             # Fila 1: Límites Diarios (5 Horas)
             g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+            g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
             c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
 
             # Fila 2: Límites Semanales
             g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
+            g4_line2 = f"Sem: {make_linebar(aweek_val, length=10)} ({aweek_reset_str})"
             c_line2 = f"Sem: {make_linebar(cweek, length=10)} ({cweek_reset})"
-
-            # Fila 3: Gemini 4 Argon
-            if aweek is not None:
-                g_line3 = f"Arg: {make_linebar(aweek, length=10)} ({aweek_reset})"
-            else:
-                g_line3 = f"Arg: {C_DIM}No disponible{C_RESET}"
-            c_line3 = ""
 
         row1 = (
             f"│ {pad_visible(alias_disp, col_alias - 2)} "
             f"│ {pad_visible(email_disp, col_email - 2)} "
             f"│ {pad_visible(state_str, col_state - 2)} "
             f"│ {pad_visible(g_line1, col_gemini - 2)} "
+            f"│ {pad_visible(g4_line1, col_gem4 - 2)} "
             f"│ {pad_visible(c_line1, col_claude - 2)} │"
         )
         row2 = (
@@ -803,21 +804,13 @@ def cmd_list(args):
             f"│ {pad_visible('', col_email - 2)} "
             f"│ {pad_visible('', col_state - 2)} "
             f"│ {pad_visible(g_line2, col_gemini - 2)} "
+            f"│ {pad_visible(g4_line2, col_gem4 - 2)} "
             f"│ {pad_visible(c_line2, col_claude - 2)} │"
         )
         print(row1)
         print(row2)
-        if has_argon:
-            row3 = (
-                f"│ {pad_visible('', col_alias - 2)} "
-                f"│ {pad_visible('', col_email - 2)} "
-                f"│ {pad_visible('', col_state - 2)} "
-                f"│ {pad_visible(g_line3, col_gemini - 2)} "
-                f"│ {pad_visible(c_line3, col_claude - 2)} │"
-            )
-            print(row3)
         if i < len(accounts) - 1:
-            print(f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_claude}┤")
+            print(border_mid)
 
     print(border_bot)
     print(f"\n{C_BOLD}Atajos rápidos para desarrollo a tiempo completo:{C_RESET}")
@@ -849,9 +842,13 @@ def cmd_switch(args):
     q = data.get("quota", {})
     g5h = q.get("gemini_5h_fraction")
     gweek = q.get("gemini_weekly_fraction")
+    aweek = q.get("argon_weekly_fraction")
+    aweek_val = aweek if aweek is not None else 1.0
+    aweek_reset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
     print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({data.get('email')}){C_RESET}")
     print(f"  Gemini 5H (Diario):     {make_linebar(g5h, length=12)} (reset: {format_countdown(q.get('gemini_5h_reset'))})")
     print(f"  Gemini Semanal:         {make_linebar(gweek, length=12)} (reset: {format_countdown(q.get('gemini_weekly_reset'))})")
+    print(f"  Gemini 4 Semanal:       {make_linebar(aweek_val, length=12)} (reset: {aweek_reset})")
     print(f"{C_DIM}A partir de ahora, 'agy' o '{alias}' utilizarán esta sesión con --dangerously-skip-permissions.{C_RESET}\n")
 
 def cmd_default(args):
@@ -1325,6 +1322,16 @@ def cmd_quota(args):
             if b_desc:
                 print(f"      {C_DIM}{b_desc}{C_RESET}")
 
+    has_argon_group = any("argon" in grp.get("displayName", "").lower() for grp in q_raw.get("groups", []))
+    if not has_argon_group:
+        q = data.get("quota", {})
+        aweek = q.get("argon_weekly_fraction")
+        aweek_val = aweek if aweek is not None else 1.0
+        areset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
+        print(f"\n{C_BOLD}{C_CYAN}▶ Gemini 4 Argon{C_RESET}")
+        print(f"  {C_DIM}Models within this group: Gemini 4 Argon (separate weekly quota bucket){C_RESET}")
+        print(f"    • {'Weekly Limit Remaining':<26} {make_linebar(aweek_val, length=16)}  (Reinicio: {areset})")
+
     print(f"\n{C_DIM}{q_raw.get('description', '')}{C_RESET}\n")
 
 def get_active_model_name() -> str:
@@ -1350,7 +1357,7 @@ def cmd_auto(args):
     forced_family = getattr(args, "family", None)
     if forced_family:
         forced_family = forced_family.lower()
-        if "argon" in forced_family:
+        if "argon" in forced_family or "gemini 4" in forced_family or "gemini-4" in forced_family:
             target_family = "argon"
         elif "claude" in forced_family or "gpt" in forced_family:
             target_family = "claude"
@@ -1358,7 +1365,7 @@ def cmd_auto(args):
             target_family = "gemini"
     else:
         m_lower = active_model.lower()
-        if "argon" in m_lower:
+        if "argon" in m_lower or "gemini 4" in m_lower or "gemini-4" in m_lower:
             target_family = "argon"
         elif "claude" in m_lower or "gpt" in m_lower or "opus" in m_lower or "sonnet" in m_lower:
             target_family = "claude"

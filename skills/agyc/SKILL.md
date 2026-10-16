@@ -15,8 +15,8 @@ Esta habilidad permite al agente consultar y administrar múltiples cuentas de G
 
 - `agyc` o `agyc list`: Muestra la tabla completa de cuentas con barras de progreso de consumo de tokens:
   - Gemini: 5H (diario) y Semanal.
+  - Gemini 4 (Argon): Columna dedicada con barras de progreso de consumo para todas las cuentas.
   - Claude & GPT: 5H (diario) y Semanal.
-  - Gemini 4 Argon: Cuota separada si está habilitada en la cuenta.
   - Estado de cada cuenta (ACTIVA, DEFAULT, LISTA, EXPIRADA).
 - `agyc list -r`: Fuerza la consulta en vivo a los servidores de Google para refrescar contadores de cuota y renovar tokens de acceso.
 - `agyc <alias>` o `agyc switch <alias>`: Cambia la sesión activa a otra cuenta (ej. `agyc agy02`).

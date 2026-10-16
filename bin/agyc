@@ -206,6 +206,60 @@ def sync_account_symlinks():
         except Exception:
             pass
 
+    # Sincronizar y activar agyc-statusline
+    ensure_statusline_configured()
+
+def ensure_statusline_configured():
+    """Garantiza que agyc-statusline esté configurado y activo en settings.json de todas las cuentas."""
+    bin_dir = get_bin_dir()
+    statusline_bin = os.path.join(bin_dir, "agyc-statusline")
+    if not os.path.exists(statusline_bin):
+        for cand in [
+            "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agyc-statusline",
+            "/home/aidev/proyectos/agyc-antigravity-cli-switcher/bin/agyc-statusline",
+            os.path.expanduser("~/.local/bin/agyc-statusline"),
+        ]:
+            if os.path.exists(cand):
+                try:
+                    shutil.copy2(cand, statusline_bin)
+                    os.chmod(statusline_bin, 0o755)
+                    break
+                except Exception:
+                    pass
+
+    base_paths = [
+        get_base_dir(),
+        os.path.expanduser("~/.gemini/antigravity-cli"),
+        "/home/aidev/.gemini/antigravity-cli",
+    ]
+    homes_base = os.path.expanduser("~/.agyc_homes")
+    if os.path.exists(homes_base):
+        try:
+            for h in os.listdir(homes_base):
+                cand = os.path.join(homes_base, h, ".gemini", "antigravity-cli")
+                if os.path.exists(cand):
+                    base_paths.append(cand)
+        except Exception:
+            pass
+
+    for bp in set(base_paths):
+        sp = os.path.join(bp, "settings.json")
+        if os.path.exists(sp):
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                cur = s.get("statusLine", {})
+                if cur.get("command") != "agyc-statusline" or not cur.get("enabled"):
+                    s["statusLine"] = {
+                        "type": "command",
+                        "command": "agyc-statusline",
+                        "enabled": True
+                    }
+                    with open(sp, "w", encoding="utf-8") as f:
+                        json.dump(s, f, indent=2)
+            except Exception:
+                pass
+
 def parse_iso_datetime(dt_str: str) -> datetime:
     clean = dt_str.replace("Z", "+00:00")
     if "." in clean:

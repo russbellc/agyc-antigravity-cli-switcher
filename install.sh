@@ -89,6 +89,12 @@ if [ -f "$SCRIPT_DIR/bin/agy" ]; then
     echo -e "  ${DIM}→ $AGY_BIN_DIR/agy${RESET}"
 fi
 
+if [ -f "$SCRIPT_DIR/bin/agyc-statusline" ]; then
+    cp -f "$SCRIPT_DIR/bin/agyc-statusline" "$AGY_BIN_DIR/agyc-statusline"
+    chmod +x "$AGY_BIN_DIR/agyc-statusline"
+    echo -e "  ${DIM}→ $AGY_BIN_DIR/agyc-statusline${RESET}"
+fi
+
 # Sincronizar a ruta snap si existe
 if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
     cp -f "$SCRIPT_DIR/bin/agyc" "$SNAP_BIN_DIR/agyc" 2>/dev/null && \
@@ -98,6 +104,11 @@ if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
     if [ -f "$SCRIPT_DIR/bin/agy" ]; then
         cp -f "$SCRIPT_DIR/bin/agy" "$SNAP_BIN_DIR/agy" 2>/dev/null && \
         chmod +x "$SNAP_BIN_DIR/agy" || true
+    fi
+
+    if [ -f "$SCRIPT_DIR/bin/agyc-statusline" ]; then
+        cp -f "$SCRIPT_DIR/bin/agyc-statusline" "$SNAP_BIN_DIR/agyc-statusline" 2>/dev/null && \
+        chmod +x "$SNAP_BIN_DIR/agyc-statusline" || true
     fi
 fi
 
@@ -111,7 +122,30 @@ if [ -f "$AGY_BIN_DIR/agy" ]; then
         cp -f "$AGY_BIN_DIR/agy" "$LOCAL_BIN/agy"
     chmod +x "$LOCAL_BIN/agy"
 fi
-echo -e "${GREEN}✓ agyc y wrapper agy instalados${RESET}"
+
+if [ -f "$AGY_BIN_DIR/agyc-statusline" ]; then
+    ln -sf "$AGY_BIN_DIR/agyc-statusline" "$LOCAL_BIN/agyc-statusline" 2>/dev/null || \
+        cp -f "$AGY_BIN_DIR/agyc-statusline" "$LOCAL_BIN/agyc-statusline"
+    chmod +x "$LOCAL_BIN/agyc-statusline"
+fi
+
+# Preconfigurar agyc-statusline en todos los settings.json
+python3 -c '
+import json, os, glob
+configs = glob.glob(os.path.expanduser("~/.agyc_homes/*/.gemini/antigravity-cli/settings.json")) + [
+    os.path.expanduser("~/.gemini/antigravity-cli/settings.json"),
+    "/home/aidev/.gemini/antigravity-cli/settings.json",
+]
+for p in set(configs):
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f: d = json.load(f)
+            d["statusLine"] = {"type": "command", "command": "agyc-statusline", "enabled": True}
+            with open(p, "w", encoding="utf-8") as f: json.dump(d, f, indent=2)
+        except Exception: pass
+' 2>/dev/null || true
+
+echo -e "${GREEN}✓ agyc, wrapper agy y agyc-statusline instalados${RESET}"
 echo ""
 
 # ── Paso 4: Crear lanzadores directos agy01..agy15 ───────────────────────────

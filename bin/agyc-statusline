@@ -29,6 +29,7 @@ C_YELLOW  = "\033[38;5;220m"   # Gold/Yellow
 C_ORANGE  = "\033[38;5;208m"   # Orange
 C_RED     = "\033[38;5;196m"   # Bright red
 C_MAGENTA = "\033[38;5;177m"   # Light purple/magenta
+C_PURPLE  = "\033[38;5;147m"   # Soft lavender/purple for models
 C_GRAY    = "\033[38;5;244m"   # Muted gray
 
 def make_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
@@ -253,25 +254,112 @@ def fetch_online_quota(alias: str) -> dict | None:
     # If no cache exists, do a quick fetch
     return do_fetch_and_save_quota(alias)
 
-def get_context_usage() -> tuple[float, int, int]:
+def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
+    """Detects active model name and reasoning effort level."""
+    model_name = None
+    effort = None
+
+    # 1. From stdin_data (if agy provides structured status payload)
+    if stdin_data:
+        m = stdin_data.get("model")
+        if isinstance(m, dict):
+            model_name = m.get("display_name") or m.get("name") or m.get("id")
+            effort = m.get("effort") or stdin_data.get("effort")
+        elif isinstance(m, str):
+            model_name = m
+        if not effort and "effort" in stdin_data:
+            effort = stdin_data.get("effort")
+
+    # 2. Check parent process cmdline for --model or --effort
+    if not model_name or not effort:
+        try:
+            pid = os.getppid()
+            for _ in range(4):
+                if pid <= 1:
+                    break
+                cmd_file = f"/proc/{pid}/cmdline"
+                if os.path.exists(cmd_file):
+                    with open(cmd_file, "rb") as f:
+                        parts = f.read().decode("utf-8", errors="ignore").split("\x00")
+                    for i, arg in enumerate(parts):
+                        if arg == "--model" and i + 1 < len(parts) and not model_name:
+                            model_name = parts[i + 1]
+                        elif arg == "--effort" and i + 1 < len(parts) and not effort:
+                            effort = parts[i + 1]
+                with open(f"/proc/{pid}/status") as sf:
+                    for line in sf:
+                        if line.startswith("PPid:"):
+                            pid = int(line.split()[1])
+                            break
+        except Exception:
+            pass
+
+    # 3. Check settings.json
+    if not model_name:
+        candidate_paths = [
+            os.path.expanduser(f"~/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json"),
+            f"/home/aidev/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json",
+            os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "") + "/settings.json" if os.environ.get("ANTIGRAVITY_APP_DATA_DIR") else "",
+            os.path.expanduser("~/.gemini/antigravity-cli/settings.json"),
+            "/home/aidev/.gemini/antigravity-cli/settings.json",
+        ]
+        for cp in candidate_paths:
+            if cp and os.path.exists(cp):
+                try:
+                    with open(cp, "r", encoding="utf-8") as f:
+                        s = json.load(f)
+                        raw_model = s.get("model")
+                        if raw_model:
+                            model_name = raw_model
+                        if not effort and s.get("effort"):
+                            effort = s.get("effort")
+                        if model_name:
+                            break
+                except Exception:
+                    pass
+
+    if not model_name:
+        model_name = "Gemini 3.8 Flash (High)"
+
+    # Extract effort if embedded in parentheses like "Gemini 3.8 Flash (High)"
+    match = re.match(r"^(.*?)(?:\s*\((.*?)\))?$", model_name)
+    if match:
+        clean_name = match.group(1).strip()
+        embedded_effort = match.group(2)
+        if embedded_effort and not effort:
+            effort = embedded_effort
+        model_name = clean_name
+
+    if not effort:
+        effort = "high"
+
+    effort_lower = effort.lower()
+    if effort_lower in ("high", "h"):
+        effort_color = C_YELLOW
+    elif effort_lower in ("max", "ultra"):
+        effort_color = C_RED
+    elif effort_lower in ("medium", "med", "m"):
+        effort_color = C_BLUE
+    else:
+        effort_color = C_DIM
+
+    return f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
+
+def get_context_usage(stdin_data: dict | None) -> tuple[float, int, int]:
     """Returns (fraction, estimated_tokens, max_tokens)."""
     max_tokens = 1_000_000
     
-    # Check if agy passes context data via stdin
-    try:
-        r, _, _ = select.select([sys.stdin], [], [], 0.01)
-        if r:
-            raw = sys.stdin.read()
-            if raw.strip().startswith("{"):
-                d = json.loads(raw)
-                ctx = d.get("context_window", {}) or d.get("context", {})
-                used = ctx.get("used_tokens") or ctx.get("total_tokens")
-                max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
-                if used:
-                    frac = min(1.0, float(used) / float(max_t))
-                    return (frac, int(used), int(max_t))
-    except Exception:
-        pass
+    # Check if stdin_data has context data
+    if stdin_data:
+        try:
+            ctx = stdin_data.get("context_window", {}) or stdin_data.get("context", {})
+            used = ctx.get("used_tokens") or ctx.get("total_tokens")
+            max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
+            if used:
+                frac = min(1.0, float(used) / float(max_t))
+                return (frac, int(used), int(max_t))
+        except Exception:
+            pass
 
     # Fallback: estimate from active conversation transcript
     base_dirs = [
@@ -316,6 +404,17 @@ def get_context_usage() -> tuple[float, int, int]:
     return (0.15, 150_000, max_tokens)
 
 def main():
+    # Read stdin non-blocking once if available
+    stdin_data = None
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0.01)
+        if r:
+            raw = sys.stdin.read()
+            if raw.strip().startswith("{"):
+                stdin_data = json.loads(raw)
+    except Exception:
+        pass
+
     # 1. Active Account
     account = detect_active_account()
     acc_badge = f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}"
@@ -324,7 +423,10 @@ def main():
     branch = get_git_branch()
     branch_badge = f"{C_BOLD}{C_GREEN}🌿 {branch}{C_RESET}" if branch else None
 
-    # 3. 5-Hour Quota
+    # 3. Model & Effort (placed before 5h quota)
+    model_badge = get_model_and_effort(stdin_data, account)
+
+    # 4. 5-Hour Quota
     quota = fetch_online_quota(account)
     if quota:
         q_frac = quota.get("gemini_5h_fraction")
@@ -333,13 +435,12 @@ def main():
         q_percent = int(round(q_frac * 100))
         q_bar = make_linebar(q_frac, length=8)
         q_countdown = format_countdown(quota.get("gemini_5h_reset"))
-        # Quota display: Saldo restante y cuenta regresiva
         quota_badge = f"{C_YELLOW}5H:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
     else:
         quota_badge = f"{C_YELLOW}5H:{C_RESET} [████████] 100% (⏳ 5h)"
 
-    # 4. Context Usage
-    ctx_frac, ctx_tokens, ctx_max = get_context_usage()
+    # 5. Context Usage
+    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data)
     ctx_percent = int(round(ctx_frac * 100))
     ctx_bar = make_context_linebar(ctx_frac, length=8)
     tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)
@@ -349,10 +450,11 @@ def main():
     # Separator
     sep = f" {C_GRAY}│{C_RESET} "
     
-    # Build complete statusline
+    # Build complete statusline: Cuenta -> Rama -> Modelo/Effort -> 5H Quota -> Contexto
     parts = [acc_badge]
     if branch_badge:
         parts.append(branch_badge)
+    parts.append(model_badge)
     parts.append(quota_badge)
     parts.append(ctx_badge)
 

@@ -148,7 +148,7 @@ def get_git_branch() -> str | None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=1
+            timeout=0.2
         )
         if res.returncode == 0:
             branch = res.stdout.strip()
@@ -158,7 +158,7 @@ def get_git_branch() -> str | None:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=1
+                timeout=0.2
             )
             is_dirty = bool(status_res.stdout.strip())
             return f"{branch}*" if is_dirty else branch
@@ -395,13 +395,45 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             pass
     return fallback_res if fallback_quota else None
 
+def spawn_background_refresh(alias: str):
+    """Spawns background refresh throttled by lock file (max 1 refresh per 30s)."""
+    lock_file = f"/tmp/agyc_quota_refreshing_{alias}.lock"
+    now_ts = time.time()
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, "r") as f:
+                lock_ts = float(f.read().strip())
+            if now_ts - lock_ts < 30:
+                return  # Another refresh was already spawned in the last 30s
+        except Exception:
+            pass
+
+    try:
+        with open(lock_file, "w") as f:
+            f.write(str(now_ts))
+    except Exception:
+        pass
+
+    try:
+        env = os.environ.copy()
+        env["HOME"] = REAL_HOME
+        subprocess.Popen(
+            [sys.executable, __file__, "--refresh-quota-bg", alias],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env
+        )
+    except Exception:
+        pass
+
 def fetch_online_quota(alias: str) -> dict | None:
-    """Fetches quota using tiered stale-while-revalidate pattern.
+    """Non-blocking quota fetcher. NEVER executes network calls in the foreground!
     
-    TTL tiers:
-    - < 60s  : use cache as-is (very fresh)
-    - 60s-5m : use cache + background refresh
-    - > 5m   : synchronous fetch (discard stale cache)
+    1. If cache exists and is fresh (< 60s): return cache immediately.
+    2. If cache exists and is stale (>= 60s): return cache immediately + spawn background refresh.
+    3. If cache does not exist: read accounts/{alias}.json fallback + spawn background refresh.
+    Execution time is always < 5ms.
     """
     cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
     now_ts = time.time()
@@ -414,31 +446,26 @@ def fetch_online_quota(alias: str) -> dict | None:
         except Exception:
             pass
 
-    cache_age = now_ts - cached.get("cached_at", 0) if cached else float("inf")
-
-    # TIER 1: Cache is very fresh (< 60s) — return immediately
-    if cached and cache_age < 60:
+    if cached:
+        cache_age = now_ts - cached.get("cached_at", 0)
+        if cache_age >= 60:
+            spawn_background_refresh(alias)
         return cached
 
-    # TIER 2: Cache is stale (60s–5min) — return old + refresh in background
-    if cached and cache_age < 300:
+    # If no cache exists, read from account JSON as immediate fallback and spawn background
+    spawn_background_refresh(alias)
+    acc_path = get_account_file_path(alias)
+    if acc_path and os.path.exists(acc_path):
         try:
-            # Pass REAL_HOME so the subprocess finds account files correctly
-            env = os.environ.copy()
-            env["HOME"] = REAL_HOME
-            subprocess.Popen(
-                [sys.executable, __file__, "--refresh-quota-bg", alias],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-                env=env
-            )
+            with open(acc_path, "r") as f:
+                acc_data = json.load(f)
+                q = acc_data.get("quota")
+                if q:
+                    return q
         except Exception:
             pass
-        return cached
 
-    # TIER 3: Cache is very stale (> 5min) or non-existent — synchronous fetch
-    return do_fetch_and_save_quota(alias)
+    return None
 
 def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     """Detects active model name and reasoning effort level."""
@@ -569,10 +596,12 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
         return frac, reset_t, "5H"
 
 def find_parent_agy_pid() -> int | None:
-    """Climbs the process tree to find the parent agy CLI process."""
+    """Climbs the process tree to find the parent agy CLI process (max 8 hops)."""
     try:
         pid = os.getppid()
-        while pid > 1:
+        for _ in range(8):
+            if pid <= 1:
+                break
             cmd_file = f"/proc/{pid}/cmdline"
             if os.path.exists(cmd_file):
                 try:

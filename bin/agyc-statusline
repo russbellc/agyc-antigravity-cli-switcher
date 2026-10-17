@@ -92,10 +92,12 @@ def format_countdown(reset_iso: str | None) -> str:
         now = datetime.now(timezone.utc)
         diff = dt - now
         total_sec = int(diff.total_seconds())
-        if total_sec <= 0:
-            return "Listo"
         hrs = total_sec // 3600
         mins = (total_sec % 3600) // 60
+        if hrs >= 24:
+            days = hrs // 24
+            rem_hrs = hrs % 24
+            return f"{days}d {rem_hrs:02d}h"
         if hrs > 0:
             return f"{hrs}h {mins:02d}m"
         return f"{mins}m"
@@ -306,7 +308,7 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                     "User-Agent": "antigravity/1.2.11 linux/amd64"
                 }
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 
             metrics = {
@@ -369,6 +371,10 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             try:
                 with open(cache_file, "w") as f:
                     json.dump(metrics, f)
+                # Persist to accounts JSON so future fallback is also accurate
+                acc_data["quota"] = metrics
+                with open(acc_path, "w") as f:
+                    json.dump(acc_data, f, indent=2)
             except Exception:
                 pass
             return metrics
@@ -380,15 +386,14 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         except Exception:
             continue
     
-    # All endpoints failed - use fallback
-    if fallback_quota:
+    # All endpoints failed - return existing disk cache if present, else fallback without poisoning
+    if os.path.exists(cache_file):
         try:
-            with open(cache_file, "w") as f:
-                json.dump(fallback_res, f)
+            with open(cache_file, "r") as f:
+                return json.load(f)
         except Exception:
             pass
-        return fallback_res
-    return None
+    return fallback_res if fallback_quota else None
 
 def fetch_online_quota(alias: str) -> dict | None:
     """Fetches quota using tiered stale-while-revalidate pattern.

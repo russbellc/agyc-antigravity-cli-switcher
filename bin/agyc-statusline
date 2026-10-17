@@ -568,8 +568,74 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
         reset_t = quota.get("gemini_5h_reset")
         return frac, reset_t, "5H"
 
+def find_parent_agy_pid() -> int | None:
+    """Climbs the process tree to find the parent agy CLI process."""
+    try:
+        pid = os.getppid()
+        while pid > 1:
+            cmd_file = f"/proc/{pid}/cmdline"
+            if os.path.exists(cmd_file):
+                try:
+                    with open(cmd_file, "rb") as f:
+                        cmd = f.read().decode("utf-8", errors="ignore")
+                        if "agy" in cmd and "statusline" not in cmd:
+                            return pid
+                except Exception:
+                    pass
+            status_file = f"/proc/{pid}/status"
+            if not os.path.exists(status_file):
+                break
+            ppid = None
+            with open(status_file, "r") as sf:
+                for line in sf:
+                    if line.startswith("PPid:"):
+                        ppid = int(line.split()[1])
+                        break
+            if not ppid or ppid == pid:
+                break
+            pid = ppid
+    except Exception:
+        pass
+    return None
+
+def get_session_conv_id() -> str | None:
+    """Detects conversation ID specific to THIS terminal instance of agy."""
+    # 1. From environment variable (if passed by agy / subagents)
+    env_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+    if env_conv:
+        return env_conv
+
+    # 2. From the calling agy process open file descriptors
+    agy_pid = find_parent_agy_pid()
+    if not agy_pid:
+        return None
+    
+    fd_dir = f"/proc/{agy_pid}/fd"
+    if not os.path.isdir(fd_dir):
+        return None
+
+    try:
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+                m = re.search(r"conversations/([a-f0-9\-]{36})\.db", target)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
 def find_active_transcript(conv_id: str | None = None) -> str | None:
-    """Finds the active conversation transcript file across all known homes and brain dirs."""
+    """Finds the conversation transcript file for THIS specific terminal session."""
+    if not conv_id:
+        conv_id = get_session_conv_id()
+
+    # If this specific terminal session has no active conversation yet, it is a brand new session!
+    if not conv_id:
+        return None
+
     candidate_bases = [
         os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
         os.path.expanduser("~/.gemini/antigravity-cli"),
@@ -579,41 +645,15 @@ def find_active_transcript(conv_id: str | None = None) -> str | None:
         f"{REAL_HOME}/.agyc_homes/agy03/.gemini/antigravity-cli",
     ]
     
-    # 1. If explicit conv_id is provided, try that first
-    if conv_id:
-        for base in candidate_bases:
-            if not base or not os.path.isdir(base):
-                continue
-            log_dir = os.path.join(base, "brain", conv_id, ".system_generated", "logs")
-            for fname in ("transcript.jsonl", "transcript_full.jsonl"):
-                cand = os.path.join(log_dir, fname)
-                if os.path.isfile(cand):
-                    return cand
-
-    # 2. Otherwise, find newest transcript.jsonl across all brain directories
-    seen = set()
-    candidates = []
     for base in candidate_bases:
         if not base or not os.path.isdir(base):
             continue
-        brain_dir = os.path.join(base, "brain")
-        if not os.path.isdir(brain_dir):
-            continue
-        real_brain = os.path.realpath(brain_dir)
-        if real_brain in seen:
-            continue
-        seen.add(real_brain)
-        try:
-            for d in os.listdir(real_brain):
-                t = os.path.join(real_brain, d, ".system_generated", "logs", "transcript.jsonl")
-                if os.path.isfile(t):
-                    candidates.append((os.path.getmtime(t), t))
-        except Exception:
-            pass
+        log_dir = os.path.join(base, "brain", conv_id, ".system_generated", "logs")
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            cand = os.path.join(log_dir, fname)
+            if os.path.isfile(cand):
+                return cand
 
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
     return None
 
 def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[float, int, int]:

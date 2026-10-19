@@ -92,6 +92,8 @@ def format_countdown(reset_iso: str | None) -> str:
         now = datetime.now(timezone.utc)
         diff = dt - now
         total_sec = int(diff.total_seconds())
+        if total_sec <= 0:
+            return "0m"
         hrs = total_sec // 3600
         mins = (total_sec % 3600) // 60
         if hrs >= 24:
@@ -376,12 +378,16 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                         metrics["has_gemini4"] = True
                         
             try:
-                with open(cache_file, "w") as f:
+                tmp_cache = cache_file + ".tmp"
+                with open(tmp_cache, "w") as f:
                     json.dump(metrics, f)
+                os.replace(tmp_cache, cache_file)
                 # Persist to accounts JSON so future fallback is also accurate
                 acc_data["quota"] = metrics
-                with open(acc_path, "w") as f:
+                tmp_acc = acc_path + ".tmp"
+                with open(tmp_acc, "w") as f:
                     json.dump(acc_data, f, indent=2)
+                os.replace(tmp_acc, acc_path)
             except Exception:
                 pass
             return metrics
@@ -567,48 +573,56 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     badge = f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
     return badge, model_name, effort_lower
 
-def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, str]:
-    """Returns (fraction, reset_time_iso, label) based on active model family."""
+def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, float | None, str | None, str]:
+    """Returns (frac_5h, reset_5h, frac_sem, reset_sem, label) based on active model family."""
     if not quota:
-        return 1.0, None, "5H"
+        return 1.0, None, 1.0, None, "5H"
 
     m = (model_name or "").lower()
     
     # 1. Claude & GPT Models
     if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
-        frac = quota.get("claude_5h_fraction")
-        if frac is None:
-            frac = 1.0
-        reset_t = quota.get("claude_5h_reset")
-        weekly_frac = quota.get("claude_weekly_fraction", 1.0)
+        frac_5h = quota.get("claude_5h_fraction")
+        if frac_5h is None:
+            frac_5h = 1.0
+        reset_5h = quota.get("claude_5h_reset")
+        frac_sem = quota.get("claude_weekly_fraction", 1.0)
+        reset_sem = quota.get("claude_weekly_reset")
         is_disabled = quota.get("claude_disabled", False)
         
-        # If weekly limit is 0 or disabled, quota is locked
-        if weekly_frac == 0 or is_disabled:
-            reset_t = quota.get("claude_weekly_reset") or reset_t
-            frac = 0.0
-            return frac, reset_t, "5H (Claude)"
-        return frac, reset_t, "5H (Claude)"
+        # If weekly limit is 0 or disabled, 5H is locked to 0
+        if (frac_sem is not None and frac_sem <= 0.001) or is_disabled:
+            reset_5h = reset_sem or reset_5h
+            frac_5h = 0.0
+            frac_sem = 0.0
+            return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
+        return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
 
     # 2. Gemini 4 Argon Models
     elif "argon" in m:
         has_g4 = bool(quota and quota.get("has_gemini4") and (quota.get("argon_weekly_fraction") is not None))
         if not has_g4:
-            return 0.0, None, "Sem (Argon: No cuenta)"
-        frac = quota.get("argon_weekly_fraction", 1.0)
-        reset_t = quota.get("argon_weekly_reset")
-        return frac, reset_t, "Sem (Argon)"
+            return 0.0, None, None, None, "Argon: No cuenta"
+        frac_sem = quota.get("argon_weekly_fraction", 1.0)
+        reset_sem = quota.get("argon_weekly_reset")
+        frac_5h = quota.get("gemini_5h_fraction", 1.0)
+        reset_5h = quota.get("gemini_5h_reset")
+        if frac_sem is not None and frac_sem <= 0.001:
+            frac_5h = 0.0
+            frac_sem = 0.0
+        return frac_5h, reset_5h, frac_sem, reset_sem, "Argon"
 
     # 3. Standard Gemini Models (Flash, Pro)
     else:
-        weekly_frac = quota.get("gemini_weekly_fraction", 1.0)
+        frac_sem = quota.get("gemini_weekly_fraction", 1.0)
+        reset_sem = quota.get("gemini_weekly_reset")
         is_disabled = quota.get("gemini_disabled", False)
-        if weekly_frac == 0 or is_disabled:
-            reset_t = quota.get("gemini_weekly_reset") or quota.get("gemini_5h_reset")
-            return 0.0, reset_t, "5H"
-        frac = quota.get("gemini_5h_fraction", 1.0)
-        reset_t = quota.get("gemini_5h_reset")
-        return frac, reset_t, "5H"
+        if (frac_sem is not None and frac_sem <= 0.001) or is_disabled:
+            reset_5h = reset_sem or quota.get("gemini_5h_reset")
+            return 0.0, reset_5h, 0.0, reset_sem, "5H"
+        frac_5h = quota.get("gemini_5h_fraction", 1.0)
+        reset_5h = quota.get("gemini_5h_reset")
+        return frac_5h, reset_5h, frac_sem, reset_sem, "5H"
 
 def find_parent_agy_pid() -> int | None:
     """Climbs the process tree to find the parent agy CLI process (max 8 hops)."""
@@ -760,19 +774,9 @@ def main():
     # 3. Model & Effort (placed before 5h quota)
     model_badge, model_name, effort = get_model_and_effort(stdin_data, account)
 
-    # 4. 5-Hour Quota (dynamically matching active model)
+    # 4. Quota (5H rolling window & Weekly subscription limit)
     quota = fetch_online_quota(account)
-    q_frac, q_reset, q_label = get_quota_for_model(quota, model_name)
-    q_percent = int(round(q_frac * 100))
-    q_bar = make_linebar(q_frac, length=8)
-    q_countdown = format_countdown(q_reset)
-
-    if q_label.endswith("(No cuenta)"):
-        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {C_DIM}[────────] No cuenta{C_RESET}"
-    elif q_percent >= 100:
-        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(Disponible){C_RESET}"
-    else:
-        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"
+    f5, r5, fs, rs, q_label = get_quota_for_model(quota, model_name)
 
     # 5. Context Usage (adjusted for model max context window)
     ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name)
@@ -785,12 +789,34 @@ def main():
     # Separator
     sep = f" {C_GRAY}│{C_RESET} "
     
-    # Build complete statusline: Cuenta -> Rama -> Modelo/Effort -> 5H Quota -> Contexto
+    # Build complete statusline
     parts = [acc_badge]
     if branch_badge:
         parts.append(branch_badge)
     parts.append(model_badge)
-    parts.append(quota_badge)
+
+    if q_label.startswith("Argon: No cuenta"):
+        parts.append(f"{C_YELLOW}Argon:{C_RESET} {C_DIM}[────────] No cuenta{C_RESET}")
+    else:
+        p5 = int(round(f5 * 100))
+        c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
+        if p5 >= 100:
+            str_5h = f"{C_YELLOW}5H:{C_RESET} {c5}{C_BOLD}100%{C_RESET}"
+        else:
+            str_5h = f"{C_YELLOW}5H:{C_RESET} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
+        parts.append(str_5h)
+
+        if fs is not None:
+            ps = int(round(fs * 100))
+            bar_s = make_linebar(fs, length=8)
+            cd_s = format_countdown(rs)
+            cs = C_GREEN if ps >= 50 else (C_YELLOW if ps >= 20 else C_RED)
+            if ps >= 100:
+                str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET}"
+            else:
+                str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET} {C_DIM}({cd_s}){C_RESET}"
+            parts.append(str_sem)
+
     parts.append(ctx_badge)
 
     line = sep.join(parts)

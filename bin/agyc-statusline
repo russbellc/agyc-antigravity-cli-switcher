@@ -601,6 +601,11 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
 
     # 3. Standard Gemini Models (Flash, Pro)
     else:
+        weekly_frac = quota.get("gemini_weekly_fraction", 1.0)
+        is_disabled = quota.get("gemini_disabled", False)
+        if weekly_frac == 0 or is_disabled:
+            reset_t = quota.get("gemini_weekly_reset") or quota.get("gemini_5h_reset")
+            return 0.0, reset_t, "5H"
         frac = quota.get("gemini_5h_fraction", 1.0)
         reset_t = quota.get("gemini_5h_reset")
         return frac, reset_t, "5H"

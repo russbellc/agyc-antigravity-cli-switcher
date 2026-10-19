@@ -410,10 +410,12 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
         "gemini_5h_reset": None,
         "gemini_weekly_fraction": None,
         "gemini_weekly_reset": None,
+        "gemini_disabled": False,
         "claude_5h_fraction": None,
         "claude_5h_reset": None,
         "claude_weekly_fraction": None,
         "claude_weekly_reset": None,
+        "claude_disabled": False,
         "argon_weekly_fraction": None,
         "argon_weekly_reset": None,
         "has_gemini4": False,
@@ -449,6 +451,7 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                 b_name = b.get("displayName", "").lower()
                 frac = b.get("remainingFraction")
                 reset_t = b.get("resetTime")
+                dis = b.get("disabled", False)
                 if "argon" in b_id or "argon" in b_name:
                     metrics["argon_weekly_fraction"] = frac
                     metrics["argon_weekly_reset"] = reset_t
@@ -456,9 +459,13 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                 elif "5h" in b_id or win == "5h":
                     metrics["gemini_5h_fraction"] = frac
                     metrics["gemini_5h_reset"] = reset_t
+                    if dis:
+                        metrics["gemini_disabled"] = True
                 elif "weekly" in b_id or win == "weekly":
                     metrics["gemini_weekly_fraction"] = frac
                     metrics["gemini_weekly_reset"] = reset_t
+                    if frac == 0 or dis:
+                        metrics["gemini_disabled"] = True
 
         # 3. Grupo Claude y GPT
         elif "claude" in d_lower or "gpt" in d_lower or "3p" in d_lower:
@@ -467,12 +474,17 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                 win = b.get("window", "").lower()
                 frac = b.get("remainingFraction")
                 reset_t = b.get("resetTime")
+                dis = b.get("disabled", False)
                 if "5h" in b_id or win == "5h":
                     metrics["claude_5h_fraction"] = frac
                     metrics["claude_5h_reset"] = reset_t
+                    if dis:
+                        metrics["claude_disabled"] = True
                 elif "weekly" in b_id or win == "weekly":
                     metrics["claude_weekly_fraction"] = frac
                     metrics["claude_weekly_reset"] = reset_t
+                    if frac == 0 or dis:
+                        metrics["claude_disabled"] = True
     return metrics
 
 def fetch_user_profile(access_token: str) -> dict:
@@ -733,7 +745,7 @@ def cmd_list(args):
         try:
             force_ref = getattr(args, "refresh", False)
             token_data, refreshed = refresh_token_if_needed(token_data, force=force_ref)
-            if refreshed or force_ref or "has_gemini4" not in data.get("quota", {}):
+            if refreshed or force_ref or "claude_disabled" not in data.get("quota", {}):
                 data["token_data"] = token_data
                 data["is_revoked"] = False
                 access_token = token_data.get("token", {}).get("access_token")
@@ -826,19 +838,30 @@ def cmd_list(args):
             g5h_reset = format_countdown(q.get("gemini_5h_reset"))
             gweek = q.get("gemini_weekly_fraction")
             gweek_reset = format_countdown(q.get("gemini_weekly_reset"))
+            g_disabled = q.get("gemini_disabled", False)
 
             c5h = q.get("claude_5h_fraction")
             c5h_reset = format_countdown(q.get("claude_5h_reset"))
             cweek = q.get("claude_weekly_fraction")
             cweek_reset = format_countdown(q.get("claude_weekly_reset"))
+            c_disabled = q.get("claude_disabled", False)
 
             has_g4 = bool(q.get("has_gemini4", False) and (q.get("argon_weekly_fraction") is not None))
             aweek = q.get("argon_weekly_fraction")
             aweek_reset = q.get("argon_weekly_reset")
 
-            # Fila 1: Límites Diarios (5 Horas)
-            g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
-            c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
+            # Fila 1: Límites Diarios (5 Horas) con coherencia frente al límite semanal
+            g_weekly_empty = (gweek is not None and gweek <= 0.001) or g_disabled
+            if g_weekly_empty:
+                g_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
+            else:
+                g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+
+            c_weekly_empty = (cweek is not None and cweek <= 0.001) or c_disabled
+            if c_weekly_empty:
+                c_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
+            else:
+                c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
 
             # Fila 2: Límites Semanales
             g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
@@ -850,7 +873,11 @@ def cmd_list(args):
                 g4_line2 = f"{C_DIM}Sem: [──────────] No cuenta{C_RESET}"
             else:
                 aweek_reset_str = format_countdown(aweek_reset) if aweek_reset else "168h"
-                g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+                a_weekly_empty = (aweek is not None and aweek <= 0.001)
+                if a_weekly_empty:
+                    g4_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
+                else:
+                    g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
                 g4_line2 = f"Sem: {make_linebar(aweek, length=10)} ({aweek_reset_str})"
 
         row1 = (
@@ -904,16 +931,28 @@ def cmd_switch(args):
     q = data.get("quota", {})
     g5h = q.get("gemini_5h_fraction")
     gweek = q.get("gemini_weekly_fraction")
+    g_disabled = q.get("gemini_disabled", False)
     has_g4 = bool(q.get("has_gemini4", False) and (q.get("argon_weekly_fraction") is not None))
     aweek = q.get("argon_weekly_fraction")
     aweek_reset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
+
+    cweek = q.get("claude_weekly_fraction")
+    c_disabled = q.get("claude_disabled", False)
+
     print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({data.get('email')}){C_RESET}")
-    print(f"  Gemini 5H (Diario):     {make_linebar(g5h, length=12)} (reset: {format_countdown(q.get('gemini_5h_reset'))})")
+    if (gweek is not None and gweek <= 0.001) or g_disabled:
+        print(f"  Gemini 5H (Diario):     {make_linebar(0.0, length=12)} {C_RED}(Semanal agotada){C_RESET}")
+    else:
+        print(f"  Gemini 5H (Diario):     {make_linebar(g5h, length=12)} (reset: {format_countdown(q.get('gemini_5h_reset'))})")
     print(f"  Gemini Semanal:         {make_linebar(gweek, length=12)} (reset: {format_countdown(q.get('gemini_weekly_reset'))})")
     if not has_g4:
         print(f"  Gemini 4 Semanal:       {C_DIM}[────────────] No cuenta (No habilitado aún por Google){C_RESET}")
     else:
         print(f"  Gemini 4 Semanal:       {make_linebar(aweek, length=12)} (reset: {aweek_reset})")
+    if (cweek is not None and cweek <= 0.001) or c_disabled:
+        print(f"  Claude Semanal:         {make_linebar(0.0, length=12)} (reset: {format_countdown(q.get('claude_weekly_reset'))}) {C_RED}[AGOTADA]{C_RESET}")
+    elif cweek is not None:
+        print(f"  Claude Semanal:         {make_linebar(cweek, length=12)} (reset: {format_countdown(q.get('claude_weekly_reset'))})")
     print(f"{C_DIM}A partir de ahora, 'agy' o '{alias}' utilizarán esta sesión con --dangerously-skip-permissions.{C_RESET}\n")
 
 def cmd_default(args):
@@ -1379,10 +1418,13 @@ def cmd_quota(args):
             reset_t = b.get("resetTime")
             b_desc = b.get("description", "")
             is_dis = b.get("disabled", False)
-
-            bar = make_linebar(frac, length=16)
+            if is_dis:
+                bar = make_linebar(0.0, length=16)
+                dis_str = f" {C_RED}[Inactivo - Semanal agotada]{C_RESET}"
+            else:
+                bar = make_linebar(frac, length=16)
+                dis_str = ""
             reset_str = format_countdown(reset_t)
-            dis_str = f" {C_YELLOW}[Inactivo]{C_RESET}" if is_dis else ""
             print(f"    • {d_name:<26} {bar}  (Reinicio: {reset_str}){dis_str}")
             if b_desc:
                 print(f"      {C_DIM}{b_desc}{C_RESET}")
@@ -1493,9 +1535,17 @@ def cmd_auto(args):
         elif target_family == "claude":
             q5h = quota.get("claude_5h_fraction")
             qweek = quota.get("claude_weekly_fraction")
+            c_dis = quota.get("claude_disabled", False)
+            if (qweek is not None and qweek <= 0.001) or c_dis:
+                q5h = 0.0
+                qweek = 0.0
         else:
             q5h = quota.get("gemini_5h_fraction")
             qweek = quota.get("gemini_weekly_fraction")
+            g_dis = quota.get("gemini_disabled", False)
+            if (qweek is not None and qweek <= 0.001) or g_dis:
+                q5h = 0.0
+                qweek = 0.0
 
         q5h = 0.0 if q5h is None else float(q5h)
         qweek = 0.0 if qweek is None else float(qweek)

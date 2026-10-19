@@ -295,110 +295,129 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             return fallback_res
         return None
 
-    endpoints = [
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-    ]
-    
-    for url in endpoints:
+    metrics = {
+        "gemini_5h_fraction": 1.0,
+        "gemini_5h_reset": None,
+        "gemini_weekly_fraction": 1.0,
+        "gemini_weekly_reset": None,
+        "claude_5h_fraction": 1.0,
+        "claude_5h_reset": None,
+        "claude_weekly_fraction": 1.0,
+        "claude_weekly_reset": None,
+        "claude_disabled": False,
+        "argon_weekly_fraction": None,
+        "argon_weekly_reset": None,
+        "has_gemini4": False,
+        "cached_at": now_ts
+    }
+
+    # 1. Fetch live per-model quota from retrieveUserQuota (daily first, then prod)
+    models_data = None
+    for host in ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]:
         try:
+            url = f"https://{host}/v1internal:retrieveUserQuota"
             req = urllib.request.Request(
                 url,
                 data=b"{}",
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.2.11 linux/amd64"
+                    "User-Agent": "antigravity/1.4.0 linux/amd64"
                 }
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                
-            metrics = {
-                "gemini_5h_fraction": 1.0,
-                "gemini_5h_reset": None,
-                "gemini_weekly_fraction": 1.0,
-                "gemini_weekly_reset": None,
-                "claude_5h_fraction": 1.0,
-                "claude_5h_reset": None,
-                "claude_weekly_fraction": 1.0,
-                "claude_weekly_reset": None,
-                "claude_disabled": False,
-                "argon_weekly_fraction": None,
-                "argon_weekly_reset": None,
-                "has_gemini4": False,
-                "cached_at": now_ts
-            }
-            for grp in data.get("groups", []):
-                grp_name = grp.get("displayName", "").lower()
-                buckets = grp.get("buckets", [])
-                
-                # Gemini Models
-                if "gemini" in grp_name and "argon" not in grp_name:
-                    for b in buckets:
-                        b_id = b.get("bucketId", "").lower()
-                        b_win = b.get("window", "").lower()
-                        frac = b.get("remainingFraction", 1.0)
-                        reset_t = b.get("resetTime")
-                        if "argon" in b_id:
-                            metrics["argon_weekly_fraction"] = frac
-                            metrics["argon_weekly_reset"] = reset_t
-                            metrics["has_gemini4"] = True
-                        elif "5h" in b_id or b_win == "5h":
-                            metrics["gemini_5h_fraction"] = frac
-                            metrics["gemini_5h_reset"] = reset_t
-                        elif "weekly" in b_id or b_win == "weekly":
-                            metrics["gemini_weekly_fraction"] = frac
-                            metrics["gemini_weekly_reset"] = reset_t
-
-                # Claude and GPT Models
-                elif any(k in grp_name for k in ("claude", "gpt", "3p")):
-                    for b in buckets:
-                        b_id = b.get("bucketId", "").lower()
-                        b_win = b.get("window", "").lower()
-                        frac = b.get("remainingFraction", 1.0)
-                        reset_t = b.get("resetTime")
-                        dis = b.get("disabled", False)
-                        if "5h" in b_id or b_win == "5h":
-                            metrics["claude_5h_fraction"] = frac
-                            metrics["claude_5h_reset"] = reset_t
-                            if dis:
-                                metrics["claude_disabled"] = True
-                        elif "weekly" in b_id or b_win == "weekly":
-                            metrics["claude_weekly_fraction"] = frac
-                            metrics["claude_weekly_reset"] = reset_t
-                            if frac == 0 or dis:
-                                metrics["claude_disabled"] = True
-
-                # Argon Models
-                elif "argon" in grp_name:
-                    for b in buckets:
-                        metrics["argon_weekly_fraction"] = b.get("remainingFraction", 1.0)
-                        metrics["argon_weekly_reset"] = b.get("resetTime")
-                        metrics["has_gemini4"] = True
-                        
-            try:
-                tmp_cache = cache_file + ".tmp"
-                with open(tmp_cache, "w") as f:
-                    json.dump(metrics, f)
-                os.replace(tmp_cache, cache_file)
-                # Persist to accounts JSON so future fallback is also accurate
-                acc_data["quota"] = metrics
-                tmp_acc = acc_path + ".tmp"
-                with open(tmp_acc, "w") as f:
-                    json.dump(acc_data, f, indent=2)
-                os.replace(tmp_acc, acc_path)
-            except Exception:
-                pass
-            return metrics
-
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                models_data = json.loads(resp.read().decode("utf-8"))
+            break
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                break  # Token invalid, don't retry different endpoint
+                break
             continue
         except Exception:
             continue
-    
+
+    if models_data and "buckets" in models_data:
+        for b in models_data.get("buckets", []):
+            mid = b.get("modelId", "").lower()
+            frac = b.get("remainingFraction", 1.0)
+            rst = b.get("resetTime")
+            if "gemini-3.8" in mid or "gemini-2.5-flash" in mid:
+                metrics["gemini_5h_fraction"] = frac
+                metrics["gemini_5h_reset"] = rst
+            elif "claude-sonnet" in mid or "claude-opus" in mid:
+                metrics["claude_5h_fraction"] = frac
+                metrics["claude_5h_reset"] = rst
+                if frac == 0:
+                    metrics["claude_disabled"] = True
+            elif "argon" in mid or "gemini-4" in mid:
+                metrics["argon_weekly_fraction"] = frac
+                metrics["argon_weekly_reset"] = rst
+                metrics["has_gemini4"] = True
+
+    # 2. Fetch weekly group quota from retrieveUserQuotaSummary (prod first, then daily)
+    summary_data = None
+    for host in ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"]:
+        try:
+            url = f"https://{host}/v1internal:retrieveUserQuotaSummary"
+            req = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/1.4.0 linux/amd64"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                summary_data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                break
+            continue
+        except Exception:
+            continue
+
+    if summary_data and "groups" in summary_data:
+        for grp in summary_data.get("groups", []):
+            gn = grp.get("displayName", "").lower()
+            for b in grp.get("buckets", []):
+                bid = b.get("bucketId", "").lower()
+                frac = b.get("remainingFraction", 1.0)
+                rst = b.get("resetTime")
+                if "gemini" in gn and "weekly" in bid:
+                    metrics["gemini_weekly_fraction"] = frac
+                    metrics["gemini_weekly_reset"] = rst
+                elif any(k in gn for k in ("claude", "gpt", "3p")) and "weekly" in bid:
+                    metrics["claude_weekly_fraction"] = frac
+                    metrics["claude_weekly_reset"] = rst
+                    if frac == 0 or b.get("disabled", False):
+                        metrics["claude_disabled"] = True
+                elif "argon" in bid or "argon" in gn:
+                    metrics["argon_weekly_fraction"] = frac
+                    metrics["argon_weekly_reset"] = rst
+                    metrics["has_gemini4"] = True
+
+    # Consistency rule: if weekly Claude is 0 or disabled, 5H is locked to 0
+    if (metrics.get("claude_weekly_fraction") is not None and metrics["claude_weekly_fraction"] <= 0.001) or metrics.get("claude_disabled"):
+        metrics["claude_5h_fraction"] = 0.0
+        metrics["claude_disabled"] = True
+
+    if models_data or summary_data:
+        try:
+            tmp_cache = cache_file + ".tmp"
+            with open(tmp_cache, "w") as f:
+                json.dump(metrics, f)
+            os.replace(tmp_cache, cache_file)
+            # Persist to accounts JSON so future fallback is also accurate
+            acc_data["quota"] = metrics
+            tmp_acc = acc_path + ".tmp"
+            with open(tmp_acc, "w") as f:
+                json.dump(acc_data, f, indent=2)
+            os.replace(tmp_acc, acc_path)
+        except Exception:
+            pass
+        return metrics
+
     # All endpoints failed - return existing disk cache if present, else fallback without poisoning
     if os.path.exists(cache_file):
         try:
@@ -800,10 +819,11 @@ def main():
     else:
         p5 = int(round(f5 * 100))
         c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
+        bar_5 = make_linebar(f5, length=8)
         if p5 >= 100:
-            str_5h = f"{C_YELLOW}5H:{C_RESET} {c5}{C_BOLD}100%{C_RESET}"
+            str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}100%{C_RESET}"
         else:
-            str_5h = f"{C_YELLOW}5H:{C_RESET} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
+            str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
         parts.append(str_5h)
 
         if fs is not None:

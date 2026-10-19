@@ -387,6 +387,7 @@ def fetch_quota_summary(access_token: str) -> dict | None:
         "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
         "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     ]
+    summary_data = None
     for url in endpoints:
         try:
             req = urllib.request.Request(
@@ -395,16 +396,43 @@ def fetch_quota_summary(access_token: str) -> dict | None:
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.2.11 linux/amd64",
+                    "User-Agent": "antigravity/1.4.0 linux/amd64",
                 }
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                summary_data = json.loads(resp.read().decode("utf-8"))
+                break
         except Exception:
             continue
-    return None
 
-def extract_quota_metrics(quota_json: dict | None) -> dict:
+    if not summary_data:
+        return None
+
+    # Fetch live per-model quota from retrieveUserQuota (crucial for real-time 5H limits)
+    models_endpoints = [
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+    ]
+    for url in models_endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({}).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": "antigravity/1.4.0 linux/amd64",
+                }
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                summary_data["_models_quota"] = json.loads(resp.read().decode("utf-8"))
+                break
+        except Exception:
+            continue
+
+    return summary_data
+
+def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = None) -> dict:
     metrics = {
         "gemini_5h_fraction": None,
         "gemini_5h_reset": None,
@@ -423,6 +451,9 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
     }
     if not quota_json or "groups" not in quota_json:
         return metrics
+
+    if not models_json and isinstance(quota_json, dict):
+        models_json = quota_json.get("_models_quota")
 
     for grp in quota_json.get("groups", []):
         display = grp.get("displayName", "")
@@ -485,6 +516,36 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                     metrics["claude_weekly_reset"] = reset_t
                     if frac == 0 or dis:
                         metrics["claude_disabled"] = True
+
+    # 4. Override con métricas live por modelo de retrieveUserQuota
+    if models_json and "buckets" in models_json:
+        for b in models_json.get("buckets", []):
+            mid = b.get("modelId", "").lower()
+            frac = b.get("remainingFraction")
+            rst = b.get("resetTime")
+            if frac is None:
+                continue
+            if "gemini-3.8" in mid or "gemini-2.5-flash" in mid:
+                metrics["gemini_5h_fraction"] = frac
+                if rst:
+                    metrics["gemini_5h_reset"] = rst
+            elif "claude-sonnet" in mid or "claude-opus" in mid:
+                metrics["claude_5h_fraction"] = frac
+                if rst:
+                    metrics["claude_5h_reset"] = rst
+                if frac == 0:
+                    metrics["claude_disabled"] = True
+            elif "argon" in mid or "gemini-4" in mid:
+                metrics["argon_weekly_fraction"] = frac
+                metrics["has_gemini4"] = True
+                if rst:
+                    metrics["argon_weekly_reset"] = rst
+
+    # Regla de consistencia: si el saldo semanal de Claude está agotado (0%), la cuota 5H queda bloqueada a 0%
+    if (metrics.get("claude_weekly_fraction") is not None and metrics["claude_weekly_fraction"] <= 0.001) or metrics.get("claude_disabled"):
+        metrics["claude_5h_fraction"] = 0.0
+        metrics["claude_disabled"] = True
+
     return metrics
 
 def fetch_user_profile(access_token: str) -> dict:
@@ -745,7 +806,18 @@ def cmd_list(args):
         try:
             force_ref = getattr(args, "refresh", False)
             token_data, refreshed = refresh_token_if_needed(token_data, force=force_ref)
-            if refreshed or force_ref or "claude_disabled" not in data.get("quota", {}):
+            q_meta = data.get("quota", {})
+            fetched_at_str = q_meta.get("fetched_at", "")
+            is_stale = True
+            if fetched_at_str:
+                try:
+                    dt_f = datetime.fromisoformat(fetched_at_str)
+                    if (datetime.now(timezone.utc) - dt_f).total_seconds() < 60:
+                        is_stale = False
+                except Exception:
+                    is_stale = True
+
+            if refreshed or force_ref or is_stale or "claude_disabled" not in q_meta:
                 data["token_data"] = token_data
                 data["is_revoked"] = False
                 access_token = token_data.get("token", {}).get("access_token")

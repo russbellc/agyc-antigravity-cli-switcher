@@ -416,6 +416,7 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
         "claude_weekly_reset": None,
         "argon_weekly_fraction": None,
         "argon_weekly_reset": None,
+        "has_gemini4": False,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
     if not quota_json or "groups" not in quota_json:
@@ -437,6 +438,7 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                 if "weekly" in b_id or win == "weekly" or "weekly" in b_name or "month" in b_id:
                     metrics["argon_weekly_fraction"] = frac
                     metrics["argon_weekly_reset"] = reset_t
+                    metrics["has_gemini4"] = True
             continue
 
         # 2. Grupo Gemini estándar (puede incluir el bucket de Argon)
@@ -450,6 +452,7 @@ def extract_quota_metrics(quota_json: dict | None) -> dict:
                 if "argon" in b_id or "argon" in b_name:
                     metrics["argon_weekly_fraction"] = frac
                     metrics["argon_weekly_reset"] = reset_t
+                    metrics["has_gemini4"] = True
                 elif "5h" in b_id or win == "5h":
                     metrics["gemini_5h_fraction"] = frac
                     metrics["gemini_5h_reset"] = reset_t
@@ -728,8 +731,9 @@ def cmd_list(args):
             continue
         token_data = data.get("token_data", {})
         try:
-            token_data, refreshed = refresh_token_if_needed(token_data, force=getattr(args, "refresh", False))
-            if refreshed:
+            force_ref = getattr(args, "refresh", False)
+            token_data, refreshed = refresh_token_if_needed(token_data, force=force_ref)
+            if refreshed or force_ref or "has_gemini4" not in data.get("quota", {}):
                 data["token_data"] = token_data
                 data["is_revoked"] = False
                 access_token = token_data.get("token", {}).get("access_token")
@@ -828,24 +832,26 @@ def cmd_list(args):
             cweek = q.get("claude_weekly_fraction")
             cweek_reset = format_countdown(q.get("claude_weekly_reset"))
 
+            has_g4 = bool(q.get("has_gemini4", False) and (q.get("argon_weekly_fraction") is not None))
             aweek = q.get("argon_weekly_fraction")
             aweek_reset = q.get("argon_weekly_reset")
-            if aweek is not None:
-                aweek_val = aweek
-                aweek_reset_str = format_countdown(aweek_reset)
-            else:
-                aweek_val = 1.0
-                aweek_reset_str = "168h"
 
             # Fila 1: Límites Diarios (5 Horas)
             g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
-            g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
             c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
 
             # Fila 2: Límites Semanales
             g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
-            g4_line2 = f"Sem: {make_linebar(aweek_val, length=10)} ({aweek_reset_str})"
             c_line2 = f"Sem: {make_linebar(cweek, length=10)} ({cweek_reset})"
+
+            # Fila Gemini 4
+            if not has_g4:
+                g4_line1 = f"{C_DIM}5H:  [──────────]   --{C_RESET}"
+                g4_line2 = f"{C_DIM}Sem: [──────────] No cuenta{C_RESET}"
+            else:
+                aweek_reset_str = format_countdown(aweek_reset) if aweek_reset else "168h"
+                g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+                g4_line2 = f"Sem: {make_linebar(aweek, length=10)} ({aweek_reset_str})"
 
         row1 = (
             f"│ {pad_visible(alias_disp, col_alias - 2)} "
@@ -898,13 +904,16 @@ def cmd_switch(args):
     q = data.get("quota", {})
     g5h = q.get("gemini_5h_fraction")
     gweek = q.get("gemini_weekly_fraction")
+    has_g4 = bool(q.get("has_gemini4", False) and (q.get("argon_weekly_fraction") is not None))
     aweek = q.get("argon_weekly_fraction")
-    aweek_val = aweek if aweek is not None else 1.0
     aweek_reset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
     print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({data.get('email')}){C_RESET}")
     print(f"  Gemini 5H (Diario):     {make_linebar(g5h, length=12)} (reset: {format_countdown(q.get('gemini_5h_reset'))})")
     print(f"  Gemini Semanal:         {make_linebar(gweek, length=12)} (reset: {format_countdown(q.get('gemini_weekly_reset'))})")
-    print(f"  Gemini 4 Semanal:       {make_linebar(aweek_val, length=12)} (reset: {aweek_reset})")
+    if not has_g4:
+        print(f"  Gemini 4 Semanal:       {C_DIM}[────────────] No cuenta (No habilitado aún por Google){C_RESET}")
+    else:
+        print(f"  Gemini 4 Semanal:       {make_linebar(aweek, length=12)} (reset: {aweek_reset})")
     print(f"{C_DIM}A partir de ahora, 'agy' o '{alias}' utilizarán esta sesión con --dangerously-skip-permissions.{C_RESET}\n")
 
 def cmd_default(args):
@@ -1381,12 +1390,16 @@ def cmd_quota(args):
     has_argon_group = any("argon" in grp.get("displayName", "").lower() for grp in q_raw.get("groups", []))
     if not has_argon_group:
         q = data.get("quota", {})
-        aweek = q.get("argon_weekly_fraction")
-        aweek_val = aweek if aweek is not None else 1.0
-        areset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
+        has_g4 = bool(q.get("has_gemini4", False) and (q.get("argon_weekly_fraction") is not None))
         print(f"\n{C_BOLD}{C_CYAN}▶ Gemini 4 Argon{C_RESET}")
         print(f"  {C_DIM}Models within this group: Gemini 4 Argon (separate weekly quota bucket){C_RESET}")
-        print(f"    • {'Weekly Limit Remaining':<26} {make_linebar(aweek_val, length=16)}  (Reinicio: {areset})")
+        if not has_g4:
+            print(f"    • {'Weekly Limit Remaining':<26} {C_DIM}[────────────────] No cuenta (No habilitado aún){C_RESET}")
+            print(f"      {C_DIM}Google aún no ha activado Gemini 4 Argon en esta cuenta (rollout progresivo).{C_RESET}")
+        else:
+            aweek = q.get("argon_weekly_fraction")
+            areset = format_countdown(q.get("argon_weekly_reset")) if q.get("argon_weekly_reset") else "168h"
+            print(f"    • {'Weekly Limit Remaining':<26} {make_linebar(aweek, length=16)}  (Reinicio: {areset})")
 
     print(f"\n{C_DIM}{q_raw.get('description', '')}{C_RESET}\n")
 
@@ -1471,6 +1484,10 @@ def cmd_auto(args):
             continue
 
         if target_family == "argon":
+            has_g4 = bool(quota.get("has_gemini4", False) and (quota.get("argon_weekly_fraction") is not None))
+            if not has_g4:
+                print(f"  • {alias:<8} ({data.get('email')}): {C_DIM}[Gemini 4 no habilitado en esta cuenta]{C_RESET}")
+                continue
             qweek = quota.get("argon_weekly_fraction")
             q5h = quota.get("gemini_5h_fraction")
         elif target_family == "claude":
@@ -1527,7 +1544,14 @@ def cmd_auto(args):
         if not data or data.get("is_revoked"):
             continue
         quota = data.get("quota", {})
-        r_str = quota.get("claude_weekly_reset" if target_family == "claude" else "gemini_5h_reset")
+        if target_family == "argon":
+            if not bool(quota.get("has_gemini4", False) and (quota.get("argon_weekly_fraction") is not None)):
+                continue
+            r_str = quota.get("argon_weekly_reset")
+        elif target_family == "claude":
+            r_str = quota.get("claude_weekly_reset")
+        else:
+            r_str = quota.get("gemini_5h_reset")
         if r_str:
             try:
                 r_dt = parse_iso_datetime(r_str)
@@ -1538,6 +1562,11 @@ def cmd_auto(args):
                     earliest_reset_str = format_countdown(r_str)
             except Exception:
                 pass
+
+    if target_family == "argon" and not best_alias and min_reset_seconds == float("inf"):
+        print(f"\n{C_BOLD}{C_YELLOW}⚠ Ninguna de tus cuentas registradas tiene Gemini 4 Argon habilitado aún.{C_RESET}")
+        print(f"Google está desplegando Gemini 4 de forma progresiva. Puedes seguir usando los modelos Gemini 3.8 / 3.5 y Claude.\n")
+        return
 
     if best_alias and (best_week > 0.001 or best_5h > 0.001):
         print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (5H: {int(best_5h*100)}%, Semanal: {int(best_week*100)}%){C_RESET}")

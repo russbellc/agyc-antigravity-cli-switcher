@@ -277,8 +277,9 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         "claude_weekly_fraction": fallback_quota.get("claude_weekly_fraction", 1.0),
         "claude_weekly_reset": fallback_quota.get("claude_weekly_reset"),
         "claude_disabled": False,
-        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction", 1.0),
+        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction"),
         "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
+        "has_gemini4": fallback_quota.get("has_gemini4", False),
         "cached_at": now_ts
     }
 
@@ -321,8 +322,9 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                 "claude_weekly_fraction": 1.0,
                 "claude_weekly_reset": None,
                 "claude_disabled": False,
-                "argon_weekly_fraction": 1.0,
+                "argon_weekly_fraction": None,
                 "argon_weekly_reset": None,
+                "has_gemini4": False,
                 "cached_at": now_ts
             }
             for grp in data.get("groups", []):
@@ -336,7 +338,11 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                         b_win = b.get("window", "").lower()
                         frac = b.get("remainingFraction", 1.0)
                         reset_t = b.get("resetTime")
-                        if "5h" in b_id or b_win == "5h":
+                        if "argon" in b_id:
+                            metrics["argon_weekly_fraction"] = frac
+                            metrics["argon_weekly_reset"] = reset_t
+                            metrics["has_gemini4"] = True
+                        elif "5h" in b_id or b_win == "5h":
                             metrics["gemini_5h_fraction"] = frac
                             metrics["gemini_5h_reset"] = reset_t
                         elif "weekly" in b_id or b_win == "weekly":
@@ -367,6 +373,7 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                     for b in buckets:
                         metrics["argon_weekly_fraction"] = b.get("remainingFraction", 1.0)
                         metrics["argon_weekly_reset"] = b.get("resetTime")
+                        metrics["has_gemini4"] = True
                         
             try:
                 with open(cache_file, "w") as f:
@@ -585,6 +592,9 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
 
     # 2. Gemini 4 Argon Models
     elif "argon" in m:
+        has_g4 = bool(quota and quota.get("has_gemini4") and (quota.get("argon_weekly_fraction") is not None))
+        if not has_g4:
+            return 0.0, None, "Sem (Argon: No cuenta)"
         frac = quota.get("argon_weekly_fraction", 1.0)
         reset_t = quota.get("argon_weekly_reset")
         return frac, reset_t, "Sem (Argon)"
@@ -752,7 +762,9 @@ def main():
     q_bar = make_linebar(q_frac, length=8)
     q_countdown = format_countdown(q_reset)
 
-    if q_percent >= 100:
+    if q_label.endswith("(No cuenta)"):
+        quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {C_DIM}[────────] No cuenta{C_RESET}"
+    elif q_percent >= 100:
         quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(Disponible){C_RESET}"
     else:
         quota_badge = f"{C_YELLOW}{q_label}:{C_RESET} {q_bar} {C_BOLD}{q_percent}%{C_RESET} {C_DIM}(⏳ {q_countdown}){C_RESET}"

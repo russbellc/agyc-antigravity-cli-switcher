@@ -771,13 +771,13 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
     return (0.0, 0, max_tokens)
 
 def main():
-    # Read stdin non-blocking once if available
+    # Read stdin non-blocking without waiting for EOF
     stdin_data = None
     try:
-        r, _, _ = select.select([sys.stdin], [], [], 0.01)
-        if r:
+        if not sys.stdin.isatty():
+            os.set_blocking(sys.stdin.fileno(), False)
             raw = sys.stdin.read()
-            if raw.strip().startswith("{"):
+            if raw and raw.strip().startswith("{"):
                 stdin_data = json.loads(raw)
     except Exception:
         pass

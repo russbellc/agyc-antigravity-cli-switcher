@@ -106,12 +106,32 @@ def format_countdown(reset_iso: str | None) -> str:
     except Exception:
         return "5h"
 
-def detect_active_account() -> str:
+def detect_active_account(stdin_data: dict | None = None) -> str:
     """Detect the active agyc account alias.
     
     When running inside agy, HOME=/home/aidev/.agyc_homes/agy02.
-    We also check ANTIGRAVITY_APP_DATA_DIR which contains the alias.
+    We also check ANTIGRAVITY_APP_DATA_DIR which contains the alias,
+    or match email from stdin payload.
     """
+    # 0. Check email in stdin_data
+    if stdin_data and stdin_data.get("email"):
+        email = stdin_data.get("email", "").strip().lower()
+        accounts_dir = f"{REAL_HOME}/.gemini/antigravity-cli/accounts"
+        if os.path.isdir(accounts_dir):
+            try:
+                for fname in os.listdir(accounts_dir):
+                    if fname.startswith("agy") and fname.endswith(".json"):
+                        alias = fname[:-5]
+                        try:
+                            with open(os.path.join(accounts_dir, fname), "r") as af:
+                                d = json.load(af)
+                                if d.get("email", "").strip().lower() == email:
+                                    return alias
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
     # 1. Check HOME path (e.g., /home/aidev/.agyc_homes/agy02)
     home = os.environ.get("HOME", "")
     m = re.search(r"agy\d+", home)
@@ -353,9 +373,9 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                 metrics["argon_weekly_reset"] = rst
                 metrics["has_gemini4"] = True
 
-    # 2. Fetch weekly group quota from retrieveUserQuotaSummary (prod first, then daily)
-    summary_data = None
-    for host in ["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"]:
+    # 2. Fetch weekly group quota from retrieveUserQuotaSummary (merge groups from daily & prod)
+    summary_data = {"groups": []}
+    for host in ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]:
         try:
             url = f"https://{host}/v1internal:retrieveUserQuotaSummary"
             req = urllib.request.Request(
@@ -368,8 +388,11 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
                 }
             )
             with urllib.request.urlopen(req, timeout=6) as resp:
-                summary_data = json.loads(resp.read().decode("utf-8"))
-            break
+                data = json.loads(resp.read().decode("utf-8"))
+                for g in data.get("groups", []):
+                    gn = g.get("displayName", "")
+                    if not any(x.get("displayName") == gn for x in summary_data["groups"]):
+                        summary_data["groups"].append(g)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 break
@@ -426,6 +449,64 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         except Exception:
             pass
     return fallback_res if fallback_quota else None
+
+def extract_quota_from_stdin(stdin_quota: dict, account: str) -> dict:
+    """Parses real-time quota payload delivered directly by agy CLI on stdin.
+    
+    This matches agy /usage exactly, updating both disk cache and account JSON.
+    """
+    now_ts = time.time()
+    g5 = stdin_quota.get("gemini-5h") or {}
+    gw = stdin_quota.get("gemini-weekly") or {}
+    c5 = stdin_quota.get("3p-5h") or stdin_quota.get("claude-5h") or {}
+    cw = stdin_quota.get("3p-weekly") or stdin_quota.get("claude-weekly") or {}
+    ar = stdin_quota.get("argon-weekly") or stdin_quota.get("gemini-4-weekly") or {}
+
+    c_dis = bool(
+        c5.get("disabled") or 
+        cw.get("disabled") or 
+        (cw.get("remaining_fraction") is not None and float(cw.get("remaining_fraction")) <= 0.001)
+    )
+    c5_frac = 0.0 if c_dis else float(c5.get("remaining_fraction", 1.0))
+    cw_frac = float(cw.get("remaining_fraction", 0.0)) if "remaining_fraction" in cw else 0.0
+
+    metrics = {
+        "gemini_5h_fraction": float(g5.get("remaining_fraction", 1.0)) if "remaining_fraction" in g5 else 1.0,
+        "gemini_5h_reset": g5.get("reset_time"),
+        "gemini_weekly_fraction": float(gw.get("remaining_fraction", 1.0)) if "remaining_fraction" in gw else 1.0,
+        "gemini_weekly_reset": gw.get("reset_time"),
+        "claude_5h_fraction": c5_frac,
+        "claude_5h_reset": c5.get("reset_time") or cw.get("reset_time"),
+        "claude_weekly_fraction": cw_frac,
+        "claude_weekly_reset": cw.get("reset_time"),
+        "claude_disabled": c_dis,
+        "argon_weekly_fraction": float(ar.get("remaining_fraction")) if "remaining_fraction" in ar else None,
+        "argon_weekly_reset": ar.get("reset_time"),
+        "has_gemini4": ("remaining_fraction" in ar and ar.get("remaining_fraction") is not None),
+        "cached_at": now_ts,
+    }
+
+    # Persist live metrics to disk cache so agyc CLI / list commands stay 100% in sync
+    try:
+        cache_file = f"/tmp/agyc_quota_cache_{account}.json"
+        tmp_cache = cache_file + ".tmp"
+        with open(tmp_cache, "w") as f:
+            json.dump(metrics, f)
+        os.replace(tmp_cache, cache_file)
+
+        acc_path = get_account_file_path(account)
+        if acc_path and os.path.exists(acc_path):
+            with open(acc_path, "r") as f:
+                acc_data = json.load(f)
+            acc_data["quota"] = metrics
+            tmp_acc = acc_path + ".tmp"
+            with open(tmp_acc, "w") as f:
+                json.dump(acc_data, f, indent=2)
+            os.replace(tmp_acc, acc_path)
+    except Exception:
+        pass
+
+    return metrics
 
 def spawn_background_refresh(alias: str):
     """Spawns background refresh throttled by lock file (max 1 refresh per 30s)."""
@@ -746,20 +827,43 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
     else:
         max_tokens = 1_000_000
     
-    # Check if stdin_data has context data
+    # 1. Parse structured context_window from stdin_data
     if stdin_data:
         try:
             ctx = stdin_data.get("context_window", {}) or stdin_data.get("context", {})
-            used = ctx.get("used_tokens") or ctx.get("total_tokens")
-            max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
-            if used:
-                frac = min(1.0, float(used) / float(max_t))
-                return (frac, int(used), int(max_t))
+            if ctx:
+                max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
+                used_pct = ctx.get("used_percentage")
+                used = (
+                    ctx.get("total_input_tokens") or 
+                    ctx.get("used_tokens") or 
+                    ctx.get("total_tokens")
+                )
+                if used is not None and max_t:
+                    frac = min(1.0, float(used) / float(max_t))
+                    return (frac, int(used), int(max_t))
+                elif used_pct is not None and max_t:
+                    frac = min(1.0, float(used_pct) / 100.0)
+                    used_t = int(round(frac * max_t))
+                    return (frac, used_t, int(max_t))
         except Exception:
             pass
 
-    conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-    transcript_path = find_active_transcript(conv_id)
+    # 2. Fallback: Parse active transcript file
+    conv_id = None
+    if stdin_data:
+        conv_id = stdin_data.get("conversation_id") or stdin_data.get("session_id")
+    if not conv_id:
+        conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
+
+    transcript_path = None
+    if stdin_data and stdin_data.get("transcript_path"):
+        tp = stdin_data.get("transcript_path")
+        if os.path.exists(tp):
+            transcript_path = tp
+
+    if not transcript_path:
+        transcript_path = find_active_transcript(conv_id)
 
     if transcript_path and os.path.exists(transcript_path):
         size_bytes = os.path.getsize(transcript_path)
@@ -771,19 +875,21 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
     return (0.0, 0, max_tokens)
 
 def main():
-    # Read stdin non-blocking without waiting for EOF
+    # Read stdin non-blocking with select timeout up to 40ms without waiting for EOF
     stdin_data = None
     try:
         if not sys.stdin.isatty():
-            os.set_blocking(sys.stdin.fileno(), False)
-            raw = sys.stdin.read()
-            if raw and raw.strip().startswith("{"):
-                stdin_data = json.loads(raw)
+            r, _, _ = select.select([sys.stdin], [], [], 0.04)
+            if r:
+                os.set_blocking(sys.stdin.fileno(), False)
+                raw = sys.stdin.read()
+                if raw and raw.strip().startswith("{"):
+                    stdin_data = json.loads(raw)
     except Exception:
         pass
 
     # 1. Active Account
-    account = detect_active_account()
+    account = detect_active_account(stdin_data)
     acc_badge = f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}"
 
     # 2. Git Branch
@@ -793,8 +899,12 @@ def main():
     # 3. Model & Effort (placed before 5h quota)
     model_badge, model_name, effort = get_model_and_effort(stdin_data, account)
 
-    # 4. Quota (5H rolling window & Weekly subscription limit)
-    quota = fetch_online_quota(account)
+    # 4. Quota (live from stdin_data if present, else cached / online API)
+    stdin_quota = stdin_data.get("quota") if stdin_data else None
+    if stdin_quota:
+        quota = extract_quota_from_stdin(stdin_quota, account)
+    else:
+        quota = fetch_online_quota(account)
     f5, r5, fs, rs, q_label = get_quota_for_model(quota, model_name)
 
     # 5. Context Usage (adjusted for model max context window)

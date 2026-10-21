@@ -384,10 +384,10 @@ def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict
 
 def fetch_quota_summary(access_token: str) -> dict | None:
     endpoints = [
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
         "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
     ]
-    summary_data = None
+    summary_data = {"groups": []}
     for url in endpoints:
         try:
             req = urllib.request.Request(
@@ -399,13 +399,16 @@ def fetch_quota_summary(access_token: str) -> dict | None:
                     "User-Agent": "antigravity/1.4.0 linux/amd64",
                 }
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                summary_data = json.loads(resp.read().decode("utf-8"))
-                break
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for g in data.get("groups", []):
+                    gn = g.get("displayName", "")
+                    if not any(x.get("displayName") == gn for x in summary_data["groups"]):
+                        summary_data["groups"].append(g)
         except Exception:
             continue
 
-    if not summary_data:
+    if not summary_data.get("groups"):
         return None
 
     # Fetch live per-model quota from retrieveUserQuota (crucial for real-time 5H limits)
@@ -816,6 +819,19 @@ def cmd_list(args):
                         is_stale = False
                 except Exception:
                     is_stale = True
+
+            # If live cache from agy statusline exists and is recent (< 5 min), use its live metrics
+            cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file, "r") as cf:
+                        cached = json.load(cf)
+                    if cached and (time.time() - cached.get("cached_at", 0) < 300):
+                        q_meta.update(cached)
+                        data["quota"] = q_meta
+                        is_stale = False
+                except Exception:
+                    pass
 
             if refreshed or force_ref or is_stale or "claude_disabled" not in q_meta:
                 data["token_data"] = token_data

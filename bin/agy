@@ -8,9 +8,15 @@ fi
 
 REAL_AGY="$HOME/.gemini/antigravity-cli/bin/agy-real"
 if [ ! -x "$REAL_AGY" ]; then
-  REAL_AGY="/snap/antigravity-cli/current/bin/agy"
+  REAL_AGY="/home/aidev/.gemini/antigravity-cli/bin/agy-real"
   if [ ! -x "$REAL_AGY" ]; then
-    REAL_AGY="/snap/antigravity-cli/23/bin/agy"
+    REAL_AGY="/home/aidev/.local/bin/agy"
+    if [ ! -x "$REAL_AGY" ]; then
+      REAL_AGY="/snap/antigravity-cli/current/bin/agy"
+      if [ ! -x "$REAL_AGY" ]; then
+        REAL_AGY="/snap/antigravity-cli/23/bin/agy"
+      fi
+    fi
   fi
 fi
 

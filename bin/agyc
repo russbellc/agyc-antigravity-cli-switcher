@@ -664,6 +664,10 @@ def launch_real_agy(extra_args: list[str], alias: str | None = None):
     """Ejecuta el binario oficial de agy con --dangerously-skip-permissions por defecto."""
     real_agy = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
     if not os.path.exists(real_agy):
+        real_agy = "/home/aidev/.gemini/antigravity-cli/bin/agy-real"
+    if not os.path.exists(real_agy):
+        real_agy = "/home/aidev/.local/bin/agy"
+    if not os.path.exists(real_agy):
         real_agy = "/snap/antigravity-cli/current/bin/agy"
     if not os.path.exists(real_agy):
         real_agy = "/snap/antigravity-cli/23/bin/agy"
@@ -725,6 +729,31 @@ def prepare_isolated_home(alias: str) -> str:
             os.chmod(token_dst, 0o600)
         except Exception:
             pass
+
+    # ── Enlazar bin para compartir binarios (agy-real, agy, agyc, webm_encoder) ──
+    user_gemini_bin = os.path.join(shared_base, "bin")
+    if not os.path.exists(user_gemini_bin):
+        user_gemini_bin = "/home/aidev/.gemini/antigravity-cli/bin"
+    iso_gemini_bin = os.path.join(isolated_gemini, "bin")
+    if os.path.exists(user_gemini_bin):
+        if os.path.islink(iso_gemini_bin):
+            if os.readlink(iso_gemini_bin) != user_gemini_bin:
+                try:
+                    os.unlink(iso_gemini_bin)
+                    os.symlink(user_gemini_bin, iso_gemini_bin)
+                except Exception:
+                    pass
+        elif os.path.isdir(iso_gemini_bin):
+            try:
+                shutil.rmtree(iso_gemini_bin)
+                os.symlink(user_gemini_bin, iso_gemini_bin)
+            except Exception:
+                pass
+        elif not os.path.exists(iso_gemini_bin):
+            try:
+                os.symlink(user_gemini_bin, iso_gemini_bin)
+            except Exception:
+                pass
 
     # ── Recursos compartidos para unificar conversaciones, contexto y settings ──
     shared_items = [
@@ -1779,7 +1808,11 @@ def cmd_update(args):
     # Sincronizar wrapper agy si existe
     wrapper_src = os.path.join(repo_dir, "bin", "agy")
     if os.path.exists(wrapper_src):
-        for wp in [os.path.expanduser("~/.gemini/antigravity-cli/bin/agy"), "/home/aidev/proyectos/backup_agyc/bin/agy"]:
+        for wp in [
+            "/home/aidev/.gemini/antigravity-cli/bin/agy",
+            "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agy",
+            "/home/aidev/proyectos/backup_agyc/bin/agy",
+        ]:
             try:
                 shutil.copy2(wrapper_src, wp)
                 os.chmod(wp, 0o755)
@@ -1806,7 +1839,9 @@ def cmd_update(args):
 
     # 3. Comprobar motor oficial de Google Antigravity CLI
     print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando motor oficial de Google Antigravity CLI...")
-    native_bin = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
+    native_bin = "/home/aidev/.gemini/antigravity-cli/bin/agy-real"
+    if not os.path.exists(os.path.dirname(native_bin)):
+        native_bin = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
     current_ver = None
     if os.path.exists(native_bin):
         try:
@@ -1832,6 +1867,13 @@ def cmd_update(args):
                 tar.extract("antigravity", path="/tmp/")
             shutil.move("/tmp/antigravity", native_bin)
             os.chmod(native_bin, 0o755)
+            # Mantener .local/bin/agy sincronizado
+            for extra_p in ["/home/aidev/.local/bin/agy"]:
+                try:
+                    shutil.copy2(native_bin, extra_p)
+                    os.chmod(extra_p, 0o755)
+                except Exception:
+                    pass
             print(f"  {C_GREEN}✓ Antigravity CLI actualizado al release oficial v{latest_ver}{C_RESET}")
         else:
             print(f"  {C_GREEN}✓ Antigravity CLI nativo en su última versión oficial: v{current_ver or '1.4.0'}{C_RESET}")

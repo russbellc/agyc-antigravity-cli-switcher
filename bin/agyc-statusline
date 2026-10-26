@@ -700,11 +700,10 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
 
     # 2. Gemini 4 Argon Models
     elif "argon" in m:
-        has_g4 = bool(quota and quota.get("has_gemini4") and (quota.get("argon_weekly_fraction") is not None))
-        if not has_g4:
-            return 0.0, None, None, None, "Argon: No cuenta"
-        frac_sem = quota.get("argon_weekly_fraction", 1.0)
-        reset_sem = quota.get("argon_weekly_reset")
+        frac_sem = quota.get("argon_weekly_fraction")
+        if frac_sem is None:
+            frac_sem = quota.get("gemini_weekly_fraction", 1.0)
+        reset_sem = quota.get("argon_weekly_reset") or quota.get("gemini_weekly_reset")
         frac_5h = quota.get("gemini_5h_fraction", 1.0)
         reset_5h = quota.get("gemini_5h_reset")
         if frac_sem is not None and frac_sem <= 0.001:

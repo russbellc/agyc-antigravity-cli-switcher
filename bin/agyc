@@ -549,6 +549,10 @@ def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = No
         metrics["claude_5h_fraction"] = 0.0
         metrics["claude_disabled"] = True
 
+    # Regla de consistencia: si Google no limitó gemini_weekly, asumimos 1.0 (disponible)
+    if metrics.get("gemini_weekly_fraction") is None and not metrics.get("gemini_disabled"):
+        metrics["gemini_weekly_fraction"] = 1.0
+
     return metrics
 
 def fetch_user_profile(access_token: str) -> dict:
@@ -893,6 +897,13 @@ def cmd_list(args):
                         for k, v in q_meta.items():
                             if new_q.get(k) is None and v is not None:
                                 new_q[k] = v
+                        if data.get("has_gemini4"):
+                            new_q["has_gemini4"] = True
+                        if new_q.get("has_gemini4"):
+                            if new_q.get("argon_weekly_fraction") is None:
+                                new_q["argon_weekly_fraction"] = new_q.get("gemini_weekly_fraction", 1.0)
+                            if new_q.get("argon_weekly_reset") is None:
+                                new_q["argon_weekly_reset"] = new_q.get("gemini_weekly_reset")
                         data["quota"] = new_q
                 save_account(alias, data)
         except TokenRevokedError:
@@ -984,18 +995,26 @@ def cmd_list(args):
                 gweek_reset = "7d 0h"
             else:
                 gweek_reset = format_countdown(q.get("gemini_weekly_reset"))
+                if gweek_reset == "N/A":
+                    gweek_reset = "7d 0h"
 
             c5h = q.get("claude_5h_fraction")
             c5h_reset = format_countdown(q.get("claude_5h_reset"))
             cweek = q.get("claude_weekly_fraction")
-            cweek_reset = format_countdown(q.get("claude_weekly_reset"))
             c_disabled = q.get("claude_disabled", False)
+            if cweek is None and not c_disabled:
+                cweek = 1.0
+                cweek_reset = "7d 0h"
+            else:
+                cweek_reset = format_countdown(q.get("claude_weekly_reset"))
+                if cweek_reset == "N/A":
+                    cweek_reset = "7d 0h"
 
             has_g4 = check_has_gemini4(acc, alias)
             aweek = q.get("argon_weekly_fraction")
             if aweek is None and has_g4:
                 aweek = gweek if gweek is not None else 1.0
-            aweek_reset = q.get("argon_weekly_reset") or (q.get("gemini_weekly_reset") if has_g4 else None) or "7d 0h"
+            aweek_reset = q.get("argon_weekly_reset") or (q.get("gemini_weekly_reset") if has_g4 else None)
 
             # Fila 1: Límites Diarios (5 Horas) con coherencia frente al límite semanal
             g_weekly_empty = (gweek is not None and gweek <= 0.001) or g_disabled
@@ -1014,19 +1033,15 @@ def cmd_list(args):
             g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
             c_line2 = f"Sem: {make_linebar(cweek, length=10)} ({cweek_reset})"
 
-            # Fila Gemini 4
+            # Fila Gemini 4 (Argon solo tiene recarga semanal, no tiene ventana rodante de 5 horas)
             if not has_g4:
                 g4_line1 = f"{C_DIM}5H:  [──────────]   --{C_RESET}"
                 g4_line2 = f"{C_DIM}Sem: [──────────] No cuenta{C_RESET}"
             else:
                 aweek_reset_str = format_countdown(aweek_reset) if aweek_reset else gweek_reset
                 if aweek_reset_str == "N/A":
-                    aweek_reset_str = gweek_reset
-                a_weekly_empty = (aweek is not None and aweek <= 0.001)
-                if a_weekly_empty:
-                    g4_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
-                else:
-                    g4_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+                    aweek_reset_str = gweek_reset if gweek_reset != "N/A" else "7d 0h"
+                g4_line1 = f"{C_DIM}5H:  [──────────]   --{C_RESET}"
                 g4_line2 = f"Sem: {make_linebar(aweek, length=10)} ({aweek_reset_str})"
 
         row1 = (
@@ -1662,6 +1677,16 @@ def cmd_auto(args):
             q_raw = fetch_quota_summary(access_token)
             if q_raw:
                 quota = extract_quota_metrics(q_raw)
+                for k, v in data.get("quota", {}).items():
+                    if quota.get(k) is None and v is not None:
+                        quota[k] = v
+                if data.get("has_gemini4"):
+                    quota["has_gemini4"] = True
+                if quota.get("has_gemini4"):
+                    if quota.get("argon_weekly_fraction") is None:
+                        quota["argon_weekly_fraction"] = quota.get("gemini_weekly_fraction", 1.0)
+                    if quota.get("argon_weekly_reset") is None:
+                        quota["argon_weekly_reset"] = quota.get("gemini_weekly_reset")
                 data["quota"] = quota
                 save_account(alias, data)
             else:
@@ -1685,8 +1710,8 @@ def cmd_auto(args):
                 continue
             qweek = quota.get("argon_weekly_fraction")
             if qweek is None:
-                qweek = quota.get("gemini_weekly_fraction")
-            q5h = quota.get("gemini_5h_fraction")
+                qweek = quota.get("gemini_weekly_fraction", 1.0)
+            q5h = quota.get("gemini_5h_fraction", 1.0)
         elif target_family == "claude":
             q5h = quota.get("claude_5h_fraction")
             qweek = quota.get("claude_weekly_fraction")
@@ -1712,17 +1737,14 @@ def cmd_auto(args):
             status_flag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
 
         if target_family == "argon":
-            print(f"  • {alias:<8} ({data.get('email')}): Argon = {int(qweek*100):3d}% | Base 5H = {int(q5h*100):3d}%{status_flag}")
+            print(f"  • {alias:<8} ({data.get('email')}): Semanal Argon = {int(qweek*100):3d}%{status_flag}")
         else:
             print(f"  • {alias:<8} ({data.get('email')}): 5H = {int(q5h*100):3d}% | Semanal = {int(qweek*100):3d}%{status_flag}")
 
         # Algoritmo de selección según familia
         if target_family == "argon":
             if qweek > 0.001:
-                score = (qweek * 0.8) + (q5h * 0.2)
-                best_score = (best_week * 0.8) + (best_5h * 0.2)
-                if score > best_score:
-                    best_5h = q5h
+                if qweek > best_week:
                     best_week = qweek
                     best_alias = alias
         elif target_family == "claude":
@@ -1774,7 +1796,10 @@ def cmd_auto(args):
         return
 
     if best_alias and (best_week > 0.001 or best_5h > 0.001):
-        print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (5H: {int(best_5h*100)}%, Semanal: {int(best_week*100)}%){C_RESET}")
+        if target_family == "argon":
+            print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (Semanal Argon: {int(best_week*100)}%){C_RESET}")
+        else:
+            print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (5H: {int(best_5h*100)}%, Semanal: {int(best_week*100)}%){C_RESET}")
         switch_active_account(best_alias)
     elif earliest_alias:
         print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas tienen la cuota de {family_label} agotada (0%).{C_RESET}")

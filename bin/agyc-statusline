@@ -82,9 +82,9 @@ def make_context_linebar(fraction: float, length: int = 8, fill_char: str = "█
     bar = f"{bar_color}{fill_char * filled_len}{C_GRAY}{empty_char * empty_len}{C_RESET}"
     return f"[{bar}]"
 
-def format_countdown(reset_iso: str | None) -> str:
+def format_countdown(reset_iso: str | None, default_val: str = "5h 00m") -> str:
     if not reset_iso:
-        return "5h 00m"
+        return default_val
     try:
         if reset_iso.endswith("Z"):
             reset_iso = reset_iso[:-1] + "+00:00"
@@ -301,7 +301,7 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         "claude_disabled": False,
         "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction"),
         "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
-        "has_gemini4": fallback_quota.get("has_gemini4", False),
+        "has_gemini4": acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False),
         "cached_at": now_ts
     }
 
@@ -315,19 +315,20 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             return fallback_res
         return None
 
+    has_g4 = acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False)
     metrics = {
         "gemini_5h_fraction": 1.0,
-        "gemini_5h_reset": None,
-        "gemini_weekly_fraction": 1.0,
-        "gemini_weekly_reset": None,
+        "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
+        "gemini_weekly_fraction": fallback_quota.get("gemini_weekly_fraction", 1.0),
+        "gemini_weekly_reset": fallback_quota.get("gemini_weekly_reset"),
         "claude_5h_fraction": 1.0,
-        "claude_5h_reset": None,
-        "claude_weekly_fraction": 1.0,
-        "claude_weekly_reset": None,
-        "claude_disabled": False,
-        "argon_weekly_fraction": None,
-        "argon_weekly_reset": None,
-        "has_gemini4": False,
+        "claude_5h_reset": fallback_quota.get("claude_5h_reset"),
+        "claude_weekly_fraction": fallback_quota.get("claude_weekly_fraction", 1.0),
+        "claude_weekly_reset": fallback_quota.get("claude_weekly_reset"),
+        "claude_disabled": fallback_quota.get("claude_disabled", False),
+        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction"),
+        "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
+        "has_gemini4": has_g4,
         "cached_at": now_ts
     }
 
@@ -424,6 +425,13 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     if (metrics.get("claude_weekly_fraction") is not None and metrics["claude_weekly_fraction"] <= 0.001) or metrics.get("claude_disabled"):
         metrics["claude_5h_fraction"] = 0.0
         metrics["claude_disabled"] = True
+
+    if acc_data.get("has_gemini4") or metrics.get("has_gemini4"):
+        metrics["has_gemini4"] = True
+        if metrics.get("argon_weekly_fraction") is None:
+            metrics["argon_weekly_fraction"] = metrics.get("gemini_weekly_fraction", 1.0)
+        if metrics.get("argon_weekly_reset") is None:
+            metrics["argon_weekly_reset"] = metrics.get("gemini_weekly_reset")
 
     if models_data or summary_data:
         try:
@@ -704,10 +712,10 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
         if frac_sem is None:
             frac_sem = quota.get("gemini_weekly_fraction", 1.0)
         reset_sem = quota.get("argon_weekly_reset") or quota.get("gemini_weekly_reset")
-        frac_5h = quota.get("gemini_5h_fraction", 1.0)
-        reset_5h = quota.get("gemini_5h_reset")
+        # Argon solo tiene recarga semanal, no ventana rodante de 5 horas
+        frac_5h = None
+        reset_5h = None
         if frac_sem is not None and frac_sem <= 0.001:
-            frac_5h = 0.0
             frac_sem = 0.0
         return frac_5h, reset_5h, frac_sem, reset_sem, "Argon"
 
@@ -926,19 +934,20 @@ def main():
     if q_label.startswith("Argon: No cuenta"):
         parts.append(f"{C_YELLOW}Argon:{C_RESET} {C_DIM}[────────] No cuenta{C_RESET}")
     else:
-        p5 = int(round(f5 * 100))
-        c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
-        bar_5 = make_linebar(f5, length=8)
-        if p5 >= 100:
-            str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}100%{C_RESET}"
-        else:
-            str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
-        parts.append(str_5h)
+        if f5 is not None:
+            p5 = int(round(f5 * 100))
+            c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
+            bar_5 = make_linebar(f5, length=8)
+            if p5 >= 100:
+                str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}100%{C_RESET}"
+            else:
+                str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
+            parts.append(str_5h)
 
         if fs is not None:
             ps = int(round(fs * 100))
             bar_s = make_linebar(fs, length=8)
-            cd_s = format_countdown(rs)
+            cd_s = format_countdown(rs, default_val="7d 0h")
             cs = C_GREEN if ps >= 50 else (C_YELLOW if ps >= 20 else C_RED)
             if ps >= 100:
                 str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET}"

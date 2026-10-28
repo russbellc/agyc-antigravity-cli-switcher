@@ -163,27 +163,28 @@ def detect_active_account(stdin_data: dict | None = None) -> str:
     return "agy01"
 
 def get_git_branch() -> str | None:
+    """Ultra-fast zero-subprocess branch reader directly from .git/HEAD."""
     try:
-        # Check current branch
-        res = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=0.2
-        )
-        if res.returncode == 0:
-            branch = res.stdout.strip()
-            # Check if dirty (quick)
-            status_res = subprocess.run(
-                ["git", "status", "--porcelain", "-uno"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=0.2
-            )
-            is_dirty = bool(status_res.stdout.strip())
-            return f"{branch}*" if is_dirty else branch
+        cwd = os.getcwd()
+        for _ in range(6):
+            git_path = os.path.join(cwd, ".git")
+            if os.path.exists(git_path):
+                if os.path.isfile(git_path):
+                    with open(git_path, "r", encoding="utf-8") as f:
+                        line = f.read().strip()
+                        if line.startswith("gitdir:"):
+                            git_path = os.path.abspath(os.path.join(cwd, line[7:].strip()))
+                head_file = os.path.join(git_path, "HEAD")
+                if os.path.isfile(head_file):
+                    with open(head_file, "r", encoding="utf-8") as f:
+                        c = f.read().strip()
+                    if c.startswith("ref: refs/heads/"):
+                        return c[16:]
+                    return c[:7]
+            parent = os.path.dirname(cwd)
+            if parent == cwd:
+                break
+            cwd = parent
     except Exception:
         pass
     return None
@@ -497,20 +498,10 @@ def extract_quota_from_stdin(stdin_quota: dict, account: str) -> dict:
     # Persist live metrics to disk cache so agyc CLI / list commands stay 100% in sync
     try:
         cache_file = f"/tmp/agyc_quota_cache_{account}.json"
-        tmp_cache = cache_file + ".tmp"
+        tmp_cache = cache_file + f".tmp.{os.getpid()}"
         with open(tmp_cache, "w") as f:
             json.dump(metrics, f)
         os.replace(tmp_cache, cache_file)
-
-        acc_path = get_account_file_path(account)
-        if acc_path and os.path.exists(acc_path):
-            with open(acc_path, "r") as f:
-                acc_data = json.load(f)
-            acc_data["quota"] = metrics
-            tmp_acc = acc_path + ".tmp"
-            with open(tmp_acc, "w") as f:
-                json.dump(acc_data, f, indent=2)
-            os.replace(tmp_acc, acc_path)
     except Exception:
         pass
 
@@ -882,11 +873,11 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
     return (0.0, 0, max_tokens)
 
 def main():
-    # Read stdin non-blocking with select timeout up to 40ms without waiting for EOF
+    # Read stdin non-blocking with minimal select timeout (5ms) without waiting for EOF
     stdin_data = None
     try:
         if not sys.stdin.isatty():
-            r, _, _ = select.select([sys.stdin], [], [], 0.04)
+            r, _, _ = select.select([sys.stdin], [], [], 0.005)
             if r:
                 os.set_blocking(sys.stdin.fileno(), False)
                 raw = sys.stdin.read()

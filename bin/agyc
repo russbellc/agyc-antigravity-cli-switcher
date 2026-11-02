@@ -56,6 +56,8 @@ def pad_visible(s: str, width: int, align: str = "left") -> str:
     else:
         return s + (" " * pad)
 
+REAL_HOME = os.environ.get("AGYC_REAL_HOME") or os.environ.get("REAL_HOME") or "/home/aidev"
+
 # Credenciales OAuth estándar de Google Antigravity
 GOOGLE_CLIENT_ID = "moc.tnetnocresuelgoog.sppa.pe304g4hjolotv532ercl12h2nisshmt-1950606001701"[::-1]
 GOOGLE_CLIENT_SECRET = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG"[::-1]
@@ -232,7 +234,7 @@ def ensure_statusline_configured():
         os.path.expanduser("~/.gemini/antigravity-cli"),
         "/home/aidev/.gemini/antigravity-cli",
     ]
-    homes_base = os.path.expanduser("~/.agyc_homes")
+    homes_base = os.path.join(REAL_HOME, ".agyc_homes")
     if os.path.exists(homes_base):
         try:
             for h in os.listdir(homes_base):
@@ -708,7 +710,7 @@ def prepare_isolated_home(alias: str) -> str:
 
     Retorna la ruta del HOME aislado (ej. /home/aidev/.agyc_homes/agy02).
     """
-    homes_base = os.path.expanduser("~/.agyc_homes")
+    homes_base = os.path.join(REAL_HOME, ".agyc_homes")
     isolated_home = os.path.join(homes_base, alias)
     isolated_gemini = os.path.join(isolated_home, ".gemini", "antigravity-cli")
     os.makedirs(isolated_gemini, exist_ok=True)

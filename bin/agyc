@@ -540,7 +540,7 @@ def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = No
                     metrics["claude_5h_reset"] = rst
                 if frac == 0:
                     metrics["claude_disabled"] = True
-            elif "argon" in mid or "hydrogen" in mid or "gemini-4" in mid:
+            elif "argon" in mid or "hydrogen" in mid or "carbon" in mid or "gemini-4" in mid:
                 metrics["argon_weekly_fraction"] = frac
                 metrics["has_gemini4"] = True
                 if rst:
@@ -835,7 +835,7 @@ def check_has_gemini4(acc: dict, alias: str) -> bool:
             with open(s_path, "r", encoding="utf-8") as sf:
                 s_data = json.load(sf)
                 s_mod = (s_data.get("model") or "").lower()
-                if "argon" in s_mod or "hydrogen" in s_mod or "gemini-4" in s_mod or "gemini 4" in s_mod:
+                if "argon" in s_mod or "hydrogen" in s_mod or "carbon" in s_mod or "gemini-4" in s_mod or "gemini 4" in s_mod:
                     return True
         except Exception:
             pass

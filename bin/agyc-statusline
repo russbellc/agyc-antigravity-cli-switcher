@@ -697,9 +697,9 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
             return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
         return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
 
-    # 2. Gemini 4 Models (Argon, Hydrogen)
-    elif "argon" in m or "hydrogen" in m or "gemini-4" in m or "gemini 4" in m:
-        fam_name = "Hydrogen" if "hydrogen" in m else "Argon"
+    # 2. Gemini 4 Models (Argon, Hydrogen, Carbon)
+    elif "argon" in m or "hydrogen" in m or "carbon" in m or "gemini-4" in m or "gemini 4" in m:
+        fam_name = "Hydrogen" if "hydrogen" in m else ("Carbon" if "carbon" in m else "Argon")
         frac_sem = quota.get("argon_weekly_fraction")
         if frac_sem is None:
             frac_sem = quota.get("gemini_weekly_fraction", 1.0)

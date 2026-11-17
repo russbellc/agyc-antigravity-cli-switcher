@@ -534,13 +534,13 @@ def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = No
                 metrics["gemini_5h_fraction"] = frac
                 if rst:
                     metrics["gemini_5h_reset"] = rst
-            elif "claude-sonnet" in mid or "claude-opus" in mid:
+            elif "claude-sonnet" in mid or "claude-opus" in mid or "claude" in mid or "gpt" in mid:
                 metrics["claude_5h_fraction"] = frac
                 if rst:
                     metrics["claude_5h_reset"] = rst
                 if frac == 0:
                     metrics["claude_disabled"] = True
-            elif "argon" in mid or "gemini-4" in mid:
+            elif "argon" in mid or "hydrogen" in mid or "gemini-4" in mid:
                 metrics["argon_weekly_fraction"] = frac
                 metrics["has_gemini4"] = True
                 if rst:
@@ -835,7 +835,7 @@ def check_has_gemini4(acc: dict, alias: str) -> bool:
             with open(s_path, "r", encoding="utf-8") as sf:
                 s_data = json.load(sf)
                 s_mod = (s_data.get("model") or "").lower()
-                if "argon" in s_mod or "gemini-4" in s_mod or "gemini 4" in s_mod:
+                if "argon" in s_mod or "hydrogen" in s_mod or "gemini-4" in s_mod or "gemini 4" in s_mod:
                     return True
         except Exception:
             pass
@@ -1930,11 +1930,18 @@ def cmd_update(args):
             import tarfile
             with tarfile.open(scratch_tar, "r:gz") as tar:
                 tar.extract("antigravity", path="/tmp/")
+            if os.path.exists(native_bin):
+                try:
+                    os.unlink(native_bin)
+                except Exception:
+                    pass
             shutil.move("/tmp/antigravity", native_bin)
             os.chmod(native_bin, 0o755)
             # Mantener .local/bin/agy sincronizado
             for extra_p in ["/home/aidev/.local/bin/agy"]:
                 try:
+                    if os.path.exists(extra_p):
+                        os.unlink(extra_p)
                     shutil.copy2(native_bin, extra_p)
                     os.chmod(extra_p, 0o755)
                 except Exception:

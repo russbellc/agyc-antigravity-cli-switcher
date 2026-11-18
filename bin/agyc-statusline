@@ -86,6 +86,8 @@ CACHE_TTL_SECONDS = 20
 REFRESH_LOCK_SECONDS = 15
 HERDR_META_THROTTLE_SECONDS = 8
 HORIZON_5H_SECONDS = 5 * 3600 + 5 * 60  # 5h + 5m
+LOW_QUOTA_THRESHOLD_PCT = 15
+LOW_QUOTA_DEDUP_SECONDS = 5 * 3600      # 5h deduplication per reset cycle
 
 
 def ensure_cache_dir(need_locks: bool = False) -> str:
@@ -1363,6 +1365,441 @@ def get_herdr_env() -> tuple[str | None, str | None]:
     return sock_path, pane_id
 
 
+def is_quota_initialized(cached: dict | None, stdin_quota: dict | None) -> bool:
+    """Returns True only when real quota measurements exist (excludes uninitialized state)."""
+    quota_keys = (
+        "fetched_at",
+        "gemini_5h_fraction",
+        "gemini_weekly_fraction",
+        "claude_5h_fraction",
+        "claude_weekly_fraction",
+        "gemini_disabled",
+        "claude_disabled",
+    )
+    if isinstance(cached, dict) and any(k in cached for k in quota_keys):
+        return True
+    if isinstance(stdin_quota, dict):
+        for sb_key in (
+            "gemini-5h",
+            "gemini_5h",
+            "gemini-weekly",
+            "gemini_weekly",
+            "3p-5h",
+            "claude-5h",
+            "3p_5h",
+            "3p-weekly",
+            "claude-weekly",
+            "3p_weekly",
+        ):
+            sb = stdin_quota.get(sb_key)
+            if isinstance(sb, dict) and (
+                sb.get("remaining_fraction") is not None
+                or sb.get("remainingFraction") is not None
+                or sb.get("disabled") is not None
+            ):
+                return True
+    return False
+
+
+def build_low_quota_badge(eff_pct: int, quota_initialized: bool = True) -> str | None:
+    """Builds compact ANSI low-quota badge when effective model quota <= 15%."""
+    if not quota_initialized or eff_pct > LOW_QUOTA_THRESHOLD_PCT:
+        return None
+    if eff_pct <= 0:
+        return f"{C_BOLD}{C_RED}⚠ AGOTADA{C_RESET}"
+    return f"{C_BOLD}{C_ORANGE}⚠ ≤15%{C_RESET}"
+
+
+def _query_herdr_busy_accounts(sock_path: str | None, exclude_pane_id: str | None = None) -> set[str]:
+    """Queries Herdr pane.list (<1ms local Unix socket) to detect accounts active in other panes."""
+    busy: set[str] = set()
+    if not sock_path or not os.path.exists(sock_path):
+        return busy
+    try:
+        import _socket
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(0.03)
+        try:
+            s.connect(sock_path)
+            s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
+            chunks: list[bytes] = []
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+        finally:
+            s.close()
+        raw = b"".join(chunks).split(b"\n", 1)[0]
+        if not raw:
+            return busy
+        resp = json.loads(raw.decode("utf-8", errors="replace"))
+        panes = (resp.get("result") or {}).get("panes") or []
+        for pane in panes:
+            if not isinstance(pane, dict):
+                continue
+            pid_str = pane.get("pane_id")
+            if exclude_pane_id and pid_str == exclude_pane_id:
+                continue
+            session = pane.get("agent_session") if isinstance(pane.get("agent_session"), dict) else {}
+            disp = str(pane.get("display_agent") or "")
+            t_strip = str(pane.get("terminal_title_stripped") or "")
+            t_raw = str(pane.get("terminal_title") or "")
+            is_agy = (
+                pane.get("agent") == "agy"
+                or session.get("agent") == "agy"
+                or "⚡ agy" in disp
+                or "⚡ agy" in t_strip
+            )
+            if not is_agy:
+                continue
+            for field_val in (disp, t_strip, t_raw, str(pane.get("label") or "")):
+                alias = extract_agy_alias(field_val)
+                if alias:
+                    busy.add(alias.lower())
+                    break
+    except Exception:
+        pass
+    return busy
+
+
+def find_suggested_replacement_account(
+    account: str,
+    model_name: str,
+    *,
+    real_home: str | None = None,
+    cache_dir: str | None = None,
+    sock_path: str | None = None,
+    current_pane_id: str | None = None,
+) -> tuple[str, str, int, int] | None:
+    """Selects best replacement account (<3ms local file scan):
+    - Excludes current account, is_revoked == True, locked == True, low quota (<=15%), and busy Herdr panes.
+    - Enforces plan_type == 'ULTRA' when model contains 'carbon'; otherwise prefers healthy PRO accounts (Reserva ULTRA).
+    Returns (alias, plan_type, p5, ps) or None.
+    """
+    base_home = real_home if real_home is not None else REAL_HOME
+    cdir = cache_dir if cache_dir is not None else (
+        os.path.join(base_home, ".cache", "agyc") if base_home != REAL_HOME else CACHE_DIR
+    )
+
+    acc_dirs = [os.path.join(base_home, ".gemini", "antigravity-cli", "accounts")]
+    if base_home == REAL_HOME:
+        acc_dirs.append(
+            os.path.join(base_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts")
+        )
+    accounts_dir = next((d for d in acc_dirs if os.path.isdir(d)), None)
+    if not accounts_dir:
+        return None
+
+    extra_locked: set[str] = set()
+    for meta_fname in ("config.json", "meta.json"):
+        mp = os.path.join(accounts_dir, meta_fname)
+        if os.path.isfile(mp):
+            try:
+                with open(mp, "r", encoding="utf-8") as mf:
+                    mdata = json.load(mf)
+                if isinstance(mdata, dict):
+                    for lk_key in ("locks", "locked", "locked_accounts"):
+                        lk_obj = mdata.get(lk_key)
+                        if isinstance(lk_obj, dict):
+                            for k, v in lk_obj.items():
+                                if v:
+                                    extra_locked.add(str(k).lower())
+                        elif isinstance(lk_obj, list):
+                            for k in lk_obj:
+                                extra_locked.add(str(k).lower())
+            except Exception:
+                pass
+
+    busy_accounts = _query_herdr_busy_accounts(sock_path, exclude_pane_id=current_pane_id)
+    needs_ultra = "carbon" in (model_name or "").lower()
+    curr_lower = (account or "").strip().lower()
+
+    best_key: tuple[int, int, int, int] | None = None
+    best_choice: tuple[str, str, int, int] | None = None
+
+    try:
+        entries = sorted(os.listdir(accounts_dir))
+    except Exception:
+        return None
+
+    for fname in entries:
+        if not (fname.startswith("agy") and fname.endswith(".json")):
+            continue
+        cand_alias = fname[:-5]
+        cand_low = cand_alias.lower()
+        if extract_agy_alias(cand_low) != cand_low:
+            continue
+        if cand_low == curr_lower or cand_low in extra_locked or cand_low in busy_accounts:
+            continue
+
+        try:
+            with open(os.path.join(accounts_dir, fname), "r", encoding="utf-8") as af:
+                acc_data = json.load(af)
+        except Exception:
+            continue
+        if not isinstance(acc_data, dict):
+            continue
+
+        if (
+            bool(acc_data.get("is_revoked", False))
+            or bool(acc_data.get("locked", False))
+            or bool(acc_data.get("is_locked", False))
+        ):
+            continue
+
+        q_data: dict = {}
+        q_cache_path = os.path.join(cdir, f"quota_cache_{cand_alias}.json")
+        if os.path.isfile(q_cache_path):
+            try:
+                with open(q_cache_path, "r", encoding="utf-8") as qf:
+                    loaded_q = json.load(qf)
+                if isinstance(loaded_q, dict):
+                    q_data = loaded_q
+            except Exception:
+                q_data = {}
+        if not q_data and isinstance(acc_data.get("quota"), dict):
+            q_data = dict(acc_data["quota"])
+
+        raw_plan = q_data.get("plan_type") or acc_data.get("plan_type")
+        supports_cb = bool(q_data.get("supports_carbon") or acc_data.get("supports_carbon"))
+        if raw_plan:
+            cand_plan = str(raw_plan).strip().upper()
+        elif supports_cb:
+            cand_plan = "ULTRA"
+        else:
+            cand_plan = "PRO"
+
+        if needs_ultra and cand_plan != "ULTRA":
+            continue
+
+        norm_q = merge_cached_and_stdin_quota(q_data, None) if q_data else None
+        cf5, _, cfs, _, _ = get_quota_for_model(norm_q, model_name)
+        cp5 = fmt_pct(cf5)
+        cps = fmt_pct(cfs)
+        if min(cp5, cps) <= LOW_QUOTA_THRESHOLD_PCT:
+            continue
+
+        if needs_ultra:
+            tier_rank = 1
+        else:
+            # Reserva ULTRA: prefer healthy PRO accounts before touching ULTRA
+            tier_rank = 2 if cand_plan == "PRO" else (1 if cand_plan != "ULTRA" else 0)
+
+        try:
+            alias_num = int(cand_low[3:])
+        except Exception:
+            alias_num = 99
+
+        cand_key = (tier_rank, cp5, cps, -alias_num)
+        if best_key is None or cand_key > best_key:
+            best_key = cand_key
+            best_choice = (cand_alias, cand_plan, cp5, cps)
+
+    return best_choice
+
+
+def maybe_notify_low_quota(
+    account: str,
+    model_name: str,
+    family: str,
+    p5: int,
+    ps: int,
+    r5: str | None = None,
+    rs: str | None = None,
+    *,
+    quota_initialized: bool = True,
+    real_home: str | None = None,
+    cache_dir: str | None = None,
+    sock_path: str | None = None,
+    current_pane_id: str | None = None,
+    now_ts: float | None = None,
+) -> dict | None:
+    """Sends a single deduplicated Herdr toast notification per reset cycle when min(p5, ps) <= 15%.
+    Supports isolated testing via AGYC_TEST_HERDR_CMD or explicit real_home/cache_dir.
+    """
+    if not quota_initialized:
+        return None
+
+    eff_pct = min(int(p5), int(ps))
+    if eff_pct > LOW_QUOTA_THRESHOLD_PCT:
+        return None
+
+    if real_home is not None:
+        base_home = real_home
+    else:
+        env_rh = os.environ.get("AGYC_REAL_HOME", "").strip()
+        base_home = env_rh if (env_rh and os.path.isdir(env_rh)) else REAL_HOME
+
+    if cache_dir is not None:
+        cdir = cache_dir
+    elif base_home != REAL_HOME:
+        cdir = os.path.join(base_home, ".cache", "agyc")
+    else:
+        cdir = CACHE_DIR
+
+    ts = float(now_ts) if now_ts is not None else time.time()
+    safe_account = safe_cache_key((account or "agy01").strip().lower())
+    fam_norm = "claude" if "claude" in (family or "").lower() else "gemini"
+    fam_label = "Claude" if fam_norm == "claude" else "Gemini"
+    reset_key = str(r5 or rs or "active")
+    alert_file = os.path.join(cdir, f"low_quota_alert_{safe_account}_{fam_norm}.json")
+
+    # Fast-path read deduplication (<0.1ms)
+    if os.path.isfile(alert_file):
+        try:
+            with open(alert_file, "r", encoding="utf-8") as af:
+                prev = json.load(af)
+            if isinstance(prev, dict) and str(prev.get("reset_key", "")) == reset_key:
+                prev_ts = float(prev.get("notified_at", 0) or 0)
+                if 0 <= (ts - prev_ts) < LOW_QUOTA_DEDUP_SECONDS:
+                    return None
+        except Exception:
+            pass
+
+    test_cmd = os.environ.get("AGYC_TEST_HERDR_CMD", "").strip()
+    if sock_path is not None:
+        eff_sock: str | None = sock_path
+    elif base_home != REAL_HOME:
+        cand_sock = os.path.join(base_home, ".config", "herdr", "herdr.sock")
+        eff_sock = cand_sock if os.path.exists(cand_sock) else None
+    else:
+        eff_sock = None
+        for sc in (
+            os.environ.get("HERDR_SOCKET_PATH", "").strip(),
+            os.path.join(base_home, ".config", "herdr", "herdr.sock"),
+            "/home/aidev/.config/herdr/herdr.sock",
+        ):
+            if sc and os.path.exists(sc):
+                eff_sock = sc
+                break
+
+    herdr_bin = os.path.join(base_home, ".local", "bin", "herdr")
+    if not os.path.isfile(herdr_bin) and base_home == REAL_HOME:
+        alt_bin = "/home/aidev/.local/bin/herdr"
+        if os.path.isfile(alt_bin):
+            herdr_bin = alt_bin
+
+    if test_cmd:
+        can_notify = True
+    else:
+        herdr_active = (os.environ.get("HERDR_ENV") == "1") or bool(eff_sock and os.path.exists(eff_sock))
+        can_notify = herdr_active and os.path.isfile(herdr_bin) and os.access(herdr_bin, os.X_OK)
+
+    if not can_notify:
+        return None
+
+    locks_dir = os.path.join(cdir, "locks")
+    try:
+        os.makedirs(locks_dir, mode=0o700, exist_ok=True)
+    except Exception:
+        pass
+
+    lock_path = os.path.join(locks_dir, f"low_quota_{safe_account}_{fam_norm}.lock")
+    lock_fd: int | None = None
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+        return None
+    except Exception:
+        lock_fd = None
+
+    try:
+        # Re-check inside lock to avoid concurrent statusline + titleline race
+        if os.path.isfile(alert_file):
+            try:
+                with open(alert_file, "r", encoding="utf-8") as af:
+                    prev = json.load(af)
+                if isinstance(prev, dict) and str(prev.get("reset_key", "")) == reset_key:
+                    prev_ts = float(prev.get("notified_at", 0) or 0)
+                    if 0 <= (ts - prev_ts) < LOW_QUOTA_DEDUP_SECONDS:
+                        return None
+            except Exception:
+                pass
+
+        suggested = find_suggested_replacement_account(
+            account,
+            model_name,
+            real_home=base_home,
+            cache_dir=cdir,
+            sock_path=eff_sock,
+            current_pane_id=current_pane_id,
+        )
+
+        title = f"⚠ Cuota baja en {account} ({eff_pct}%)"
+        if suggested is not None:
+            best_alias, best_plan, best_p5, _ = suggested
+            body = f"Sugerida libre: {best_alias} [{best_plan}] ({best_p5}% 5H) · Ejecuta: agyc auto"
+        else:
+            body = f"Ventana {fam_label} al {eff_pct}% · Revisa con: agyc list"
+
+        try:
+            atomic_write_json(
+                alert_file,
+                {"reset_key": reset_key, "notified_at": ts},
+                mode=0o600,
+            )
+        except Exception:
+            pass
+
+        cmd_to_run: str | None = None
+        if test_cmd:
+            if test_cmd.lower() not in ("0", "none", "noop", "dry-run", "dry_run"):
+                cmd_to_run = test_cmd
+        else:
+            cmd_to_run = herdr_bin
+
+        if cmd_to_run:
+            try:
+                import subprocess
+                subprocess.Popen(
+                    [
+                        cmd_to_run,
+                        "notification",
+                        "show",
+                        "--position",
+                        "top-right",
+                        "--sound",
+                        "none",
+                        "--body",
+                        body,
+                        title,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception:
+                pass
+
+        return {
+            "title": title,
+            "body": body,
+            "reset_key": reset_key,
+            "notified_at": ts,
+            "suggested": suggested[0] if suggested else None,
+            "suggested_plan": suggested[1] if suggested else None,
+        }
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+
+
 def report_herdr_pane_metadata(
     account: str,
     plan_type: str | None,
@@ -1371,10 +1808,11 @@ def report_herdr_pane_metadata(
     ctx_percent: int,
     ps: int,
     allow_without_parent: bool = False,
+    low_quota: bool | None = None,
 ) -> None:
     """Reports live account, plan, model and 5H -> Ctx -> Sem telemetry to Herdr pane header.
     Uses 8s throttle in ~/.cache/agyc/herdr_meta_{safe_pane}.json with immediate bypass on
-    account/plan/model change or abs(ctx_pct - prev_ctx) >= 3.
+    account/plan/model/low_quota change or abs(ctx_pct - prev_ctx) >= 3.
     """
     if not allow_without_parent and find_parent_agy_pid() is None:
         return
@@ -1390,6 +1828,7 @@ def report_herdr_pane_metadata(
 
     plan_tag = (plan_type or "").strip().upper()
     short_model = model_name.strip()
+    is_low = (min(p5, ps) <= LOW_QUOTA_THRESHOLD_PCT) if low_quota is None else bool(low_quota)
 
     if os.path.exists(meta_file):
         try:
@@ -1401,6 +1840,7 @@ def report_herdr_pane_metadata(
                     prev.get("account") == account
                     and prev.get("plan") == plan_tag
                     and prev.get("model") == short_model
+                    and bool(prev.get("low_quota", False)) == is_low
                 )
                 prev_ctx = prev.get("ctx_pct")
                 ctx_changed = (prev_ctx is None) or (abs(ctx_percent - int(prev_ctx)) >= 3)
@@ -1420,6 +1860,7 @@ def report_herdr_pane_metadata(
                 "ctx_pct": ctx_percent,
                 "p5": p5,
                 "ps": ps,
+                "low_quota": is_low,
             },
             mode=0o600,
         )
@@ -1428,6 +1869,8 @@ def report_herdr_pane_metadata(
 
     seq = int(now_ts * 1000)
     acc_head = f"⚡ {account} [{plan_tag}]" if plan_tag else f"⚡ {account}"
+    if is_low:
+        acc_head = f"⚠ {acc_head}"
     display_agent = f"{acc_head} · {short_model} · 5H:{p5}% Ctx:{ctx_percent}% Sem:{ps}%"
     tokens: dict[str, str | None] = {
         "quota": f"5H:{p5}% Ctx:{ctx_percent}% Sem:{ps}%",
@@ -1918,6 +2361,9 @@ def main() -> None:
     f5, r5, fs, rs, family = get_quota_for_model(quota, model_name)
     p5 = fmt_pct(f5)
     ps = fmt_pct(fs)
+    quota_init = is_quota_initialized(cached_quota, stdin_quota)
+    eff_pct = min(p5, ps)
+    is_low_quota = quota_init and (eff_pct <= LOW_QUOTA_THRESHOLD_PCT)
 
     # 4. Context Usage + Persistence BEFORE is_title_mode branch
     conv_id, transcript_path = resolve_conv_and_transcript(stdin_data, account=account)
@@ -1929,7 +2375,7 @@ def main() -> None:
     )
     ctx_percent = fmt_ctx_pct(ctx_frac)
 
-    _, pane_id = get_herdr_env()
+    sock_path, pane_id = get_herdr_env()
     persist_pane_context(
         pane_id=pane_id,
         conv_id=conv_id,
@@ -1949,6 +2395,8 @@ def main() -> None:
     # 5. Titleline Mode (--title or agyc-titleline): plain text without ANSI codes (5H -> Ctx -> Sem)
     if is_title_mode:
         acc_part = f"⚡ {account} [{plan_type}]" if plan_type else f"⚡ {account}"
+        if is_low_quota:
+            acc_part = f"⚠ {acc_part}"
         model_part = f"{model_name} ({effort})"
         part_5h = f"5H: {p5}%" if (p5 >= 100 or not r5) else f"5H: {p5}% ({format_countdown(r5)})"
         ctx_part = f"Ctx: {ctx_percent}%"
@@ -1962,11 +2410,26 @@ def main() -> None:
             ctx_percent,
             ps,
             allow_without_parent=has_stdin,
+            low_quota=is_low_quota,
         )
+        if is_low_quota and (has_stdin or find_parent_agy_pid() is not None or bool(os.environ.get("AGYC_TEST_HERDR_CMD"))):
+            maybe_notify_low_quota(
+                account,
+                model_name,
+                family,
+                p5,
+                ps,
+                r5,
+                rs,
+                quota_initialized=quota_init,
+                sock_path=sock_path,
+                current_pane_id=pane_id,
+            )
         sys.exit(0)
 
     # 6. Normal ANSI Statusline Mode (5H -> Ctx -> Sem)
     acc_badge = build_account_badge(account, plan_type)
+    low_badge = build_low_quota_badge(eff_pct, quota_initialized=quota_init)
 
     branch, is_dirty = get_vcs_info(stdin_data)
     if branch:
@@ -1997,13 +2460,15 @@ def main() -> None:
 
     sep = f" {C_GRAY}│{C_RESET} "
     parts = [acc_badge]
+    if low_badge:
+        parts.append(low_badge)
     if branch_badge:
         parts.append(branch_badge)
     parts.extend([model_badge, str_5h, ctx_badge, str_sem])
 
     print(sep.join(parts), flush=True)
 
-    # 7. Sync metadata with Herdr pane top bar (8s throttle with bypass on model/account/ctx>=3% delta)
+    # 7. Sync metadata with Herdr pane top bar + single low-quota toast per cycle
     report_herdr_pane_metadata(
         account,
         plan_type,
@@ -2012,7 +2477,21 @@ def main() -> None:
         ctx_percent,
         ps,
         allow_without_parent=has_stdin,
+        low_quota=is_low_quota,
     )
+    if is_low_quota and (has_stdin or find_parent_agy_pid() is not None or bool(os.environ.get("AGYC_TEST_HERDR_CMD"))):
+        maybe_notify_low_quota(
+            account,
+            model_name,
+            family,
+            p5,
+            ps,
+            r5,
+            rs,
+            quota_initialized=quota_init,
+            sock_path=sock_path,
+            current_pane_id=pane_id,
+        )
 
 
 if __name__ == "__main__":

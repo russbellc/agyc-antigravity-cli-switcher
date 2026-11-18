@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agyc: Administrador multi-cuenta de Google Antigravity (Pro / Ultra — v1.5).
+agyc: Administrador multi-cuenta de Google Antigravity (Pro / Ultra — v1.6).
 
 Características:
   - Nombre corto y rápido: agyc
@@ -9,8 +9,9 @@ Características:
   - Registro automático correlativo: 'agyc add' asigna automáticamente agy02, agy03, etc.
   - Motor de cuotas CloudCode PA v1.5.10 (daily + prod fusionados con min remainingFraction).
   - Detección automática de plan (ULTRA / PRO / ENT / FREE) y soporte Gemini 4 Carbon.
-  - Tabla compacta de 131 columnas ideal para paneles divididos de Herdr.
-  - Rotación inteligente paralela: 'agyc auto [gemini|claude|carbon]'.
+  - Tabla compacta de 131 columnas con paneles vivos de Herdr ('EN USO') y etiquetas ('agyc note').
+  - Rotación inteligente paralela: 'agyc auto [gemini|claude|carbon] [--allow-ultra]' (Reserva ULTRA + Burn-First + Anti-colisión).
+  - Diagnóstico y auto-reparación de flota: 'agyc doctor [--fix]'.
   - Vaciado seguro y total: 'agyc wipe'.
 """
 
@@ -18,6 +19,7 @@ import sys
 import os
 import re
 import pwd
+import stat
 import glob
 import math
 import json
@@ -26,6 +28,8 @@ import hmac
 import html
 import fcntl
 import base64
+import socket
+import inspect
 import hashlib
 import secrets
 import tempfile
@@ -72,6 +76,10 @@ RESERVED_ALIASES = {
     "auto",
     "lock",
     "unlock",
+    "note",
+    "tag",
+    "label",
+    "doctor",
     "wipe",
     "clean",
     "purge",
@@ -104,8 +112,32 @@ def strip_ansi(s: str) -> str:
     return ANSI_REGEX.sub("", str(s))
 
 
+def _char_display_width(ch: str) -> int:
+    import unicodedata
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
 def visible_len(s: str) -> int:
-    return len(strip_ansi(s))
+    return sum(_char_display_width(ch) for ch in strip_ansi(s))
+
+
+def truncate_visible(s: str, max_len: int) -> str:
+    clean = strip_ansi(s)
+    if visible_len(clean) <= max_len:
+        return clean
+    if max_len <= 1:
+        return "…" if max_len == 1 else ""
+    out = []
+    acc = 0
+    for ch in clean:
+        w = _char_display_width(ch)
+        if acc + w > max_len - 1:
+            break
+        out.append(ch)
+        acc += w
+    return "".join(out) + "…"
 
 
 def pad_visible(s: str, width: int, align: str = "left") -> str:
@@ -154,6 +186,35 @@ def resolve_real_home() -> str:
 
 REAL_HOME = resolve_real_home()
 CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
+
+
+def _load_agyc_core():
+    """Carga lib/agyc_core.py con búsqueda determinista en repo, desarrollo e instalación global."""
+    lib_candidates = [
+        os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")),
+        "/home/aidev/proyectos/agyc-antigravity-cli-switcher/lib",
+        os.path.join(resolve_real_home(), ".gemini", "antigravity-cli", "lib"),
+        os.path.join(
+            resolve_real_home(),
+            "snap",
+            "antigravity-cli",
+            "common",
+            ".gemini",
+            "antigravity-cli",
+            "lib",
+        ),
+    ]
+    for lib_dir in reversed(lib_candidates):
+        if lib_dir and os.path.isdir(lib_dir) and lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+    try:
+        import agyc_core  # type: ignore
+        return agyc_core
+    except Exception:
+        return None
+
+
+_agyc_core = _load_agyc_core()
 
 # User-Agent oficial Antigravity 1.5.10 que habilita ambos grupos unificados en CloudCode PA
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
@@ -1464,6 +1525,7 @@ def prepare_isolated_home(alias: str) -> str:
         ".gitconfig",
         ".git-credentials",
         ".ssh",
+        ".npm",
         os.path.join(".config", "gh"),
         os.path.join(".config", "herdr"),
     )
@@ -1666,13 +1728,367 @@ def _load_or_refresh_account_for_list(alias: str, force_refresh: bool) -> dict |
     return data
 
 
+def _extract_agy_alias_fast(text: str | None) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"(?<![a-zA-Z0-9_])(?:agy|agi)(\d{1,3})(?![a-zA-Z0-9_])", text, re.IGNORECASE)
+    if m:
+        return f"agy{int(m.group(1)):02d}"
+    return None
+
+
+def _query_herdr_panes_fast(real_home: str, timeout: float = 0.06) -> tuple[list[dict], float | None, str]:
+    sock_path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(real_home, ".config", "herdr", "herdr.sock")
+    if not os.path.exists(sock_path):
+        return [], None, sock_path
+    t0 = time.monotonic()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_path)
+        s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
+        chunks: list[bytes] = []
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+        raw = b"".join(chunks).split(b"\n", 1)[0]
+        if not raw:
+            return [], None, sock_path
+        resp = json.loads(raw.decode("utf-8", errors="replace"))
+        panes = (resp.get("result") or {}).get("panes") or []
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+        return (panes if isinstance(panes, list) else []), elapsed_ms, sock_path
+    except Exception:
+        return [], None, sock_path
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _short_pane_label(pane_id: str) -> str:
+    pid_str = str(pane_id or "").strip()
+    if ":" in pid_str:
+        return pid_str.split(":")[-1]
+    return pid_str
+
+
+def _builtin_scan_active_herdr_panes(real_home: str | None = None) -> dict[str, list[dict]]:
+    """
+    Escanea en <8ms los procesos vivos 'agy-real' en /proc y cruza con pane.list de Herdr
+    para mapear alias -> [{'pane_id': 'w3:p2', 'short_pane': 'p2', 'pid': ...}, ...].
+    """
+    rh = _strip_agyc_homes(real_home) if real_home else resolve_real_home()
+    rh_prefix = rh.rstrip("/") + "/"
+
+    default_active = None
+    for cp in (
+        os.path.join(rh, ".gemini", "antigravity-cli", "accounts", "config.json"),
+        os.path.join(rh, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
+    ):
+        if os.path.exists(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as f:
+                    act = json.load(f).get("active_account")
+                    if act:
+                        default_active = normalize_alias(str(act))
+                        break
+            except Exception:
+                pass
+
+    herdr_panes, _, _ = _query_herdr_panes_fast(rh, timeout=0.06)
+    live_pane_map: dict[str, dict] = {}
+    for hp in herdr_panes:
+        if isinstance(hp, dict) and hp.get("pane_id"):
+            live_pane_map[str(hp["pane_id"])] = hp
+
+    # Por cada HERDR_PANE_ID elegir el proceso agy-real activo (ignorando procesos detenidos Ctrl+Z o zombies)
+    pane_best_proc: dict[str, tuple[tuple[int, int, int], str | None, int]] = {}
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except Exception:
+        pids = []
+
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as cf:
+                if cf.read().strip() != b"agy-real":
+                    continue
+
+            state_active = 1
+            is_fg = 0
+            try:
+                with open(f"/proc/{pid}/stat", "rb") as sf:
+                    st_raw = sf.read().decode("utf-8", errors="ignore")
+                rp = st_raw.rfind(")")
+                if rp != -1:
+                    sfields = st_raw[rp + 2 :].split()
+                    if sfields:
+                        st_ch = sfields[0]
+                        if st_ch in ("Z", "X"):
+                            continue
+                        if st_ch in ("T", "t"):
+                            state_active = 0
+                        if len(sfields) >= 6 and sfields[2] == sfields[5]:
+                            is_fg = 1
+            except Exception:
+                pass
+
+            with open(f"/proc/{pid}/environ", "rb") as ef:
+                env_bytes = ef.read()
+
+            pane_id = None
+            home_val = ""
+            env_real_home = ""
+            alias_from_env = None
+            for item in env_bytes.split(b"\x00"):
+                if item.startswith(b"HERDR_PANE_ID="):
+                    pane_id = item[14:].decode("utf-8", errors="ignore").strip()
+                elif item.startswith(b"HOME="):
+                    home_val = item[5:].decode("utf-8", errors="ignore").strip()
+                    found = _extract_agy_alias_fast(home_val)
+                    if found:
+                        alias_from_env = found
+                elif item.startswith(b"ANTIGRAVITY_APP_DATA_DIR="):
+                    app_dir = item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
+                    found = _extract_agy_alias_fast(app_dir)
+                    if found and not alias_from_env:
+                        alias_from_env = found
+                elif item.startswith(b"AGYC_REAL_HOME="):
+                    env_real_home = item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
+
+            if not pane_id:
+                continue
+
+            # Aislar procesos pertenecientes a otro REAL_HOME (útil en tests con AGYC_REAL_HOME temporal)
+            belongs_to_rh = (
+                home_val == rh
+                or home_val.startswith(rh_prefix)
+                or (env_real_home and _strip_agyc_homes(env_real_home) == rh)
+            )
+            if not belongs_to_rh:
+                continue
+
+            if live_pane_map and pane_id not in live_pane_map:
+                continue
+
+            rank = (state_active, is_fg, pid)
+            prev = pane_best_proc.get(pane_id)
+            if prev is None or rank > prev[0]:
+                pane_best_proc[pane_id] = (rank, alias_from_env, pid)
+        except Exception:
+            continue
+
+    result: dict[str, list[dict]] = {}
+    for pane_id, (_, alias_env, pid) in pane_best_proc.items():
+        hp = live_pane_map.get(pane_id, {})
+        resolved_alias = alias_env
+        if not resolved_alias and hp:
+            for k in ("display_agent", "terminal_title_stripped", "terminal_title", "label"):
+                v = hp.get(k)
+                if isinstance(v, str) and v:
+                    cand = _extract_agy_alias_fast(v)
+                    if cand:
+                        resolved_alias = cand
+                        break
+        if not resolved_alias:
+            resolved_alias = default_active
+        if not resolved_alias:
+            continue
+
+        entry = {
+            "pane_id": pane_id,
+            "short_pane": _short_pane_label(pane_id),
+            "pid": pid,
+            "tab_id": hp.get("tab_id"),
+            "label": hp.get("label"),
+            "focused": bool(hp.get("focused", False)),
+        }
+        result.setdefault(resolved_alias, []).append(entry)
+
+    def _pane_sort_key(p: dict) -> tuple[int, int, str]:
+        sp = str(p.get("short_pane") or "")
+        m = re.match(r"^p(\d+)$", sp)
+        return (0 if p.get("focused") else 1, int(m.group(1)) if m else 999999, sp)
+
+    for al in result:
+        result[al].sort(key=_pane_sort_key)
+
+    return result
+
+
+def _normalize_panes_map(raw_map: dict | None) -> dict[str, list[dict]]:
+    if not isinstance(raw_map, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for raw_alias, plist in raw_map.items():
+        al = normalize_alias(str(raw_alias)) or str(raw_alias)
+        if not isinstance(plist, list):
+            continue
+        norm_list: list[dict] = []
+        for item in plist:
+            if isinstance(item, str) and item.strip():
+                pid_s = item.strip()
+                norm_list.append({"pane_id": pid_s, "short_pane": _short_pane_label(pid_s)})
+            elif isinstance(item, dict):
+                pid_s = str(item.get("pane_id") or item.get("id") or item.get("short_pane") or "").strip()
+                if not pid_s:
+                    continue
+                sp = str(item.get("short_pane") or item.get("short_id") or _short_pane_label(pid_s)).strip()
+                copied = dict(item)
+                copied["pane_id"] = pid_s
+                copied["short_pane"] = sp
+                norm_list.append(copied)
+        if norm_list:
+            out[al] = norm_list
+    return out
+
+
+def scan_active_herdr_panes(real_home: str | None = None) -> dict[str, list[dict]]:
+    rh = real_home or resolve_real_home()
+    core_fn = getattr(_agyc_core, "scan_active_herdr_panes", None) if _agyc_core else None
+    if callable(core_fn):
+        try:
+            sig = inspect.signature(core_fn)
+            params = list(sig.parameters.values())
+            if not params:
+                raw = core_fn()
+            else:
+                raw = core_fn(rh)
+            return _normalize_panes_map(raw)
+        except Exception:
+            pass
+    return _builtin_scan_active_herdr_panes(rh)
+
+
+def _builtin_sanitize_account_for_json(
+    acc: dict,
+    active: str | None = None,
+    default: str | None = None,
+    active_panes: list[str] | None = None,
+) -> dict:
+    al = acc.get("alias", "")
+    q_norm = _sanitize_cached_or_stored_quota(acc.get("quota", {}))
+    clean_quota = {k: q_norm[k] for k in SAFE_QUOTA_KEYS if k in q_norm}
+    plan_type = clean_quota.get("plan_type") or acc.get("plan_type") or "FREE"
+    tier_id = clean_quota.get("tier_id") or acc.get("tier_id") or "free-tier"
+    tier_name = clean_quota.get("tier_name") or acc.get("tier_name") or "Antigravity"
+    supports_carbon = bool(
+        clean_quota.get("supports_carbon", acc.get("supports_carbon", plan_type == "ULTRA"))
+    )
+    return {
+        "alias": al,
+        "email": acc.get("email", ""),
+        "name": acc.get("name", ""),
+        "plan_type": plan_type,
+        "tier_id": tier_id,
+        "tier_name": tier_name,
+        "supports_carbon": supports_carbon,
+        "is_active": bool(al == active),
+        "is_default": bool(al == default),
+        "is_revoked": bool(acc.get("is_revoked", False)),
+        "locked": bool(acc.get("locked", False)),
+        "lock_reason": acc.get("lock_reason") or "",
+        "note": acc.get("note") or "",
+        "active_panes": list(active_panes or []),
+        "quota": clean_quota,
+        "updated_at": acc.get("updated_at"),
+    }
+
+
+def sanitize_account_for_json(
+    acc: dict,
+    active: str | None = None,
+    default: str | None = None,
+    active_panes: list[str] | None = None,
+) -> dict:
+    base_safe = _builtin_sanitize_account_for_json(
+        acc,
+        active=active,
+        default=default,
+        active_panes=active_panes,
+    )
+    core_fn = getattr(_agyc_core, "sanitize_account_for_json", None) if _agyc_core else None
+    if callable(core_fn):
+        try:
+            acc_prepared = dict(acc)
+            acc_prepared["quota"] = base_safe["quota"]
+            al_str = str(acc.get("alias") or "")
+            res = core_fn(
+                al_str,
+                acc_prepared,
+                active_account=active,
+                default_account=default,
+                active_panes=list(active_panes or []),
+            )
+            if isinstance(res, dict):
+                merged = dict(base_safe)
+                merged.update(res)
+                merged["active_panes"] = list(active_panes or [])
+                merged["note"] = acc.get("note") or ""
+                merged["lock_reason"] = acc.get("lock_reason") or ""
+                merged["locked"] = bool(acc.get("locked", False))
+                for forbidden in ("token_data", "token", "access_token", "refresh_token", "id_token", "client_secret"):
+                    merged.pop(forbidden, None)
+                if isinstance(merged.get("quota"), dict):
+                    merged["quota"] = {k: merged["quota"][k] for k in SAFE_QUOTA_KEYS if k in merged["quota"]}
+                return merged
+        except Exception:
+            pass
+    return base_safe
+
+
+def _format_state_row2(is_locked: bool, short_panes: list[str], inner_width: int) -> str:
+    """Formatea la segunda fila de ESTADO (<= inner_width chars visibles, sin desbordar jamás)."""
+    if is_locked and short_panes:
+        if len(short_panes) == 1:
+            raw = truncate_visible(f"🔒 en {short_panes[0]}", inner_width)
+        else:
+            raw = truncate_visible(f"🔒 {len(short_panes)}p:{','.join(short_panes)}", inner_width)
+        return f"{C_BOLD}{C_YELLOW}{raw}{C_RESET}"
+    if is_locked:
+        raw = truncate_visible("🔒 RESERVADA", inner_width)
+        return f"{C_BOLD}{C_YELLOW}{raw}{C_RESET}"
+    if short_panes:
+        if len(short_panes) == 1:
+            raw = truncate_visible(f"▶ en {short_panes[0]}", inner_width)
+            return f"{C_BOLD}{C_GREEN}{raw}{C_RESET}"
+        raw = truncate_visible(f"▶ {len(short_panes)}p:{','.join(short_panes)}", inner_width)
+        return f"{C_BOLD}{C_CYAN}{raw}{C_RESET}"
+    return ""
+
+
+def _format_note_row2(acc: dict, inner_width: int) -> str:
+    """Formatea la nota o motivo de bloqueo en la segunda fila de CUENTA / EMAIL (<= inner_width chars)."""
+    is_locked = bool(acc.get("locked", False))
+    raw_text = (
+        (acc.get("lock_reason") or acc.get("note") or "")
+        if is_locked
+        else (acc.get("note") or "")
+    )
+    clean_text = " ".join(str(raw_text).split()).strip()
+    if not clean_text:
+        return ""
+    disp = truncate_visible(f"↳ {clean_text}", inner_width)
+    if is_locked:
+        return f"{C_YELLOW}{disp}{C_RESET}"
+    return f"{C_DIM}{C_CYAN}{disp}{C_RESET}"
+
+
 def cmd_list(args):
     ensure_auto_migration()
     sync_account_symlinks()
+    real_home = resolve_real_home()
     aliases = list_account_aliases()
     cfg = load_config()
     active = cfg.get("active_account")
     default = cfg.get("default_account")
+    active_panes_map = scan_active_herdr_panes(real_home)
 
     if not aliases:
         if getattr(args, "json", False):
@@ -1695,30 +2111,15 @@ def cmd_list(args):
         sanitized_accounts = []
         for acc in accounts:
             al = acc.get("alias", "")
-            q_norm = _sanitize_cached_or_stored_quota(acc.get("quota", {}))
-            clean_quota = {k: q_norm[k] for k in SAFE_QUOTA_KEYS if k in q_norm}
-            plan_type = clean_quota.get("plan_type") or acc.get("plan_type") or "FREE"
-            tier_id = clean_quota.get("tier_id") or acc.get("tier_id") or "free-tier"
-            tier_name = clean_quota.get("tier_name") or acc.get("tier_name") or "Antigravity"
-            supports_carbon = bool(
-                clean_quota.get("supports_carbon", acc.get("supports_carbon", plan_type == "ULTRA"))
+            pane_ids = [p["pane_id"] for p in active_panes_map.get(al, []) if p.get("pane_id")]
+            sanitized_accounts.append(
+                sanitize_account_for_json(
+                    acc,
+                    active=active,
+                    default=default,
+                    active_panes=pane_ids,
+                )
             )
-            sanitized_accounts.append({
-                "alias": al,
-                "email": acc.get("email", ""),
-                "name": acc.get("name", ""),
-                "plan_type": plan_type,
-                "tier_id": tier_id,
-                "tier_name": tier_name,
-                "supports_carbon": supports_carbon,
-                "is_active": bool(al == active),
-                "is_default": bool(al == default),
-                "is_revoked": bool(acc.get("is_revoked", False)),
-                "locked": bool(acc.get("locked", False)),
-                "note": acc.get("note") or "",
-                "quota": clean_quota,
-                "updated_at": acc.get("updated_at"),
-            })
         out = {
             "active_account": active,
             "default_account": default,
@@ -1728,7 +2129,7 @@ def cmd_list(args):
         return
 
     print()
-    header_title = f"{C_BOLD}{C_WHITE}PANEL DE CUENTAS DE GOOGLE ANTIGRAVITY (PRO / ULTRA — AGYC v1.5){C_RESET}"
+    header_title = f"{C_BOLD}{C_WHITE}PANEL DE CUENTAS DE GOOGLE ANTIGRAVITY (PRO / ULTRA — AGYC v1.6){C_RESET}"
     print(header_title)
     print(f"{C_DIM}Consumo unificado en vivo: Gemini (Carbon/Argon/Hydrogen/Flash) y Claude & GPT (5H y Semanal).{C_RESET}\n")
 
@@ -1767,8 +2168,14 @@ def cmd_list(args):
         is_active = (alias == active)
         is_default = (alias == default)
         is_revoked = bool(acc.get("is_revoked", False))
+        is_locked = bool(acc.get("locked", False))
         q = _sanitize_cached_or_stored_quota(acc.get("quota", {}))
         plan_disp = format_plan_badge(q.get("plan_type"))
+
+        panes_for_acc = active_panes_map.get(alias, [])
+        short_panes = [str(p["short_pane"]) for p in panes_for_acc if p.get("short_pane")]
+        state_row2_str = _format_state_row2(is_locked, short_panes, col_state - 2)
+        email_row2_str = _format_note_row2(acc, col_email - 2)
 
         if is_revoked:
             state_str = f"{C_BOLD}{C_RED}EXPIRADA{C_RESET}"
@@ -1784,7 +2191,7 @@ def cmd_list(args):
             elif is_active:
                 state_str = f"{C_GREEN}* ACTIVA{C_RESET}"
                 alias_disp = f"{C_BOLD}{C_GREEN}* {alias}{C_RESET}"
-            elif acc.get("locked"):
+            elif is_locked:
                 state_str = f"{C_YELLOW}  RESERVADA{C_RESET}"
                 alias_disp = f"  {alias}"
             elif is_default:
@@ -1826,9 +2233,9 @@ def cmd_list(args):
         )
         row2 = (
             f"│ {pad_visible('', col_alias - 2)} "
-            f"│ {pad_visible('', col_email - 2)} "
+            f"│ {pad_visible(email_row2_str, col_email - 2)} "
             f"│ {pad_visible('', col_plan - 2)} "
-            f"│ {pad_visible('', col_state - 2)} "
+            f"│ {pad_visible(state_row2_str, col_state - 2)} "
             f"│ {pad_visible(g_line2, col_gemini - 2)} "
             f"│ {pad_visible(c_line2, col_claude - 2)} │"
         )
@@ -1841,10 +2248,10 @@ def cmd_list(args):
     print(f"\n{C_BOLD}Atajos rápidos para desarrollo a tiempo completo:{C_RESET}")
     print(f"  • Entrar directo a cuenta: {C_GREEN}agy01{C_RESET} | {C_GREEN}agy02{C_RESET} | {C_GREEN}agy10{C_RESET} (HOME aislado + --dangerously-skip-permissions)")
     print(f"  • Cambiar sin iniciar:     {C_CYAN}agyc agy02{C_RESET}                  (o 'agyc switch agy02')")
-    print(f"  • Rotación inteligente:    {C_CYAN}agyc auto [gemini|claude|carbon]{C_RESET} (elige mejor saldo 5H + Semanal)")
-    print(f"  • Reporte detallado:       {C_CYAN}agyc quota [alias]{C_RESET}          (plan Pro/Ultra, Carbon y ventanas)")
-    print(f"  • Agregar / renovar:       {C_CYAN}agyc add [alias]{C_RESET}            (OAuth correlativo o re-vinculación)")
-    print(f"  • Actualizar / limpiar:    {C_CYAN}agyc update{C_RESET} | {C_CYAN}agyc wipe{C_RESET}\n")
+    print(f"  • Rotación inteligente:    {C_CYAN}agyc auto [gemini|claude|carbon] [--allow-ultra]{C_RESET} (Reserva ULTRA + Burn-First)")
+    print(f"  • Etiquetar / reservar:    {C_CYAN}agyc note agy05 \"Texto\"{C_RESET} | {C_CYAN}agyc lock agy10 \"Motivo\"{C_RESET}")
+    print(f"  • Reporte y diagnóstico:   {C_CYAN}agyc quota [alias]{C_RESET} | {C_CYAN}agyc doctor [--fix]{C_RESET}")
+    print(f"  • Agregar / actualizar:    {C_CYAN}agyc add [alias]{C_RESET} | {C_CYAN}agyc update{C_RESET} | {C_CYAN}agyc wipe{C_RESET}\n")
 
 
 def cmd_switch(args):
@@ -1974,7 +2381,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
                 <div class="card">
                     <div class="badge">Google Antigravity (Pro / Ultra)</div>
                     <h1>¡Autenticación Exitosa!</h1>
-                    <p>Tu cuenta ha sido vinculada correctamente para Google Antigravity (agyc v1.5).</p>
+                    <p>Tu cuenta ha sido vinculada correctamente para Google Antigravity (agyc v1.6).</p>
                     <p style="color: #64748b; font-size: 14px;">Ya puedes cerrar esta ventana y regresar a tu terminal.</p>
                 </div>
             </body>
@@ -2252,6 +2659,7 @@ def cmd_add(args):
         "quota": quota,
         "is_revoked": False,
         "locked": bool(existing.get("locked", False)) if existing else False,
+        "lock_reason": (existing.get("lock_reason") or "") if existing else "",
         "note": (existing.get("note") or "") if existing else "",
     }
     if existing and existing.get("created_at"):
@@ -2334,6 +2742,7 @@ def cmd_capture(args):
             "quota": quota,
             "is_revoked": False,
             "locked": bool(existing.get("locked", False)) if existing else False,
+            "lock_reason": (existing.get("lock_reason") or "") if existing else "",
             "note": (existing.get("note") or "") if existing else "",
         }
         save_account(alias, acc_data)
@@ -2715,12 +3124,262 @@ def _eval_account_for_auto(alias: str) -> tuple[str, dict | None, dict]:
     return alias, data, quota
 
 
+def _builtin_compute_smart_auto_choice(
+    accounts: list[dict],
+    target_mode: str = "gemini",
+    active_panes_map: dict[str, list[dict]] | None = None,
+    current_pane: str | None = None,
+    allow_ultra: bool = False,
+) -> dict:
+    """
+    Algoritmo 'Reserva ULTRA + Burn-First + Anti-Colisión':
+      1) Omite cuentas revocadas o locked == True.
+      2) En gemini/claude (sin --allow-ultra), si existe al menos una cuenta PRO saludable (5H >= 15% y Sem >= 15%),
+         protege las cuentas ULTRA reservándolas para Gemini 4 Carbon; si todas las PRO están <15% o agotadas,
+         habilita automáticamente el fallback a ULTRA.
+      3) Anti-colisión: prioriza cuentas libres ([Libre]) sin paneles activos en Herdr frente a cuentas en uso.
+      4) Burn-First: entre cuentas libres saludables del mismo tier, prioriza ventana 5H abierta (20% <= 5H < 100%)
+         antes de abrir el reloj de 5H de una cuenta intacta al 100%.
+    """
+    panes_map = active_panes_map or {}
+    cur_pane = (current_pane or "").strip() or None
+    fam_key = "gemini" if target_mode in ("gemini", "carbon") else "claude"
+    now_dt = datetime.now(timezone.utc)
+
+    # Pre-evaluación para detectar disponibilidad de cuentas PRO saludables y total de ULTRA
+    has_healthy_pro = False
+    ultra_count = 0
+
+    prepared: list[dict] = []
+    for acc in accounts:
+        if not isinstance(acc, dict):
+            continue
+        alias = str(acc.get("alias") or "")
+        quota = _sanitize_cached_or_stored_quota(acc.get("quota") or {})
+        plan_type = str(quota.get("plan_type") or acc.get("plan_type") or "FREE").upper()
+        supports_carbon = bool(quota.get("supports_carbon") or acc.get("supports_carbon") or plan_type == "ULTRA")
+        is_revoked = bool(acc.get("is_revoked", False))
+        is_locked = bool(acc.get("locked", False))
+
+        if not is_revoked and supports_carbon:
+            ultra_count += 1
+
+        q5h, r5h = normalize_window(quota.get(f"{fam_key}_5h_fraction"), quota.get(f"{fam_key}_5h_reset"))
+        qweek, rweek = normalize_window(quota.get(f"{fam_key}_weekly_fraction"), quota.get(f"{fam_key}_weekly_reset"))
+        dis = bool(quota.get(f"{fam_key}_disabled", False))
+
+        if (qweek is not None and qweek <= 0.001) or (dis and (qweek is None or qweek <= 0.001)):
+            q5h = 0.0
+            qweek = 0.0
+
+        q5h_f = 0.0 if q5h is None else float(q5h)
+        qweek_f = 0.0 if qweek is None else float(qweek)
+        p5 = pct_display(q5h_f) or 0
+        pw = pct_display(qweek_f) or 0
+
+        if not is_revoked and not is_locked and plan_type == "PRO" and p5 >= 15 and pw >= 15:
+            has_healthy_pro = True
+
+        all_panes = panes_map.get(alias, [])
+        other_panes = [p for p in all_panes if p.get("pane_id") != cur_pane]
+        short_other = [str(p.get("short_pane") or _short_pane_label(str(p.get("pane_id") or ""))) for p in other_panes]
+
+        prepared.append({
+            "alias": alias,
+            "email": str(acc.get("email") or ""),
+            "plan_type": plan_type,
+            "supports_carbon": supports_carbon,
+            "is_revoked": is_revoked,
+            "locked": is_locked,
+            "lock_reason": str(acc.get("lock_reason") or acc.get("note") or "").strip(),
+            "note": str(acc.get("note") or "").strip(),
+            "q5h": q5h_f,
+            "r5h": r5h,
+            "qweek": qweek_f,
+            "rweek": rweek,
+            "p5": p5,
+            "pw": pw,
+            "other_panes": other_panes,
+            "short_panes": [s for s in short_other if s],
+        })
+
+    protect_ultra = bool(target_mode in ("gemini", "claude") and not allow_ultra and has_healthy_pro)
+    ultra_fallback = bool(
+        target_mode in ("gemini", "claude") and not allow_ultra and not has_healthy_pro and ultra_count > 0
+    )
+
+    best_alias: str | None = None
+    best_rank: tuple | None = None
+    best_5h = 0.0
+    best_week = 0.0
+
+    earliest_alias: str | None = None
+    min_reset_seconds = float("inf")
+    earliest_reset_str = "N/A"
+
+    evaluations: list[dict] = []
+    for item in prepared:
+        alias = item["alias"]
+        if item["is_revoked"]:
+            item["status"] = "revoked"
+            evaluations.append(item)
+            continue
+
+        if target_mode == "carbon" and not item["supports_carbon"]:
+            item["status"] = "skip_non_ultra"
+            evaluations.append(item)
+            continue
+
+        if item["locked"]:
+            item["status"] = "locked"
+            evaluations.append(item)
+            continue
+
+        if protect_ultra and item["plan_type"] == "ULTRA":
+            item["status"] = "ultra_protected"
+            evaluations.append(item)
+            continue
+
+        q5h_f = item["q5h"]
+        qweek_f = item["qweek"]
+        p5 = item["p5"]
+        pw = item["pw"]
+        is_free = len(item["short_panes"]) == 0
+        is_healthy = (p5 >= 15 and pw >= 15)
+        is_burn_first = (is_free and 20 <= p5 < 100 and pw >= 15)
+
+        item["is_free"] = is_free
+        item["is_healthy"] = is_healthy
+        item["is_burn_first"] = is_burn_first
+
+        if q5h_f > 0.001 and qweek_f > 0.001:
+            if target_mode == "carbon":
+                base_score = (qweek_f * 0.70) + (q5h_f * 0.30)
+            elif target_mode == "claude":
+                base_score = (qweek_f * 0.65) + (q5h_f * 0.35)
+            else:
+                base_score = (q5h_f * 0.65) + (qweek_f * 0.35)
+
+            rank = (
+                1 if is_healthy else 0,
+                1 if is_free else 0,
+                -len(item["short_panes"]),
+                1 if is_burn_first else 0,
+                round(base_score, 6),
+                1 if (target_mode != "carbon" and item["plan_type"] != "ULTRA") else 0,
+            )
+            item["status"] = "eligible"
+            item["score"] = base_score
+            item["rank"] = rank
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_alias = alias
+                best_5h = q5h_f
+                best_week = qweek_f
+        else:
+            item["status"] = "exhausted"
+            blocking_rst = item["rweek"] if qweek_f <= 0.001 else item["r5h"]
+            if blocking_rst:
+                try:
+                    r_dt = parse_iso_datetime(blocking_rst)
+                    secs = max(0.0, (r_dt - now_dt).total_seconds())
+                    if 0 < secs < min_reset_seconds:
+                        min_reset_seconds = secs
+                        earliest_alias = alias
+                        earliest_reset_str = format_countdown(blocking_rst)
+                except Exception:
+                    pass
+
+        evaluations.append(item)
+
+    return {
+        "best_alias": best_alias,
+        "best_5h": best_5h,
+        "best_week": best_week,
+        "protect_ultra": protect_ultra,
+        "ultra_fallback": ultra_fallback,
+        "ultra_count": ultra_count,
+        "earliest_alias": earliest_alias,
+        "earliest_reset_str": earliest_reset_str,
+        "evaluations": evaluations,
+    }
+
+
+def compute_smart_auto_choice(
+    accounts_map: dict[str, dict] | list[dict],
+    target_mode: str = "gemini",
+    active_model: str = "",
+    active_panes_map: dict[str, list[dict]] | None = None,
+    allow_ultra_for_pro_models: bool = False,
+    exclude_pane_id: str | None = None,
+) -> dict:
+    if isinstance(accounts_map, dict):
+        accounts_list = []
+        for k, v in accounts_map.items():
+            if isinstance(v, dict):
+                rec = dict(v)
+                rec.setdefault("alias", k)
+                accounts_list.append(rec)
+        map_for_core = accounts_map
+    else:
+        accounts_list = [x for x in accounts_map if isinstance(x, dict)]
+        map_for_core = {str(x.get("alias") or ""): x for x in accounts_list if x.get("alias")}
+
+    builtin_res = _builtin_compute_smart_auto_choice(
+        accounts_list,
+        target_mode=target_mode,
+        active_panes_map=active_panes_map,
+        current_pane=exclude_pane_id,
+        allow_ultra=allow_ultra_for_pro_models,
+    )
+    core_fn = getattr(_agyc_core, "compute_smart_auto_choice", None) if _agyc_core else None
+    if callable(core_fn):
+        try:
+            core_res = core_fn(
+                map_for_core,
+                target_mode,
+                active_model=active_model,
+                active_panes_map=active_panes_map or {},
+                allow_ultra_for_pro_models=bool(allow_ultra_for_pro_models),
+                exclude_pane_id=exclude_pane_id,
+            )
+            if isinstance(core_res, dict):
+                chosen = core_res.get("best_alias")
+                if isinstance(chosen, str) and chosen.strip():
+                    norm_ch = normalize_alias(chosen.strip())
+                    ev_by_alias = {ev.get("alias"): ev for ev in builtin_res["evaluations"]}
+                    cand_ev = ev_by_alias.get(norm_ch)
+                    cur_ev = ev_by_alias.get(builtin_res.get("best_alias"))
+                    # Respetar elección de agyc_core salvo cuando rompería Burn-First estricto (20%<=5H<100% libre vs 100%)
+                    preserve_strict_burn_first = bool(
+                        cur_ev
+                        and cand_ev
+                        and cur_ev.get("is_burn_first")
+                        and not cand_ev.get("is_burn_first")
+                        and cur_ev.get("is_free")
+                        and cur_ev.get("is_healthy")
+                        and cur_ev.get("plan_type") == cand_ev.get("plan_type")
+                    )
+                    if cand_ev and cand_ev.get("status") == "eligible" and not preserve_strict_burn_first:
+                        builtin_res["best_alias"] = norm_ch
+                        builtin_res["best_5h"] = cand_ev["q5h"]
+                        builtin_res["best_week"] = cand_ev["qweek"]
+                if core_res.get("earliest_alias") and not builtin_res.get("earliest_alias"):
+                    builtin_res["earliest_alias"] = core_res["earliest_alias"]
+                    if core_res.get("earliest_reset"):
+                        builtin_res["earliest_reset_str"] = format_countdown(core_res["earliest_reset"])
+        except Exception:
+            pass
+    return builtin_res
+
+
 def cmd_auto(args):
     aliases = list_account_aliases()
     if not aliases:
         print(f"{C_YELLOW}No hay cuentas registradas.{C_RESET}")
         return
 
+    allow_ultra = bool(getattr(args, "allow_ultra", False))
     active_model = get_active_model_name()
     forced_family = getattr(args, "family", None)
     if forced_family:
@@ -2745,108 +3404,97 @@ def cmd_auto(args):
 
     if target_mode == "carbon":
         family_label = "Gemini 4 Carbon (Exclusivo ULTRA)"
-        fam_key = "gemini"
     elif target_mode == "claude":
         family_label = "Claude & GPT"
-        fam_key = "claude"
     else:
         family_label = "Gemini (Argon / Hydrogen / Flash)"
-        fam_key = "gemini"
+
+    real_home = resolve_real_home()
+    active_panes_map = scan_active_herdr_panes(real_home)
+    current_pane = (os.environ.get("HERDR_PANE_ID") or "").strip() or None
 
     print(f"{C_CYAN}Modelo activo en configuración: {C_BOLD}{active_model}{C_RESET}")
-    print(f"{C_CYAN}Evaluando cuotas en paralelo para {C_BOLD}{family_label}{C_RESET} entre {len(aliases)} cuentas...{C_RESET}")
+    print(f"{C_CYAN}Evaluando cuotas y paneles Herdr en paralelo para {C_BOLD}{family_label}{C_RESET} entre {len(aliases)} cuentas...{C_RESET}")
 
     with ThreadPoolExecutor(max_workers=6) as pool:
         eval_results = list(pool.map(_eval_account_for_auto, aliases))
 
-    best_alias = None
-    best_score = -1.0
-    best_5h = 0.0
-    best_week = 0.0
-    ultra_count = 0
-
-    earliest_alias = None
-    min_reset_seconds = float("inf")
-    earliest_reset_str = "N/A"
-    now_dt = datetime.now(timezone.utc)
-
+    accounts_map: dict[str, dict] = {}
     for alias, data, quota in eval_results:
         if not data:
             continue
-        email = data.get("email", "")
-        if data.get("is_revoked"):
+        rec = dict(data)
+        rec["alias"] = alias
+        rec["quota"] = quota
+        accounts_map[alias] = rec
+
+    choice = compute_smart_auto_choice(
+        accounts_map,
+        target_mode=target_mode,
+        active_model=active_model,
+        active_panes_map=active_panes_map,
+        allow_ultra_for_pro_models=allow_ultra,
+        exclude_pane_id=current_pane,
+    )
+
+    if choice.get("ultra_fallback"):
+        print(f"  {C_YELLOW}ℹ Sin cuentas PRO saludables (>=15%); habilitando fallback automático a cuentas ULTRA.{C_RESET}")
+
+    for ev in choice["evaluations"]:
+        alias = ev["alias"]
+        email = ev["email"]
+        plan_badge = format_plan_badge(ev["plan_type"])
+        st = ev["status"]
+
+        if st == "revoked":
             print(f"  • {alias:<8} ({email}): {C_RED}[EXPIRADA - Re-vincular con 'agyc renew {alias}']{C_RESET}")
             continue
-
-        plan_type = (quota.get("plan_type") or data.get("plan_type") or "FREE").upper()
-        supports_carbon = bool(quota.get("supports_carbon") or plan_type == "ULTRA")
-        plan_badge = format_plan_badge(plan_type)
-
-        if target_mode == "carbon" and not supports_carbon:
+        if st == "skip_non_ultra":
             print(f"  • {alias:<8} [{plan_badge}] ({email}): {C_DIM}[Omitida — Gemini 4 Carbon requiere ULTRA]{C_RESET}")
             continue
-
-        if supports_carbon:
-            ultra_count += 1
-
-        if data.get("locked") is True:
-            note_suffix = f" ({data.get('note')})" if data.get("note") else ""
-            print(f"  • {alias:<8} [{plan_badge}] ({email}): {C_YELLOW}[Reservada]{C_RESET}{C_DIM}{note_suffix}{C_RESET}")
+        if st == "locked":
+            reason = ev.get("lock_reason") or ""
+            tag = f"[🔒 Reservada: {reason}]" if reason else "[🔒 Reservada]"
+            print(f"  • {alias:<8} [{plan_badge}] ({email}): {C_YELLOW}{tag}{C_RESET}")
+            continue
+        if st == "ultra_protected":
+            p5 = ev["p5"]
+            pw = ev["pw"]
+            print(
+                f"  • {alias:<8} [{plan_badge}] ({email}): 5H = {p5:3d}% | Semanal = {pw:3d}% "
+                f"{C_MAGENTA}[🛡 Reserva ULTRA protegida]{C_RESET}"
+            )
             continue
 
-        q5h, r5h = normalize_window(quota.get(f"{fam_key}_5h_fraction"), quota.get(f"{fam_key}_5h_reset"))
-        qweek, rweek = normalize_window(quota.get(f"{fam_key}_weekly_fraction"), quota.get(f"{fam_key}_weekly_reset"))
-        dis = bool(quota.get(f"{fam_key}_disabled", False))
-
-        if (qweek is not None and qweek <= 0.001) or (dis and (qweek is None or qweek <= 0.001)):
-            q5h = 0.0
-            qweek = 0.0
-
-        q5h = 0.0 if q5h is None else float(q5h)
-        qweek = 0.0 if qweek is None else float(qweek)
-
-        p5 = pct_display(q5h) or 0
-        pw = pct_display(qweek) or 0
-
-        status_flag = ""
-        if qweek <= 0.001:
-            status_flag = f" {C_RED}[Semanal Agotada]{C_RESET}"
-        elif q5h <= 0.001:
-            status_flag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
-
-        print(f"  • {alias:<8} [{plan_badge}] ({email}): 5H = {p5:3d}% | Semanal = {pw:3d}%{status_flag}")
-
-        # Requisito estricto: AMBAS ventanas deben tener saldo disponible (AND, nunca OR)
-        if q5h > 0.001 and qweek > 0.001:
-            if target_mode == "carbon":
-                score = (qweek * 0.70) + (q5h * 0.30)
-            elif target_mode == "claude":
-                score = (qweek * 0.65) + (q5h * 0.35)
-            else:
-                score = (q5h * 0.65) + (qweek * 0.35)
-            if score > best_score:
-                best_score = score
-                best_5h = q5h
-                best_week = qweek
-                best_alias = alias
+        p5 = ev["p5"]
+        pw = ev["pw"]
+        short_panes = ev.get("short_panes") or []
+        if short_panes:
+            pane_tag = f"{C_YELLOW}[En uso: {','.join(short_panes)}]{C_RESET}"
         else:
-            # Si está bloqueada por cuota, medir cuándo vuelve a estar operativa (weekly si semanal=0, sino 5h)
-            blocking_rst = rweek if qweek <= 0.001 else r5h
-            if blocking_rst:
-                try:
-                    r_dt = parse_iso_datetime(blocking_rst)
-                    secs = max(0.0, (r_dt - now_dt).total_seconds())
-                    if secs > 0 and secs < min_reset_seconds:
-                        min_reset_seconds = secs
-                        earliest_alias = alias
-                        earliest_reset_str = format_countdown(blocking_rst)
-                except Exception:
-                    pass
+            pane_tag = f"{C_GREEN}[Libre]{C_RESET}"
 
-    if target_mode == "carbon" and ultra_count == 0:
+        extra_flags: list[str] = [pane_tag]
+        if ev["qweek"] <= 0.001:
+            extra_flags.append(f"{C_RED}[Semanal Agotada]{C_RESET}")
+        elif ev["q5h"] <= 0.001:
+            extra_flags.append(f"{C_YELLOW}[5H Agotada]{C_RESET}")
+        elif ev.get("is_burn_first"):
+            extra_flags.append(f"{C_CYAN}[🔥 Burn-first: aprovecha ventana 5H activa]{C_RESET}")
+
+        flags_str = " " + " ".join(extra_flags) if extra_flags else ""
+        print(f"  • {alias:<8} [{plan_badge}] ({email}): 5H = {p5:3d}% | Semanal = {pw:3d}%{flags_str}")
+
+    if target_mode == "carbon" and choice.get("ultra_count", 0) == 0:
         print(f"\n{C_BOLD}{C_YELLOW}⚠ Ninguna de tus cuentas registradas tiene suscripción Google AI Ultra.{C_RESET}")
         print(f"Gemini 4 Carbon solo está habilitado en cuentas ULTRA. Usa {C_CYAN}agyc auto gemini{C_RESET} para Argon/Hydrogen/Flash.\n")
         return
+
+    best_alias = choice.get("best_alias")
+    best_5h = float(choice.get("best_5h") or 0.0)
+    best_week = float(choice.get("best_week") or 0.0)
+    earliest_alias = choice.get("earliest_alias")
+    earliest_reset_str = choice.get("earliest_reset_str") or "N/A"
 
     if best_alias is not None and best_5h > 0.001 and best_week > 0.001:
         print(
@@ -2873,11 +3521,23 @@ def cmd_lock(args):
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
         sys.exit(1)
+
+    raw_opt = getattr(args, "note_opt", None)
+    raw_pos = getattr(args, "reason", None)
+    motivo = None
+    if raw_opt is not None:
+        motivo = " ".join(str(raw_opt).split()).strip()
+    elif isinstance(raw_pos, list) and len(raw_pos) > 0:
+        motivo = " ".join(str(x) for x in raw_pos).strip()
+
     data["locked"] = True
-    if getattr(args, "note", None) is not None:
-        data["note"] = str(args.note).strip()
+    if motivo is not None and motivo != "":
+        data["lock_reason"] = motivo
+        if not (data.get("note") or "").strip():
+            data["note"] = motivo
     save_account(alias, data, sync_links=False)
-    note_msg = f" ({data['note']})" if data.get("note") else ""
+    reason_disp = data.get("lock_reason") or data.get("note") or ""
+    note_msg = f" ({reason_disp})" if reason_disp else ""
     print(f"{C_BOLD}{C_YELLOW}🔒 Cuenta '{alias}' marcada como RESERVADA{note_msg}.{C_RESET} 'agyc auto' la omitirá.\n")
 
 
@@ -2892,8 +3552,50 @@ def cmd_unlock(args):
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
         sys.exit(1)
     data["locked"] = False
+    data["lock_reason"] = ""
     save_account(alias, data, sync_links=False)
     print(f"{C_BOLD}{C_GREEN}🔓 Cuenta '{alias}' liberada.{C_RESET} Disponible nuevamente para 'agyc auto'.\n")
+
+
+def cmd_note(args):
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
+    data = load_account(alias)
+    if not data:
+        print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
+        print(f"Cuentas disponibles: {', '.join(list_account_aliases())}")
+        sys.exit(1)
+
+    clear_flag = bool(getattr(args, "clear", False))
+    raw_parts = getattr(args, "text", None)
+
+    if clear_flag or (isinstance(raw_parts, list) and len(raw_parts) > 0 and " ".join(raw_parts).strip() == ""):
+        data["note"] = ""
+        if not data.get("locked"):
+            data["lock_reason"] = ""
+        save_account(alias, data, sync_links=False)
+        print(f"{C_BOLD}{C_GREEN}✓ Nota eliminada en '{alias}' ({data.get('email')}).{C_RESET}\n")
+        return
+
+    if isinstance(raw_parts, list) and len(raw_parts) > 0:
+        clean_note = " ".join(" ".join(raw_parts).split()).strip()
+        data["note"] = clean_note
+        save_account(alias, data, sync_links=False)
+        print(f"{C_BOLD}{C_GREEN}✓ Nota guardada en '{alias}':{C_RESET} {C_CYAN}{clean_note}{C_RESET}\n")
+        return
+
+    cur_note = (data.get("note") or "").strip()
+    cur_lock_reason = (data.get("lock_reason") or "").strip()
+    if cur_note:
+        print(f"{C_BOLD}Nota actual de '{alias}':{C_RESET} {C_CYAN}{cur_note}{C_RESET}\n")
+    elif cur_lock_reason:
+        print(f"{C_BOLD}Motivo de reserva en '{alias}':{C_RESET} {C_YELLOW}{cur_lock_reason}{C_RESET}\n")
+    else:
+        print(f"{C_DIM}La cuenta '{alias}' no tiene ninguna nota asignada.{C_RESET}")
+        print(f"Usa: {C_CYAN}agyc note {alias} \"Descripción\"{C_RESET} o {C_CYAN}agyc note {alias} --clear{C_RESET}\n")
 
 
 def _copy_executable(src: str, dst: str) -> bool:
@@ -2916,6 +3618,794 @@ def _copy_executable(src: str, dst: str) -> bool:
         return False
 
 
+def _copy_regular_file(src: str, dst: str, mode: int = 0o644) -> bool:
+    if not os.path.isfile(src):
+        return False
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return True
+    parent = os.path.dirname(dst)
+    try:
+        os.makedirs(parent, exist_ok=True)
+        if os.path.islink(dst):
+            os.unlink(dst)
+        tmp = f"{dst}.tmp.{os.getpid()}"
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+        return True
+    except Exception:
+        return False
+
+
+def _find_repo_dir(real_home: str) -> str:
+    self_repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    candidates = [
+        self_repo,
+        os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher"),
+        "/home/aidev/proyectos/agyc-antigravity-cli-switcher",
+        os.path.join(real_home, "proyectos", "agyc"),
+    ]
+    for cand in candidates:
+        if cand and (os.path.isdir(os.path.join(cand, ".git")) or os.path.isdir(os.path.join(cand, "bin"))):
+            return cand
+    return os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher")
+
+
+def _sync_agyc_lib_dirs(repo_dir: str, real_home: str) -> list[str]:
+    """Sincroniza lib/agyc_core.py y lib/__init__.py hacia ~/.gemini/antigravity-cli/lib, snap lib/ y backup_agyc/lib/."""
+    synced: list[str] = []
+    repo_lib = os.path.join(repo_dir, "lib")
+    if not os.path.isdir(repo_lib):
+        return synced
+
+    target_libs = [os.path.join(real_home, ".gemini", "antigravity-cli", "lib")]
+    snap_base = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli")
+    if os.path.isdir(snap_base):
+        target_libs.append(os.path.join(snap_base, "lib"))
+    for bkp_root in (
+        os.path.join(real_home, "proyectos", "backup_agyc"),
+        "/home/aidev/proyectos/backup_agyc",
+    ):
+        if os.path.isdir(bkp_root):
+            cand_bkp = os.path.join(bkp_root, "lib")
+            if cand_bkp not in target_libs:
+                target_libs.append(cand_bkp)
+
+    for fname in ("agyc_core.py", "__init__.py"):
+        src_f = os.path.join(repo_lib, fname)
+        if not os.path.isfile(src_f):
+            continue
+        for tlib in target_libs:
+            dst_f = os.path.join(tlib, fname)
+            if _copy_regular_file(src_f, dst_f, mode=0o644):
+                synced.append(dst_f)
+
+    # Garantizar __init__.py vacío si se sincronizó agyc_core.py y aún no existía __init__.py en origen
+    if os.path.isfile(os.path.join(repo_lib, "agyc_core.py")) and not os.path.isfile(os.path.join(repo_lib, "__init__.py")):
+        for tlib in target_libs:
+            init_f = os.path.join(tlib, "__init__.py")
+            if os.path.isdir(tlib) and not os.path.exists(init_f):
+                try:
+                    with open(init_f, "w", encoding="utf-8") as f:
+                        f.write("")
+                    os.chmod(init_f, 0o644)
+                except Exception:
+                    pass
+
+    return synced
+
+
+def _parse_semver_tuple(ver_str: str | None) -> tuple[int, int, int]:
+    if not ver_str:
+        return (0, 0, 0)
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", ver_str)
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def _dir_size_bytes(root_path: str) -> int:
+    total = 0
+    stack = [root_path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    return total
+
+
+def _resolve_base_dir_readonly(real_home: str) -> str:
+    candidates = [
+        os.environ.get("ANTIGRAVITY_HOME"),
+        os.environ.get("AGY_CONFIG_DIR"),
+        os.path.join(real_home, ".gemini", "antigravity-cli"),
+        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
+    ]
+    for c in candidates:
+        if c and "/.agyc_homes/" not in c and not c.endswith("/.agyc_homes") and os.path.exists(c):
+            return c
+    return os.path.join(real_home, ".gemini", "antigravity-cli")
+
+
+def _list_aliases_readonly(accounts_dir: str) -> list[str]:
+    if not os.path.isdir(accounts_dir):
+        return []
+    aliases: list[str] = []
+    try:
+        for f in sorted(os.listdir(accounts_dir)):
+            if f.endswith(".json") and f != "config.json":
+                stem = f[:-5]
+                if ALIAS_REGEX.match(stem) and stem.lower() not in RESERVED_ALIASES:
+                    aliases.append(stem)
+    except Exception:
+        pass
+    return aliases
+
+
+def cmd_doctor(args):
+    """Diagnóstico integral [1/6..6/6] y auto-reparación segura (--fix) de la flota Antigravity."""
+    fix = bool(getattr(args, "fix", False))
+    real_home = resolve_real_home()
+    base_dir = _resolve_base_dir_readonly(real_home)
+    bin_dir = os.path.join(base_dir, "bin")
+    local_bin = os.path.join(real_home, ".local", "bin")
+    accounts_dir = os.path.join(base_dir, "accounts")
+    homes_base = os.path.join(real_home, ".agyc_homes")
+    cache_dir = os.path.join(real_home, ".cache", "agyc")
+    locks_dir = os.path.join(cache_dir, "locks")
+    repo_dir = _find_repo_dir(real_home)
+    repo_bin = os.path.join(repo_dir, "bin")
+
+    issues_found = 0
+    fixes_applied = 0
+    freed_npm_bytes = 0
+
+    mode_badge = f"{C_BG_GREEN} AUTO-FIX ACTIVO {C_RESET}" if fix else f"{C_DIM}(modo auditoría — usa --fix para reparar){C_RESET}"
+    print(f"\n{C_BOLD}{C_WHITE}DIAGNÓSTICO DE FLOTA AGYC DOCTOR (v1.6){C_RESET} {mode_badge}")
+    print(f"{C_DIM}{'=' * 78}{C_RESET}")
+
+    aliases = _list_aliases_readonly(accounts_dir)
+
+    # ── [1/6] Binarios, Librería y PATH ──────────────────────────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}1/6{C_RESET}] {C_BOLD}Binarios, Librería y PATH{C_RESET}")
+
+    agy_real_candidates = [
+        os.path.join(bin_dir, "agy-real"),
+        "/snap/antigravity-cli/current/bin/agy",
+    ] + sorted(glob.glob("/snap/antigravity-cli/*/bin/agy"), reverse=True)
+    agy_real_path = next((p for p in agy_real_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    if agy_real_path:
+        ver_str = ""
+        try:
+            vres = subprocess.run([agy_real_path, "--version"], capture_output=True, text=True, timeout=5)
+            ver_str = (vres.stdout or vres.stderr or "").strip().splitlines()[0] if (vres.stdout or vres.stderr) else ""
+        except Exception:
+            ver_str = ""
+        vtuple = _parse_semver_tuple(ver_str)
+        if vtuple >= (1, 5, 10):
+            print(f"  {C_GREEN}✓{C_RESET} Motor agy-real v{ver_str} (>= 1.5.10) en {agy_real_path}")
+        else:
+            issues_found += 1
+            print(f"  {C_YELLOW}⚠{C_RESET} Motor agy-real versión '{ver_str or 'desconocida'}' (< 1.5.10) en {agy_real_path} — ejecuta 'agyc update'")
+    else:
+        issues_found += 1
+        print(f"  {C_RED}✗{C_RESET} Motor nativo 'agy-real' no encontrado en {bin_dir} ni en /snap — ejecuta 'agyc update'")
+
+    def _check_agy_wrapper(wpath: str) -> tuple[bool, str]:
+        if not os.path.exists(wpath):
+            return False, "faltante"
+        if not os.access(wpath, os.X_OK):
+            return False, "sin permiso +x"
+        try:
+            with open(wpath, "rb") as wf:
+                head = wf.read(4096)
+            if head.startswith(b"\x7fELF"):
+                return False, "es binario ELF directo en vez de wrapper"
+            txt = head.decode("utf-8", errors="ignore")
+            if "agy-real" not in txt or "--dangerously-skip-permissions" not in txt:
+                return False, "contenido inesperado en wrapper"
+            for line in txt.splitlines():
+                ls = line.strip()
+                if ls.startswith("#"):
+                    continue
+                if ".local/bin/agy" in ls and ("exec" in ls or "REAL_AGY=" in ls):
+                    return False, "riesgo de recursión a .local/bin/agy"
+            return True, "wrapper seguro sin recursión"
+        except Exception as e:
+            return False, f"error lectura ({e})"
+
+    wrapper_missing_or_bad = []
+    for wloc in (os.path.join(bin_dir, "agy"), os.path.join(local_bin, "agy")):
+        ok_w, msg_w = _check_agy_wrapper(wloc)
+        if not ok_w:
+            wrapper_missing_or_bad.append((wloc, msg_w))
+
+    required_bins = ("agyc", "agyc-statusline", "agyc-titleline", "agyc-topbar")
+    missing_tools: list[str] = []
+    for bname in required_bins:
+        for dloc in (bin_dir, local_bin):
+            bp = os.path.join(dloc, bname)
+            if not (os.path.exists(bp) and os.access(bp, os.X_OK)):
+                missing_tools.append(bp)
+
+    missing_launchers: list[str] = []
+    for al in aliases:
+        for dloc in (bin_dir, local_bin):
+            lp = os.path.join(dloc, al)
+            if not (os.path.exists(lp) and os.access(lp, os.X_OK)):
+                missing_launchers.append(lp)
+
+    installed_core = os.path.join(base_dir, "lib", "agyc_core.py")
+    repo_core = os.path.join(repo_dir, "lib", "agyc_core.py")
+    core_present = os.path.isfile(installed_core)
+
+    if fix and (wrapper_missing_or_bad or missing_tools or missing_launchers or (not core_present and os.path.isfile(repo_core))):
+        os.makedirs(bin_dir, exist_ok=True)
+        os.makedirs(local_bin, exist_ok=True)
+        src_agyc = os.path.join(repo_bin, "agyc") if os.path.isfile(os.path.join(repo_bin, "agyc")) else os.path.realpath(__file__)
+        for bname in ("agyc", "agy", "agyc-statusline", "agyc-topbar"):
+            src_b = src_agyc if bname == "agyc" else os.path.join(repo_bin, bname)
+            if not os.path.isfile(src_b):
+                alt_b = os.path.join(bin_dir, bname)
+                src_b = alt_b if os.path.isfile(alt_b) else src_b
+            if os.path.isfile(src_b):
+                for dloc in (bin_dir, local_bin):
+                    if _copy_executable(src_b, os.path.join(dloc, bname)):
+                        fixes_applied += 1
+        for dloc in (bin_dir, local_bin):
+            sl_p = os.path.join(dloc, "agyc-statusline")
+            tl_p = os.path.join(dloc, "agyc-titleline")
+            if os.path.exists(sl_p) and not os.path.exists(tl_p):
+                try:
+                    if os.path.lexists(tl_p):
+                        os.unlink(tl_p)
+                    os.symlink(sl_p, tl_p)
+                    fixes_applied += 1
+                except Exception:
+                    pass
+        sync_account_symlinks()
+        canonical_agyc = os.path.join(bin_dir, "agyc")
+        all_ln = set(aliases) | {f"agy{i:02d}" for i in range(1, 16)} | {f"agi{i:02d}" for i in range(1, 16)}
+        for al in sorted(all_ln):
+            lp = os.path.join(local_bin, al)
+            if not os.path.exists(lp):
+                try:
+                    if os.path.lexists(lp):
+                        os.unlink(lp)
+                    os.symlink(canonical_agyc, lp)
+                    fixes_applied += 1
+                except Exception:
+                    pass
+        synced_libs = _sync_agyc_lib_dirs(repo_dir, real_home)
+        fixes_applied += len(synced_libs)
+        wrapper_missing_or_bad = [
+            (wloc, _check_agy_wrapper(wloc)[1])
+            for wloc in (os.path.join(bin_dir, "agy"), os.path.join(local_bin, "agy"))
+            if not _check_agy_wrapper(wloc)[0]
+        ]
+        missing_tools = [
+            os.path.join(dloc, bname)
+            for bname in required_bins
+            for dloc in (bin_dir, local_bin)
+            if not (os.path.exists(os.path.join(dloc, bname)) and os.access(os.path.join(dloc, bname), os.X_OK))
+        ]
+        missing_launchers = [
+            os.path.join(dloc, al)
+            for al in aliases
+            for dloc in (bin_dir, local_bin)
+            if not (os.path.exists(os.path.join(dloc, al)) and os.access(os.path.join(dloc, al), os.X_OK))
+        ]
+        core_present = os.path.isfile(installed_core)
+        print(f"  {C_CYAN}🔧 Wrappers, binarios y symlinks resincronizados.{C_RESET}")
+
+    if not wrapper_missing_or_bad:
+        print(f"  {C_GREEN}✓{C_RESET} Wrapper 'agy' verificado sin recursión en {bin_dir} y {local_bin}")
+    else:
+        issues_found += len(wrapper_missing_or_bad)
+        for wp, wmsg in wrapper_missing_or_bad:
+            print(f"  {C_RED}✗{C_RESET} Wrapper {wp}: {wmsg}")
+
+    if not missing_tools and not missing_launchers:
+        print(f"  {C_GREEN}✓{C_RESET} Herramientas (agyc, statusline, titleline, topbar) y {len(aliases)} lanzadores OK")
+    else:
+        issues_found += len(missing_tools) + (1 if missing_launchers else 0)
+        if missing_tools:
+            print(f"  {C_YELLOW}⚠{C_RESET} Binarios/symlinks faltantes: {', '.join(missing_tools[:4])}")
+        if missing_launchers:
+            print(f"  {C_YELLOW}⚠{C_RESET} Lanzadores faltantes ({len(missing_launchers)}): {', '.join(missing_launchers[:4])}")
+
+    if core_present:
+        print(f"  {C_GREEN}✓{C_RESET} Librería compartida instalada: {installed_core}")
+    elif os.path.isfile(repo_core):
+        issues_found += 1
+        print(f"  {C_YELLOW}⚠{C_RESET} lib/agyc_core.py presente en repo pero aún no sincronizada en {installed_core}")
+    else:
+        print(f"  {C_DIM}ℹ{C_RESET} lib/agyc_core.py no instalada aún en {installed_core} (usando motor interno integrado)")
+
+    env_path_dirs = [os.path.abspath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    if os.path.abspath(local_bin) in env_path_dirs or os.path.abspath(bin_dir) in env_path_dirs:
+        print(f"  {C_GREEN}✓{C_RESET} PATH incluye directorios ejecutables de agyc")
+    else:
+        issues_found += 1
+        print(f"  {C_YELLOW}⚠{C_RESET} PATH actual no contiene {local_bin} ni {bin_dir}")
+
+    # ── [2/6] Permisos de Seguridad (0700 / 0600) ────────────────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}2/6{C_RESET}] {C_BOLD}Permisos de Seguridad (0700 / 0600){C_RESET}")
+
+    expected_700_dirs = [accounts_dir, homes_base, cache_dir, locks_dir]
+    if os.path.isdir(homes_base):
+        try:
+            for h in sorted(os.listdir(homes_base)):
+                hp = os.path.join(homes_base, h)
+                if os.path.isdir(hp) and not os.path.islink(hp):
+                    expected_700_dirs.append(hp)
+        except Exception:
+            pass
+
+    expected_600_files: list[str] = []
+    if os.path.isdir(accounts_dir):
+        try:
+            for fn in sorted(os.listdir(accounts_dir)):
+                if fn.endswith(".json"):
+                    fp = os.path.join(accounts_dir, fn)
+                    if os.path.isfile(fp) and not os.path.islink(fp):
+                        expected_600_files.append(fp)
+        except Exception:
+            pass
+
+    for global_sec in (
+        os.path.join(base_dir, "antigravity-oauth-token"),
+        os.path.join(base_dir, "settings.json"),
+        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+    ):
+        if os.path.isfile(global_sec) and not os.path.islink(global_sec) and global_sec not in expected_600_files:
+            expected_600_files.append(global_sec)
+
+    if os.path.isdir(homes_base):
+        try:
+            for h in sorted(os.listdir(homes_base)):
+                igem = os.path.join(homes_base, h, ".gemini", "antigravity-cli")
+                for fn in ("antigravity-oauth-token", "settings.json"):
+                    fp = os.path.join(igem, fn)
+                    if os.path.isfile(fp) and not os.path.islink(fp):
+                        expected_600_files.append(fp)
+        except Exception:
+            pass
+
+    if os.path.isdir(cache_dir):
+        for qcf in sorted(glob.glob(os.path.join(cache_dir, "quota_cache_*.json"))):
+            if os.path.isfile(qcf) and not os.path.islink(qcf):
+                expected_600_files.append(qcf)
+
+    perm_issues: list[tuple[str, int, int | None]] = []
+    for dp in expected_700_dirs:
+        if not os.path.exists(dp):
+            if dp in (accounts_dir, homes_base, cache_dir, locks_dir):
+                perm_issues.append((dp, 0o700, None))
+            continue
+        cur_m = stat.S_IMODE(os.lstat(dp).st_mode)
+        if cur_m != 0o700:
+            perm_issues.append((dp, 0o700, cur_m))
+
+    for fp in expected_600_files:
+        cur_m = stat.S_IMODE(os.lstat(fp).st_mode)
+        if cur_m != 0o600:
+            perm_issues.append((fp, 0o600, cur_m))
+
+    if perm_issues and fix:
+        repaired_perms = 0
+        for p_item, exp_mode, cur_mode in perm_issues:
+            try:
+                if cur_mode is None:
+                    os.makedirs(p_item, mode=exp_mode, exist_ok=True)
+                os.chmod(p_item, exp_mode)
+                repaired_perms += 1
+                fixes_applied += 1
+            except Exception as e:
+                issues_found += 1
+                print(f"  {C_RED}✗{C_RESET} No se pudo ajustar {oct(exp_mode)} en {p_item}: {e}")
+        print(f"  {C_CYAN}🔧 Permisos endurecidos automáticamente en {repaired_perms} ruta(s) (0700/0600).{C_RESET}")
+        perm_issues = []
+
+    if not perm_issues:
+        print(
+            f"  {C_GREEN}✓{C_RESET} {len(expected_700_dirs)} directorios en 0700 y "
+            f"{len(expected_600_files)} archivos sensibles en 0600 verificados"
+        )
+    else:
+        issues_found += len(perm_issues)
+        for p_item, exp_mode, cur_mode in perm_issues[:6]:
+            cur_s = f"0{cur_mode:03o}" if cur_mode is not None else "no existe"
+            print(f"  {C_YELLOW}⚠{C_RESET} {p_item}: actual={cur_s}, esperado=0{exp_mode:03o}")
+        if len(perm_issues) > 6:
+            print(f"  {C_DIM}  ... y {len(perm_issues) - 6} ruta(s) adicional(es) por endurecer con --fix{C_RESET}")
+
+    # ── [3/6] Aislamiento de Perfiles, Symlinks y Duplicados ─────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}3/6{C_RESET}] {C_BOLD}Aislamiento de Perfiles, Symlinks y Duplicados{C_RESET}")
+
+    email_map: dict[str, list[str]] = {}
+    revoked_aliases: list[str] = []
+    profile_drift_aliases: list[tuple[str, list[str]]] = []
+
+    def _audit_single_profile(al: str) -> tuple[dict | None, list[str]]:
+        acc_p = os.path.join(accounts_dir, f"{al}.json")
+        acc_d = None
+        try:
+            with open(acc_p, "r", encoding="utf-8") as f:
+                acc_d = json.load(f)
+        except Exception:
+            return None, ["JSON de cuenta ilegible"]
+
+        reasons: list[str] = []
+        iso_h = os.path.join(homes_base, al)
+        iso_g = os.path.join(iso_h, ".gemini", "antigravity-cli")
+        if not os.path.isdir(iso_g):
+            reasons.append("HOME aislado faltante")
+            return acc_d, reasons
+
+        # Token aislado vs accounts/<alias>.json
+        tok_file = os.path.join(iso_g, "antigravity-oauth-token")
+        exp_td = (acc_d.get("token_data") or {}).get("token") or {}
+        if os.path.islink(tok_file) or not os.path.isfile(tok_file):
+            reasons.append("token aislado faltante o symlink")
+        else:
+            try:
+                with open(tok_file, "r", encoding="utf-8") as tf:
+                    iso_td = (json.load(tf).get("token") or {})
+                if exp_td.get("refresh_token") and iso_td.get("refresh_token") != exp_td.get("refresh_token"):
+                    reasons.append("refresh_token desincronizado")
+                elif exp_td.get("access_token") and iso_td.get("access_token") != exp_td.get("access_token"):
+                    reasons.append("access_token desincronizado")
+            except Exception:
+                reasons.append("token aislado corrupto")
+
+        for req_gem_link in ("builtin", "mcp"):
+            src_t = os.path.join(base_dir, req_gem_link)
+            dst_l = os.path.join(iso_g, req_gem_link)
+            if os.path.exists(src_t) or req_gem_link == "mcp":
+                if not os.path.islink(dst_l) or not os.path.exists(dst_l):
+                    reasons.append(f"symlink '{req_gem_link}' faltante/roto")
+
+        for req_dot in (".gitconfig", ".ssh", os.path.join(".config", "herdr")):
+            src_d = os.path.join(real_home, req_dot)
+            dst_d = os.path.join(iso_h, req_dot)
+            if os.path.exists(src_d) and not os.path.exists(dst_d):
+                reasons.append(f"enlace '{req_dot}' faltante")
+
+        return acc_d, reasons
+
+    loaded_accounts: dict[str, dict] = {}
+    for al in aliases:
+        acc_obj, drift_reasons = _audit_single_profile(al)
+        if isinstance(acc_obj, dict):
+            loaded_accounts[al] = acc_obj
+            em = (acc_obj.get("email") or "").strip().lower()
+            if em and em not in ("desconocido@google.com", "cuenta@google.com", f"{al.lower()}@google.com"):
+                email_map.setdefault(em, []).append(al)
+            if acc_obj.get("is_revoked"):
+                revoked_aliases.append(al)
+        if drift_reasons:
+            profile_drift_aliases.append((al, drift_reasons))
+
+    if profile_drift_aliases and fix:
+        repaired_profiles = 0
+        for al, _ in profile_drift_aliases:
+            try:
+                prepare_isolated_home(al)
+                repaired_profiles += 1
+                fixes_applied += 1
+            except Exception as e:
+                print(f"  {C_RED}✗{C_RESET} Error reparando perfil {al}: {e}")
+        print(f"  {C_CYAN}🔧 Perfiles aislados y tokens reparados en {repaired_profiles} cuenta(s).{C_RESET}")
+        profile_drift_aliases = []
+        for al in aliases:
+            _, post_reasons = _audit_single_profile(al)
+            if post_reasons:
+                profile_drift_aliases.append((al, post_reasons))
+
+    if not profile_drift_aliases:
+        print(f"  {C_GREEN}✓{C_RESET} {len(aliases)} perfil(es) aislados con tokens sincronizados y symlinks (builtin, mcp, dotfiles) OK")
+    else:
+        issues_found += len(profile_drift_aliases)
+        for al, rlist in profile_drift_aliases:
+            print(f"  {C_YELLOW}⚠{C_RESET} {al}: {', '.join(rlist)}")
+
+    dup_emails = {em: als for em, als in email_map.items() if len(als) > 1}
+    if not dup_emails:
+        print(f"  {C_GREEN}✓{C_RESET} 0 emails duplicados entre cuentas registradas")
+    else:
+        issues_found += len(dup_emails)
+        for em, als in dup_emails.items():
+            print(f"  {C_YELLOW}⚠{C_RESET} Email duplicado '{em}' en alias: {', '.join(als)}")
+
+    if revoked_aliases:
+        issues_found += len(revoked_aliases)
+        print(f"  {C_RED}✗{C_RESET} Tokens expirados/revocados: {', '.join(revoked_aliases)} (usa 'agyc renew <alias>')")
+
+    # ── [4/6] Auditoría de Espacio y Cachés Duplicadas en ~/.agyc_homes ──────────
+    print(f"\n[{C_BOLD}{C_CYAN}4/6{C_RESET}] {C_BOLD}Auditoría de Espacio y Cachés Duplicadas en ~/.agyc_homes{C_RESET}")
+
+    dup_npm_entries: list[tuple[str, str, int]] = []
+    unlinked_npm_profiles: list[tuple[str, str]] = []
+    linked_npm_count = 0
+    info_large_dirs: list[tuple[str, int]] = []
+
+    if os.path.isdir(homes_base):
+        profile_dirs = [
+            h for h in sorted(os.listdir(homes_base))
+            if os.path.isdir(os.path.join(homes_base, h)) and not os.path.islink(os.path.join(homes_base, h))
+        ]
+        size_jobs: list[tuple[str, str, str]] = []
+        for h in profile_dirs:
+            hp = os.path.join(homes_base, h)
+            npm_p = os.path.join(hp, ".npm")
+            if os.path.islink(npm_p) and os.path.exists(npm_p):
+                linked_npm_count += 1
+            elif os.path.isdir(npm_p) and not os.path.islink(npm_p):
+                size_jobs.append(("npm", h, npm_p))
+            else:
+                unlinked_npm_profiles.append((h, npm_p))
+
+            try:
+                for sub in sorted(os.listdir(hp)):
+                    if sub in (".gemini", ".npm", ".ssh", ".gitconfig", ".git-credentials"):
+                        continue
+                    sp = os.path.join(hp, sub)
+                    if os.path.isdir(sp) and not os.path.islink(sp):
+                        size_jobs.append(("other", f"{h}/{sub}", sp))
+            except Exception:
+                pass
+
+        if size_jobs:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                measured = list(pool.map(lambda job: (job[0], job[1], job[2], _dir_size_bytes(job[2])), size_jobs))
+            for kind, label, path_m, sz in measured:
+                if kind == "npm":
+                    dup_npm_entries.append((label, path_m, sz))
+                elif sz >= 5 * 1024 * 1024:
+                    info_large_dirs.append((label, sz))
+
+    my_uid = os.getuid()
+    real_home_abs = os.path.abspath(real_home)
+    stale_tmp_files: list[str] = []
+    for tp in sorted(glob.glob("/tmp/agyc_*")):
+        try:
+            tp_abs = os.path.abspath(tp)
+            if real_home_abs == tp_abs or real_home_abs.startswith(tp_abs + "/"):
+                continue
+            lst = os.lstat(tp)
+            if lst.st_uid == my_uid and not stat.S_ISDIR(lst.st_mode):
+                stale_tmp_files.append(tp)
+        except Exception:
+            pass
+
+    if fix and (dup_npm_entries or unlinked_npm_profiles or stale_tmp_files):
+        real_npm = os.path.join(real_home, ".npm")
+        if os.path.islink(real_npm) and not os.path.exists(real_npm):
+            try:
+                os.unlink(real_npm)
+            except Exception:
+                pass
+        os.makedirs(real_npm, exist_ok=True)
+
+        unified_count = 0
+        for h, npm_p, sz in dup_npm_entries:
+            try:
+                if os.path.realpath(npm_p) != os.path.realpath(real_npm) and not os.path.islink(npm_p):
+                    shutil.rmtree(npm_p)
+                    os.symlink(real_npm, npm_p)
+                    freed_npm_bytes += sz
+                    unified_count += 1
+                    linked_npm_count += 1
+                    fixes_applied += 1
+            except Exception as e:
+                issues_found += 1
+                print(f"  {C_RED}✗{C_RESET} Error unificando {npm_p}: {e}")
+
+        for h, npm_p in unlinked_npm_profiles:
+            try:
+                if os.path.islink(npm_p):
+                    os.unlink(npm_p)
+                if not os.path.exists(npm_p):
+                    os.symlink(real_npm, npm_p)
+                    linked_npm_count += 1
+                    fixes_applied += 1
+            except Exception:
+                pass
+
+        if unified_count > 0 or unlinked_npm_profiles:
+            freed_mb = freed_npm_bytes / (1024.0 * 1024.0)
+            print(
+                f"  {C_CYAN}🔧 Caché .npm unificada hacia {real_npm} en {linked_npm_count} perfil(es) "
+                f"({freed_mb:.2f} MB liberados).{C_RESET}"
+            )
+        dup_npm_entries = []
+        unlinked_npm_profiles = []
+
+        removed_tmp = 0
+        for tp in stale_tmp_files:
+            try:
+                os.remove(tp)
+                removed_tmp += 1
+                fixes_applied += 1
+            except Exception:
+                pass
+        if removed_tmp > 0:
+            print(f"  {C_CYAN}🔧 Eliminados {removed_tmp} archivo(s) obsoletos en /tmp/agyc_*.{C_RESET}")
+        stale_tmp_files = []
+
+    if not dup_npm_entries:
+        print(f"  {C_GREEN}✓{C_RESET} Cachés .npm unificadas por symlink ({linked_npm_count} perfil(es) -> {os.path.join(real_home, '.npm')})")
+    else:
+        issues_found += 1
+        total_npm_mb = sum(x[2] for x in dup_npm_entries) / (1024.0 * 1024.0)
+        print(
+            f"  {C_YELLOW}⚠{C_RESET} {len(dup_npm_entries)} cachés .npm duplicadas ocupan {C_BOLD}{total_npm_mb:.2f} MB{C_RESET} "
+            f"(usa 'agyc doctor --fix' para unificar a ~/.npm)"
+        )
+
+    if stale_tmp_files:
+        issues_found += 1
+        print(f"  {C_YELLOW}⚠{C_RESET} {len(stale_tmp_files)} archivo(s) legacy en /tmp/agyc_* pendientes de limpieza")
+    else:
+        print(f"  {C_GREEN}✓{C_RESET} 0 archivos legacy en /tmp/agyc_*")
+
+    if info_large_dirs:
+        info_large_dirs.sort(key=lambda x: x[1], reverse=True)
+        summary_dirs = ", ".join(f"{lbl} ({sz / (1024.0 * 1024.0):.1f} MB)" for lbl, sz in info_large_dirs[:5])
+        print(f"  {C_DIM}ℹ Otros directorios en perfiles aislados (intactos): {summary_dirs}{C_RESET}")
+
+    # ── [5/6] Telemetría TUI y TopBar de Herdr ───────────────────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}5/6{C_RESET}] {C_BOLD}Telemetría TUI y TopBar de Herdr{C_RESET}")
+
+    settings_targets = [os.path.join(base_dir, "settings.json")]
+    for al in aliases:
+        iso_sp = os.path.join(homes_base, al, ".gemini", "antigravity-cli", "settings.json")
+        if os.path.isdir(os.path.dirname(iso_sp)):
+            settings_targets.append(iso_sp)
+
+    def _check_settings_hooks(paths: list[str]) -> list[str]:
+        bad: list[str] = []
+        for sp in paths:
+            if not os.path.isfile(sp):
+                bad.append(sp)
+                continue
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                sl = s.get("statusLine") or {}
+                tl = s.get("title") or {}
+                if (
+                    sl.get("command") != "agyc-statusline"
+                    or not sl.get("enabled")
+                    or sl.get("type") != "command"
+                    or tl.get("command") != "agyc-titleline"
+                    or not tl.get("enabled")
+                    or tl.get("type") != "command"
+                ):
+                    bad.append(sp)
+            except Exception:
+                bad.append(sp)
+        return bad
+
+    bad_settings = _check_settings_hooks(settings_targets)
+    if bad_settings and fix:
+        main_sp = os.path.join(base_dir, "settings.json")
+        if not os.path.exists(main_sp):
+            try:
+                os.makedirs(base_dir, exist_ok=True)
+                _atomic_write_json(main_sp, {}, mode=0o600, indent=2)
+            except Exception:
+                pass
+        ensure_statusline_configured()
+        for al in aliases:
+            iso_sp = os.path.join(homes_base, al, ".gemini", "antigravity-cli", "settings.json")
+            if not os.path.isfile(iso_sp):
+                try:
+                    prepare_isolated_home(al)
+                except Exception:
+                    pass
+        fixes_applied += len(bad_settings)
+        print(f"  {C_CYAN}🔧 Hooks statusLine/title reparados en {len(bad_settings)} archivo(s) settings.json.{C_RESET}")
+        bad_settings = _check_settings_hooks(settings_targets)
+
+    if not bad_settings:
+        print(f"  {C_GREEN}✓{C_RESET} Hooks statusLine y title activos en {len(settings_targets)} archivo(s) settings.json")
+    else:
+        issues_found += len(bad_settings)
+        print(f"  {C_YELLOW}⚠{C_RESET} {len(bad_settings)} archivo(s) settings.json sin hooks completos (agyc-statusline / agyc-titleline)")
+
+    herdr_toml = os.path.join(real_home, ".config", "herdr", "config.toml")
+    if os.path.isfile(herdr_toml):
+        try:
+            with open(herdr_toml, "r", encoding="utf-8", errors="ignore") as f:
+                toml_txt = f.read()
+            if "agyc-topbar" in toml_txt:
+                print(f"  {C_GREEN}✓{C_RESET} Widget global 'agyc-topbar' configurado en {herdr_toml}")
+            else:
+                issues_found += 1
+                print(f"  {C_YELLOW}⚠{C_RESET} 'agyc-topbar' no aparece en {herdr_toml}")
+        except Exception:
+            print(f"  {C_YELLOW}⚠{C_RESET} No se pudo leer {herdr_toml}")
+    else:
+        print(f"  {C_DIM}ℹ{C_RESET} {herdr_toml} no encontrado en este entorno")
+
+    h_panes, h_lat_ms, h_sock = _query_herdr_panes_fast(real_home, timeout=0.12)
+    if h_lat_ms is not None:
+        print(f"  {C_GREEN}✓{C_RESET} Socket Herdr vivo ({h_sock} — {len(h_panes)} paneles totales, {h_lat_ms:.1f} ms)")
+    else:
+        print(f"  {C_DIM}ℹ{C_RESET} Socket Herdr sin sesión activa en {h_sock}")
+
+    # ── [6/6] Resumen Operativo de Flota ─────────────────────────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}6/6{C_RESET}] {C_BOLD}Resumen Operativo de Flota{C_RESET}")
+
+    tier_counts = {"ULTRA": 0, "PRO": 0, "ENT": 0, "FREE": 0}
+    locked_info: list[str] = []
+    for al in aliases:
+        acc_d = loaded_accounts.get(al) or load_account(al) or {}
+        q_d = acc_d.get("quota") or {}
+        pt = str(q_d.get("plan_type") or acc_d.get("plan_type") or "FREE").upper()
+        tier_counts[pt if pt in tier_counts else "FREE"] += 1
+        if acc_d.get("locked"):
+            rsn = (acc_d.get("lock_reason") or acc_d.get("note") or "").strip()
+            locked_info.append(f"{al} ({rsn})" if rsn else al)
+
+    active_panes_map = scan_active_herdr_panes(real_home)
+    total_agy_panes = sum(len(v) for v in active_panes_map.values())
+
+    tier_parts = [f"{C_MAGENTA}{tier_counts['ULTRA']} ULTRA{C_RESET}", f"{C_CYAN}{tier_counts['PRO']} PRO{C_RESET}"]
+    if tier_counts["ENT"]:
+        tier_parts.append(f"{tier_counts['ENT']} ENT")
+    if tier_counts["FREE"]:
+        tier_parts.append(f"{tier_counts['FREE']} FREE")
+
+    print(f"  • Cuentas totales:     {C_BOLD}{len(aliases)}{C_RESET} ({', '.join(tier_parts)})")
+    if locked_info:
+        print(f"  • Cuentas reservadas:  {C_YELLOW}{len(locked_info)}{C_RESET} -> {', '.join(locked_info)}")
+    else:
+        print(f"  • Cuentas reservadas:  0 {C_DIM}(todas elegibles según política PRO/ULTRA){C_RESET}")
+
+    if active_panes_map:
+        by_acc_str = ", ".join(
+            f"{C_GREEN}{al}{C_RESET} ({','.join(p['short_pane'] for p in plist)})"
+            for al, plist in sorted(active_panes_map.items())
+        )
+        print(f"  • Paneles agy vivos:   {C_BOLD}{total_agy_panes}{C_RESET} en {len(active_panes_map)} cuenta(s) -> {by_acc_str}")
+    else:
+        print(f"  • Paneles agy vivos:   0")
+
+    print(f"\n{C_DIM}{'-' * 78}{C_RESET}")
+    if fix:
+        freed_suffix = f" | {freed_npm_bytes / (1024.0 * 1024.0):.2f} MB liberados" if freed_npm_bytes > 0 else ""
+        if issues_found == 0:
+            print(f"{C_BOLD}{C_GREEN}✓ Doctor completado: {fixes_applied} reparación(es) aplicada(s){freed_suffix}. Flota 100% saludable.{C_RESET}\n")
+        else:
+            print(
+                f"{C_BOLD}{C_YELLOW}⚠ Doctor aplicó {fixes_applied} reparación(es){freed_suffix}; "
+                f"quedan {issues_found} observación(es) manual(es).{C_RESET}\n"
+            )
+    else:
+        if issues_found == 0:
+            print(f"{C_BOLD}{C_GREEN}✓ Flota 100% saludable (0 observaciones pendientes).{C_RESET}\n")
+        else:
+            print(
+                f"{C_BOLD}{C_YELLOW}⚠ Se detectaron {issues_found} observación(es). "
+                f"Ejecuta '{C_CYAN}agyc doctor --fix{C_YELLOW}' para auto-reparar.{C_RESET}\n"
+            )
+
+
 def _verify_sha512(file_path: str, expected: str) -> bool:
     exp = (expected or "").strip()
     if not exp:
@@ -2936,7 +4426,7 @@ def _verify_sha512(file_path: str, expected: str) -> bool:
 
 def cmd_update(args):
     real_home = resolve_real_home()
-    print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY (v1.5){C_RESET}")
+    print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY (v1.6){C_RESET}")
     print(f"{C_DIM}{'=' * 68}{C_RESET}\n")
 
     self_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2985,8 +4475,8 @@ def cmd_update(args):
         except Exception as e:
             print(f"  {C_YELLOW}⚠ Descarga omitida: {e}{C_RESET}")
 
-    # 2. Sincronizar agyc, agy (wrapper), agyc-statusline, agyc-topbar y symlink agyc-titleline
-    print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, wrappers, statusline, titleline y topbar...")
+    # 2. Sincronizar agyc, agy (wrapper), agyc-statusline, agyc-topbar, lib/agyc_core.py y symlink agyc-titleline
+    print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, librería core, wrappers, statusline, titleline y topbar...")
     gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
     snap_bin = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin")
     local_bin = os.path.join(real_home, ".local", "bin")
@@ -3009,6 +4499,9 @@ def cmd_update(args):
                 dst_path = os.path.join(tdir, bname)
                 if _copy_executable(src_path, dst_path):
                     print(f"  {C_GREEN}✓{C_RESET} {dst_path}")
+
+    for synced_lib in _sync_agyc_lib_dirs(repo_dir, real_home):
+        print(f"  {C_GREEN}✓{C_RESET} {synced_lib}")
 
     # Symlink agyc-titleline -> agyc-statusline en ~/.gemini/antigravity-cli/bin, snap y ~/.local/bin
     for tdir in [gemini_bin, snap_bin, local_bin]:
@@ -3128,11 +4621,12 @@ def cmd_update(args):
     print(f"  {C_GREEN}✓ Perfiles aislados y hooks statusLine/title sincronizados.{C_RESET}")
 
     print(f"\n{C_BOLD}{C_GREEN}════════════════════════════════════════════════════════════════════{C_RESET}")
-    print(f"{C_BOLD}{C_GREEN}  ✓ SISTEMA ACTUALIZADO AL 100% (agyc v1.5 — Pro / Ultra)           {C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}  ✓ SISTEMA ACTUALIZADO AL 100% (agyc v1.6 — Pro / Ultra)           {C_RESET}")
     print(f"{C_BOLD}{C_GREEN}════════════════════════════════════════════════════════════════════{C_RESET}")
     print(f"• Motor unificado v1.5.10:  {C_BOLD}Google AI Pro / Ultra + Gemini 4 Carbon{C_RESET}")
     print(f"• Refresca cuotas en vivo:  {C_CYAN}agyc list -r{C_RESET}")
-    print(f"• Rotación inteligente:     {C_CYAN}agyc auto [gemini|claude|carbon]{C_RESET}\n")
+    print(f"• Rotación inteligente:     {C_CYAN}agyc auto [gemini|claude|carbon] [--allow-ultra]{C_RESET}")
+    print(f"• Diagnóstico de flota:     {C_CYAN}agyc doctor [--fix]{C_RESET}\n")
 
 
 def main():
@@ -3171,12 +4665,14 @@ def main():
         launch_real_agy(sys_argv_to_pass, alias=alias)
         return
 
-    sync_account_symlinks()
+    is_doctor_cmd = len(sys.argv) >= 2 and sys.argv[1] == "doctor"
+    if not is_doctor_cmd:
+        sync_account_symlinks()
 
     # 2. Ejecución directa 'agyc <alias>' para switch rápido
     if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
         candidate = normalize_alias(sys.argv[1]) or sys.argv[1]
-        if candidate in list_account_aliases():
+        if candidate.lower() not in RESERVED_ALIASES and candidate in list_account_aliases():
             class DirectSwitchArgs:
                 alias = candidate
             cmd_switch(DirectSwitchArgs())
@@ -3184,13 +4680,13 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="agyc",
-        description="Administrador multi-cuenta de Google Antigravity (Pro / Ultra — agyc v1.5)",
+        description="Administrador multi-cuenta de Google Antigravity (Pro / Ultra — agyc v1.6)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Comandos disponibles")
 
     # list
-    p_list = subparsers.add_parser("list", help="Lista todas las cuentas, planes y barras de consumo")
+    p_list = subparsers.add_parser("list", help="Lista todas las cuentas, planes, paneles vivos y barras de consumo")
     p_list.add_argument("-r", "--refresh", action="store_true", help="Forzar actualización en paralelo desde Google")
     p_list.add_argument("--json", action="store_true", help="Salida en formato JSON sanitizada (sin secretos)")
     p_list.set_defaults(func=cmd_list)
@@ -3227,24 +4723,52 @@ def main():
     p_quota.set_defaults(func=cmd_quota)
 
     # auto
-    p_auto = subparsers.add_parser("auto", help="Auto-switch paralelo a la mejor cuenta (gemini, claude o carbon)")
+    p_auto = subparsers.add_parser(
+        "auto",
+        help="Auto-switch inteligente (Reserva ULTRA + Burn-First + Anti-colisión)",
+    )
     p_auto.add_argument(
         "family",
         nargs="?",
         default=None,
         help="Familia/modo: gemini (argon/hydrogen/flash), claude (gpt/3p) o carbon (ultra)",
     )
+    p_auto.add_argument(
+        "--allow-ultra",
+        action="store_true",
+        help="Permitir seleccionar cuentas ULTRA en gemini/claude aunque existan cuentas PRO saludables",
+    )
     p_auto.set_defaults(func=cmd_auto)
 
     # lock / unlock
     p_lock = subparsers.add_parser("lock", help="Marca una cuenta como reservada para que 'agyc auto' no la seleccione")
     p_lock.add_argument("alias", help="Alias de la cuenta a reservar (ej. agy10)")
-    p_lock.add_argument("-m", "--note", default=None, help="Nota opcional de reserva")
+    p_lock.add_argument("reason", nargs="*", default=[], help="Motivo opcional de reserva (ej. 'Carbon dedicado')")
+    p_lock.add_argument("-m", "--note", dest="note_opt", default=None, help="Nota/motivo opcional de reserva")
     p_lock.set_defaults(func=cmd_lock)
 
     p_unlock = subparsers.add_parser("unlock", help="Desbloquea una cuenta reservada para 'agyc auto'")
     p_unlock.add_argument("alias", help="Alias de la cuenta a liberar")
     p_unlock.set_defaults(func=cmd_unlock)
+
+    # note / tag / label
+    p_note = subparsers.add_parser(
+        "note",
+        aliases=["tag", "label"],
+        help="Asigna o limpia una etiqueta/nota visible en 'agyc list' para una cuenta",
+    )
+    p_note.add_argument("alias", help="Alias de la cuenta (ej. agy05)")
+    p_note.add_argument("text", nargs="*", default=[], help="Texto de la nota (o '' / --clear para limpiar)")
+    p_note.add_argument("-c", "--clear", action="store_true", help="Limpiar la nota de la cuenta")
+    p_note.set_defaults(func=cmd_note)
+
+    # doctor
+    p_doctor = subparsers.add_parser(
+        "doctor",
+        help="Diagnóstico integral [1/6..6/6] y auto-reparación segura (--fix) de la flota",
+    )
+    p_doctor.add_argument("--fix", action="store_true", help="Auto-reparar permisos, symlinks, hooks y cachés .npm duplicadas")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     # wipe / clean / purge
     p_wipe = subparsers.add_parser("wipe", aliases=["clean", "purge"], help="Vacía todas las credenciales, tokens aislados y caché")
@@ -3252,7 +4776,7 @@ def main():
     p_wipe.set_defaults(func=cmd_wipe)
 
     # update / upgrade
-    p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc, wrappers y Antigravity CLI")
+    p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc, librería core, wrappers y Antigravity CLI")
     p_update.set_defaults(func=cmd_update)
 
     args = parser.parse_args()

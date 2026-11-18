@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# agyc v1.5 — Instalador para Ubuntu Linux (Google Antigravity CLI 1.5.10+)
+# agyc v1.6 — Instalador para Ubuntu Linux (Google Antigravity CLI 1.5.10+)
 # Multi-account switcher (Google AI Pro & Ultra) con perfiles HOME aislados
 #
 # Uso:
@@ -23,6 +23,7 @@ DIM="\033[2m"
 RESET="\033[0m"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$SCRIPT_DIR"
 
 # Resolver HOME real dinámicamente incluso si se ejecuta desde un panel con perfil aislado (~/.agyc_homes/agyXX)
 REAL_HOME="${AGYC_REAL_HOME:-$HOME}"
@@ -40,13 +41,15 @@ if [ -z "$REAL_HOME" ] || [ ! -d "$REAL_HOME" ]; then
 fi
 
 AGY_BIN_DIR="$REAL_HOME/.gemini/antigravity-cli/bin"
+AGY_LIB_DIR="$REAL_HOME/.gemini/antigravity-cli/lib"
 SNAP_BIN_DIR="$REAL_HOME/snap/antigravity-cli/common/.gemini/antigravity-cli/bin"
+SNAP_LIB_DIR="$REAL_HOME/snap/antigravity-cli/common/.gemini/antigravity-cli/lib"
 SKILL_DIR="$REAL_HOME/proyectos/.agents/skills/agyc"
 LOCAL_BIN="$REAL_HOME/.local/bin"
 
 echo ""
 echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}${CYAN}║       agyc v1.5 — Instalador Multi-Cuenta            ║${RESET}"
+echo -e "${BOLD}${CYAN}║       agyc v1.6 — Instalador Multi-Cuenta            ║${RESET}"
 echo -e "${BOLD}${CYAN}║   Google Antigravity 1.5.10+ (AI Pro & AI Ultra)     ║${RESET}"
 echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
 echo ""
@@ -90,6 +93,8 @@ echo ""
 # ── Paso 2: Crear directorios y endurecer permisos (0700 / 0600) ─────────────
 echo -e "${BOLD}[2/7] Creando directorios y asegurando permisos privados...${RESET}"
 mkdir -p "$AGY_BIN_DIR"
+mkdir -p -m 755 "$AGY_LIB_DIR"
+chmod 755 "$AGY_LIB_DIR"
 mkdir -p "$LOCAL_BIN"
 mkdir -p -m 700 "$REAL_HOME/.agyc_homes"
 chmod 700 "$REAL_HOME/.agyc_homes"
@@ -101,6 +106,16 @@ chmod 700 "$REAL_HOME/.cache/agyc" "$REAL_HOME/.cache/agyc/locks"
 for iso_dir in "$REAL_HOME/.agyc_homes"/*; do
     if [ -d "$iso_dir" ] && [ ! -L "$iso_dir" ]; then
         chmod 700 "$iso_dir" 2>/dev/null || true
+        # Deduplicar caché .npm en perfiles aislados -> symlink a $REAL_HOME/.npm si procede
+        if [ -d "$REAL_HOME/.npm" ] || [ -d "$iso_dir/.npm" ] || command -v npm &>/dev/null; then
+            mkdir -p "$REAL_HOME/.npm" 2>/dev/null || true
+            if [ -d "$REAL_HOME/.npm" ]; then
+                if [ -d "$iso_dir/.npm" ] && [ ! -L "$iso_dir/.npm" ]; then
+                    rm -rf "$iso_dir/.npm" 2>/dev/null || true
+                fi
+                ln -sfn "$REAL_HOME/.npm" "$iso_dir/.npm" 2>/dev/null || true
+            fi
+        fi
     fi
 done
 for acc_file in "$REAL_HOME/.gemini/antigravity-cli/accounts"/*.json; do
@@ -114,8 +129,29 @@ fi
 echo -e "${GREEN}✓ Directorios creados${RESET}"
 echo ""
 
-# ── Paso 3: Instalar agyc, wrapper agy y barras de estado/título ──────────────
-echo -e "${BOLD}[3/7] Instalando agyc, wrapper agy, statusline, titleline y topbar...${RESET}"
+# ── Paso 3: Instalar lib/agyc_core.py, agyc, wrapper agy y barras ────────────
+echo -e "${BOLD}[3/7] Instalando librería núcleo, agyc, wrapper agy, statusline, titleline y topbar...${RESET}"
+
+# 0. Instalar lib/agyc_core.py y lib/__init__.py (si existen en $REPO_DIR/lib) con permisos 0755/0644
+if [ -d "$REPO_DIR/lib" ]; then
+    mkdir -p -m 755 "$AGY_LIB_DIR"
+    chmod 755 "$AGY_LIB_DIR"
+    for lib_file in "__init__.py" "agyc_core.py"; do
+        if [ -f "$REPO_DIR/lib/$lib_file" ]; then
+            rm -f "$AGY_LIB_DIR/$lib_file"
+            cp -f "$REPO_DIR/lib/$lib_file" "$AGY_LIB_DIR/$lib_file"
+            chmod 644 "$AGY_LIB_DIR/$lib_file"
+            echo -e "  ${DIM}→ $AGY_LIB_DIR/$lib_file${RESET}"
+        fi
+    done
+    for iso_gemini in "$REAL_HOME/.agyc_homes"/*/.gemini/antigravity-cli; do
+        if [ -d "$iso_gemini" ] && [ ! -L "$iso_gemini" ]; then
+            if [ ! -e "$iso_gemini/lib" ] || [ -L "$iso_gemini/lib" ]; then
+                ln -sfn "$AGY_LIB_DIR" "$iso_gemini/lib" 2>/dev/null || true
+            fi
+        fi
+    done
+fi
 
 # Si ~/.local/bin/agy es el binario nativo real (no symlink ni wrapper) y aún no existe agy-real,
 # respaldarlo en $AGY_BIN_DIR/agy-real antes de colocar el wrapper bin/agy en ~/.local/bin/agy.
@@ -191,6 +227,16 @@ fi
 
 # 5. Sincronizar a ruta snap si existe
 if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
+    if [ -d "$REPO_DIR/lib" ]; then
+        mkdir -p -m 755 "$SNAP_LIB_DIR" 2>/dev/null || true
+        for lib_file in "__init__.py" "agyc_core.py"; do
+            if [ -f "$REPO_DIR/lib/$lib_file" ]; then
+                cp -f "$REPO_DIR/lib/$lib_file" "$SNAP_LIB_DIR/$lib_file" 2>/dev/null && \
+                    chmod 644 "$SNAP_LIB_DIR/$lib_file" 2>/dev/null || true
+            fi
+        done
+    fi
+
     rm -f "$SNAP_BIN_DIR/agyc" 2>/dev/null || true
     cp -f "$SCRIPT_DIR/bin/agyc" "$SNAP_BIN_DIR/agyc" 2>/dev/null && \
         chmod +x "$SNAP_BIN_DIR/agyc" && \
@@ -321,12 +367,20 @@ echo ""
 
 # ── Paso 7: Verificación final ────────────────────────────────────────────────
 echo -e "${BOLD}[7/7] Verificación final...${RESET}"
-python3 -m py_compile "$AGY_BIN_DIR/agyc" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc)${RESET}"
+if [ -f "$AGY_LIB_DIR/agyc_core.py" ]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_LIB_DIR/agyc_core.py" && \
+        echo -e "  ${GREEN}✓ Sintaxis Python correcta (lib/agyc_core.py)${RESET}"
+fi
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc)${RESET}"
 if [ -f "$AGY_BIN_DIR/agyc-statusline" ]; then
-    python3 -m py_compile "$AGY_BIN_DIR/agyc-statusline" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-statusline / agyc-titleline)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-statusline" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-statusline / agyc-titleline)${RESET}"
 fi
 if [ -f "$AGY_BIN_DIR/agyc-topbar" ] && head -n 1 "$AGY_BIN_DIR/agyc-topbar" 2>/dev/null | grep -q "python"; then
-    python3 -m py_compile "$AGY_BIN_DIR/agyc-topbar" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-topbar)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-topbar" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-topbar)${RESET}"
+fi
+if [ -f "$REPO_DIR/tests/test_agyc.py" ]; then
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$REPO_DIR/tests" && \
+        echo -e "  ${GREEN}✓ Suite de tests unitarios superada (tests/)${RESET}"
 fi
 
 # Aplicar PATH en sesión actual
@@ -334,7 +388,7 @@ export PATH="$REAL_HOME/.local/bin:$REAL_HOME/.gemini/antigravity-cli/bin:$PATH"
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════╗${RESET}"
-echo -e "${BOLD}${GREEN}║        ✅ agyc v1.5 instalado correctamente          ║${RESET}"
+echo -e "${BOLD}${GREEN}║        ✅ agyc v1.6 instalado correctamente          ║${RESET}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════════════╝${RESET}"
 echo ""
 echo -e "${BOLD}Próximos pasos:${RESET}"

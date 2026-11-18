@@ -1,7 +1,7 @@
 # Manual Completo de `agyc`
 ## Google Antigravity Multi-Account Switcher
 
-> **Versión:** v1.5 | **Fecha:** Noviembre 2026
+> **Versión:** v1.6 | **Fecha:** Noviembre 2026
 > **Motor soportado:** Google Antigravity CLI `1.5.10+` (binario nativo o Snap `antigravity-cli`)
 > **Suscripciones soportadas:** Google AI Pro (`PRO`) y Google AI Ultra (`ULTRA`)
 > **Plataforma:** Ubuntu Linux x86_64
@@ -12,18 +12,19 @@
 
 1. [¿Para qué sirve agyc?](#1-para-qué-sirve-agyc)
 2. [Esquema Oficial de Cuotas en Google Antigravity 1.5.10](#2-esquema-oficial-de-cuotas-en-google-antigravity-1510)
-3. [Instalación (`v1.5`)](#3-instalación-v15)
-4. [Primeros pasos y panel de 6 columnas](#4-primeros-pasos-y-panel-de-6-columnas)
-5. [Comandos de referencia](#5-comandos-de-referencia)
-6. [Visualización de consumo en vivo: Pie y Barra Superior (Top Bar)](#6-visualización-de-consumo-en-vivo-pie-y-barra-superior-top-bar)
-7. [Aislamiento de perfiles HOME](#7-aislamiento-de-perfiles-home)
-8. [Uso en múltiples paneles (Herdr / tmux / zellij)](#8-uso-en-múltiples-paneles-herdr--tmux--zellij)
-9. [Rotación inteligente de cuotas (`agyc auto`) y Estrategia Agotar y Rotar](#9-rotación-inteligente-de-cuotas-agyc-auto-y-estrategia-agotar-y-rotar)
-10. [Gestión de tokens, elegibilidad y keyring](#10-gestión-de-tokens-elegibilidad-y-keyring)
-11. [Skill para el agente de Antigravity](#11-skill-para-el-agente-de-antigravity)
-12. [agyc wipe — Reinicio limpio](#12-agyc-wipe--reinicio-limpio)
-13. [agyc update — Actualizador automático](#13-agyc-update--actualizador-automático)
-14. [Historia de versiones y decisiones de diseño](#14-historia-de-versiones-y-decisiones-de-diseño)
+3. [Instalación (`v1.6`)](#3-instalación-v16)
+4. [Primeros pasos, Panel de 131 Columnas, Notas y Reservas](#4-primeros-pasos-panel-de-131-columnas-notas-y-reservas)
+5. [Comandos de Referencia](#5-comandos-de-referencia)
+6. [Visualización en Vivo y Alerta Inteligente al `≤15%` en Herdr](#6-visualización-en-vivo-y-alerta-inteligente-al-15-en-herdr)
+7. [Aislamiento de Perfiles HOME y Deduplicación `.npm`](#7-aislamiento-de-perfiles-home-y-deduplicación-npm)
+8. [Uso en Múltiples Paneles y Detección `EN USO` (Anti-Colisión)](#8-uso-en-múltiples-paneles-y-detección-en-uso-anti-colisión)
+9. [Motor *"Reserva ULTRA + Burn-First"* (`agyc auto [--allow-ultra]`)](#9-motor-reserva-ultra--burn-first-agyc-auto---allow-ultra)
+10. [Diagnóstico y Auto-Reparación (`agyc doctor [--fix]`)](#10-diagnóstico-y-auto-reparación-agyc-doctor---fix)
+11. [Librería Núcleo `lib/agyc_core.py` y Suite de Tests](#11-librería-núcleo-libagyc_corepy-y-suite-de-tests)
+12. [Gestión de Tokens, Elegibilidad y Keyring](#12-gestión-de-tokens-elegibilidad-y-keyring)
+13. [Skill para el Agente de Antigravity](#13-skill-para-el-agente-de-antigravity)
+14. [`agyc wipe` y `agyc update`](#14-agyc-wipe-y-agyc-update)
+15. [Historia de Versiones y Decisiones de Diseño](#15-historia-de-versiones-y-decisiones-de-diseño)
 
 ---
 
@@ -31,20 +32,19 @@
 
 Google Antigravity CLI (`agy`) opera por defecto con una única sesión OAuth activa. Al trabajar a tiempo completo con modelos de razonamiento profundo (`Gemini 4 Carbon`, `Gemini 4 Argon`, `Claude Opus 5.5`, `Claude Sonnet 5.5`) o ejecutar enjambres de subagentes en paralelo, las ventanas de cuota de una sola cuenta se consumen rápidamente.
 
-`agyc v1.5` transforma Antigravity en una estación de trabajo **multi-cuenta unificada**:
+`agyc v1.6` transforma Antigravity en una estación de trabajo **multi-cuenta inteligente y libre de colisiones**:
 
 - Gestiona hasta **15 cuentas correlativas** (`agy01`..`agy15`), combinando cuentas **Google AI Pro (`PRO`)** y **Google AI Ultra (`ULTRA`)**.
-- Aísla cada sesión en su propio **perfil `HOME` virtual** — múltiples paneles abiertos en paralelo jamás pisan el token de otro panel.
-- Monitorea en tiempo real los **2 grupos unificados de cuotas** de Antigravity `1.5.10` tanto en tabla CLI como en vivo dentro del pie de `agy`, la **Barra Superior (Top Bar)** de ventana/panel y la barra global de **Herdr**.
-- Conmuta automáticamente a la mejor cuenta elegible (`agyc auto`), filtrando exclusivamente cuentas `ULTRA` cuando se requiere `Gemini 4 Carbon`.
+- Detecta en vivo qué cuentas están **`EN USO`** en paneles activos (`▶ en p2`) y cuáles están **`🔒 RESERVADA`** (`agyc lock`), evitando choques al rotar.
+- Permite asignar **notas y reservas con motivo** por cuenta visibles en la segunda línea de cada fila de `agyc list` manteniendo **131 columnas** exactas.
+- Implementa el motor ***"Reserva ULTRA + Burn-First"*** en `agyc auto [--allow-ultra]` y dispara una **alerta visual + Toast único por ciclo en Herdr** cuando cualquier ventana cae a **`≤15%`**.
+- Incluye diagnóstico integral y auto-reparación con **`agyc doctor [--fix]`**, núcleo modular en **`lib/agyc_core.py`** y suite automatizada de pruebas unitarias.
 
 ---
 
 ## 2. Esquema Oficial de Cuotas en Google Antigravity 1.5.10
 
 ### Niveles de suscripción (`PRO` vs `ULTRA`)
-
-`agyc` detecta y muestra en la columna `PLAN` el nivel real de suscripción de cada cuenta de Google:
 
 | Código | Suscripción | Capacidades en Antigravity 1.5.10 |
 |---|---|---|
@@ -53,42 +53,19 @@ Google Antigravity CLI (`agy`) opera por defecto con una única sesión OAuth ac
 
 ### Los 2 Grupos Unificados de Cuotas
 
-A partir de Google Antigravity `1.5.10`, todas las cuotas de modelos se consolidan en **2 grupos unificados** por cuenta. Dentro de cada grupo, el uso de cualquiera de sus modelos descuenta de la misma bolsa de forma **proporcional al costo de tokens** del modelo elegido, sobre dos ventanas móviles compartidas:
-
-- **Ventana de 5 Horas (`5H`):** Ventana móvil de corto plazo (se inicia con el primer consumo y se restablece 5 horas después; **no** es un corte diario fijo a medianoche).
+Todas las cuotas de modelos se consolidan en **2 grupos unificados** por cuenta sobre dos ventanas móviles compartidas:
+- **Ventana de 5 Horas (`5H`):** Ventana deslizante desde el primer consumo activo (se restablece 5h después; **no** es un corte diario fijo).
 - **Ventana Semanal (`Sem`):** Reserva móvil acumulada de 7 días (`168h`).
 
-#### 1) Grupo `GEMINI` (Gemini Models)
-Comparte un único par de medidores `5H` / `Sem` entre:
-- **`Gemini 4 Carbon`** *(exclusivo para cuentas `ULTRA`)*
-- **`Gemini 4 Argon`**
-- **`Gemini 4 Hydrogen`**
-- **`Orchestrator (Carbon/Argon)`**
-- **`Gemini 3.8 Flash`**
+1. **Grupo `GEMINI` (Gemini Models):** `Gemini 4 Carbon` *(exclusivo `ULTRA`)*, `Gemini 4 Argon`, `Gemini 4 Hydrogen`, `Orchestrator (Carbon/Argon)`, `Gemini 3.8 Flash`.
+2. **Grupo `CLAUDE & GPT` (Claude & GPT Models):** `Claude Sonnet 4.6 / 5.5`, `Claude Opus 4.6 / 5.5`, `GPT-OSS 120B`.
 
-#### 2) Grupo `CLAUDE & GPT` (Claude & GPT Models)
-Comparte un único par de medidores `5H` / `Sem` entre:
-- **`Claude Sonnet 4.6 / 5.5`**
-- **`Claude Opus 4.6 / 5.5`**
-- **`GPT-OSS 120B`**
-
-### Interpretación de `Disponible` vs Contadores `(4h 25m)` / `(6d 23h)`
-
-- **`100% Disponible`:** La cuenta conserva el 100% íntegro de esa ventana y aún no ha abierto un ciclo de reinicio por consumo reciente.
-- **`82% (4h 25m)` / `91% (6d 23h)`:** Existe consumo activo en la ventana; el porcentaje refleja la **cuota restante disponible** y el contador entre paréntesis indica el tiempo exacto faltante para que esa ventana vuelva al 100%.
+- **`100% Disponible`:** La cuenta conserva el 100% íntegro sin ciclo de reinicio abierto.
+- **`82% (4h 25m)` / `91% (6d 23h)`:** Muestra el porcentaje restante disponible y el tiempo exacto hasta volver al 100%.
 
 ---
 
-## 3. Instalación (`v1.5`)
-
-### Requisitos
-
-| Requisito | Versión recomendada |
-|---|---|
-| Ubuntu Linux | 20.04+ (x86_64) |
-| Google Antigravity CLI | `1.5.10+` (binario nativo en `agy-real` o Snap) |
-| Python | 3.10+ |
-| Suscripción Google AI | Al menos 1 cuenta `Google AI Pro` o `Google AI Ultra` |
+## 3. Instalación (`v1.6`)
 
 ### Instalación automática desde el repositorio
 
@@ -100,423 +77,244 @@ chmod +x install.sh
 source ~/.bashrc
 ```
 
-### Qué realiza `install.sh` en `v1.5`
+### Qué realiza `install.sh` en `v1.6`
 
-1. **Preservación segura del motor y del wrapper `agy`:** Si `~/.local/bin/agy` contiene el binario nativo ELF de Antigravity y aún no existe `~/.gemini/antigravity-cli/bin/agy-real`, lo respalda primero como `agy-real` y coloca el wrapper `bin/agy` en `~/.gemini/antigravity-cli/bin/agy` y `~/.local/bin/agy`.
-2. **Instalación de herramientas de barra superior e inferior:**
-   - Instala `agyc` y `agyc-statusline` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`.
-   - Crea el symlink `agyc-titleline -> agyc-statusline` en **ambos** directorios de binarios (`~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`).
-   - Copia y enlaza `bin/agyc-topbar` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`.
-3. **Configuración automática de `settings.json`:** Activa tanto `"statusLine"` (`agyc-statusline`) como `"title"` (`agyc-titleline`) en `~/.gemini/antigravity-cli/settings.json` y en los perfiles existentes.
-4. **Lanzadores `agy01..agy15` y Skill:** Genera los 15 accesos directos, configura `PATH` + `SSH_TTY` e instala `skills/agyc/SKILL.md`.
-
-### Instalación manual equivalente
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli/bin ~/.local/bin ~/.agyc_homes
-
-# Copiar binarios principales
-cp -f bin/agyc bin/agy bin/agyc-statusline ~/.gemini/antigravity-cli/bin/
-[ -f bin/agyc-topbar ] && cp -f bin/agyc-topbar ~/.gemini/antigravity-cli/bin/
-chmod +x ~/.gemini/antigravity-cli/bin/agyc \
-         ~/.gemini/antigravity-cli/bin/agy \
-         ~/.gemini/antigravity-cli/bin/agyc-statusline
-[ -f ~/.gemini/antigravity-cli/bin/agyc-topbar ] && chmod +x ~/.gemini/antigravity-cli/bin/agyc-topbar
-
-# Enlaces en ~/.local/bin y symlinks agyc-titleline -> agyc-statusline
-ln -sf ~/.gemini/antigravity-cli/bin/agyc ~/.local/bin/agyc
-ln -sf ~/.gemini/antigravity-cli/bin/agy ~/.local/bin/agy
-ln -sf ~/.gemini/antigravity-cli/bin/agyc-statusline ~/.local/bin/agyc-statusline
-ln -sf agyc-statusline ~/.gemini/antigravity-cli/bin/agyc-titleline
-ln -sf agyc-statusline ~/.local/bin/agyc-titleline
-[ -f ~/.gemini/antigravity-cli/bin/agyc-topbar ] && \
-    ln -sf ~/.gemini/antigravity-cli/bin/agyc-topbar ~/.local/bin/agyc-topbar
-
-# Lanzadores agy01..agy15
-for i in $(seq -w 1 15); do
-    ln -sf ~/.gemini/antigravity-cli/bin/agyc ~/.local/bin/agy${i}
-done
-```
+1. **Endurecimiento de permisos (`0700` / `0600`) y deduplicación `.npm`:** Asegura permisos privados en `~/.agyc_homes`, `~/.gemini/antigravity-cli/accounts` y `~/.cache/agyc`, y enlaza `~/.agyc_homes/<alias>/.npm -> ~/.npm` para evitar duplicar cachés de servidores MCP/`npx`.
+2. **Librería núcleo `lib/agyc_core.py`:** Copia `lib/__init__.py` y `lib/agyc_core.py` hacia `~/.gemini/antigravity-cli/lib/` (`0755` / `0644`) y enlaza `lib/` en perfiles aislados.
+3. **Binarios, wrapper `agy` y barras en vivo:** Instala `agyc`, preserva `agy-real` + wrapper `bin/agy`, instala `agyc-statusline`, crea el symlink `agyc-titleline -> agyc-statusline` e instala `agyc-topbar` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`.
+4. **Hooks TUI, lanzadores `agy01..agy15` y verificación unitaria:** Activa `"statusLine"` y `"title"` en `settings.json` (`0600`), instala `skills/agyc/SKILL.md`, valida sintaxis Python y ejecuta `python3 -m unittest discover -s tests` si está presente.
 
 ---
 
-## 4. Primeros pasos y Panel de 6 Columnas
+## 4. Primeros pasos, Panel de 131 Columnas, Notas y Reservas
 
-### Registrar cuentas
-
-```bash
-agyc add      # primera cuenta → agy01 (abre navegador para OAuth)
-agyc add      # segunda cuenta → agy02
-agyc add      # tercera cuenta → agy03
-```
-
-### Consultar estado unificado (`agyc` / `agyc list`)
+### Registrar cuentas y anotar/reservar alias
 
 ```bash
-agyc
+agyc add                                    # primera cuenta → agy01
+agyc add                                    # segunda cuenta → agy02
+agyc add                                    # tercera cuenta → agy03
+
+agyc note agy01 "Solo Carbon crítico"       # asigna nota informativa a agy01
+agyc note agy01 --clear                     # elimina la nota de agy01
+
+agyc lock agy03 "Intocable demo"            # bloquea agy03 con motivo (excluida de agyc auto)
+agyc unlock agy03                           # desbloquea agy03
 ```
 
-Salida del nuevo diseño compacto de 6 columnas en `v1.5`:
+### Consultar el panel unificado (`agyc` / `agyc list`)
 
 ```text
-PANEL DE CUENTAS DE GOOGLE AI PRO & ULTRA (ANTIGRAVITY 1.5.10 / AGYC v1.5)
+PANEL DE CUENTAS DE GOOGLE AI PRO & ULTRA (ANTIGRAVITY 1.5.10 / AGYC v1.6)
 
-┌──────────┬──────────────────────┬───────┬─────────────┬───────────────────────────────────┬───────────────────────────────────┐
-│ ALIAS    │ CUENTA / EMAIL       │ PLAN  │ ESTADO      │ GEMINI (5H / SEMANAL)             │ CLAUDE & GPT (5H / SEMANAL)       │
-├──────────┼──────────────────────┼───────┼─────────────┼───────────────────────────────────┼───────────────────────────────────┤
-│ * agy01  │ dev1@gmail.com       │ ULTRA │ *ACTIVA+DEF │ 5H:  [████████░░]  82% (4h 25m)   │ 5H:  [██████████] 100% Disponible │
-│          │                      │       │             │ Sem: [█████████░]  91% (6d 23h)   │ Sem: [████████░░]  78% (6d 23h)   │
-├──────────┼──────────────────────┼───────┼─────────────┼───────────────────────────────────┼───────────────────────────────────┤
-│   agy02  │ dev2@gmail.com       │ PRO   │   LISTA     │ 5H:  [██████████] 100% Disponible │ 5H:  [██████░░░░]  60% (4h 25m)   │
-│          │                      │       │             │ Sem: [██████████] 100% Disponible │ Sem: [█████░░░░░]  50% (6d 23h)   │
-├──────────┼──────────────────────┼───────┼─────────────┼───────────────────────────────────┼───────────────────────────────────┤
-│   agy03  │ dev3@gmail.com       │ PRO   │   LISTA     │ 5H:  [███████░░░]  70% (3h 10m)   │ 5H:  [░░░░░░░░░░]   0% (1h 45m)   │
-│          │                      │       │             │ Sem: [████████░░]  84% (5d 12h)   │ Sem: [██░░░░░░░░]  20% (4d 08h)   │
-└──────────┴──────────────────────┴───────┴─────────────┴───────────────────────────────────┴───────────────────────────────────┘
+┌──────────┬──────────────────────┬───────┬───────────────┬───────────────────────────────────┬───────────────────────────────────┐
+│ ALIAS    │ CUENTA / EMAIL       │ PLAN  │ ESTADO        │ GEMINI (5H / SEMANAL)             │ CLAUDE & GPT (5H / SEMANAL)       │
+├──────────┼──────────────────────┼───────┼───────────────┼───────────────────────────────────┼───────────────────────────────────┤
+│ * agy01  │ dev1@gmail.com       │ ULTRA │ *ACTIVA+DEF   │ 5H:  [████████░░]  82% (4h 25m)   │ 5H:  [██████████] 100% Disponible │
+│          │ Solo Carbon crítico  │       │ ▶ en p1       │ Sem: [█████████░]  91% (6d 23h)   │ Sem: [████████░░]  78% (6d 23h)   │
+├──────────┼──────────────────────┼───────┼───────────────┼───────────────────────────────────┼───────────────────────────────────┤
+│   agy02  │ dev2@gmail.com       │ PRO   │ EN USO        │ 5H:  [██████░░░░]  64% (3h 12m)   │ 5H:  [██████░░░░]  60% (4h 25m)   │
+│          │ Backend Sprint 4     │       │ ▶ en p2       │ Sem: [█████████░]  92% (6d 10h)   │ Sem: [█████░░░░░]  50% (6d 23h)   │
+├──────────┼──────────────────────┼───────┼───────────────┼───────────────────────────────────┼───────────────────────────────────┤
+│   agy03  │ dev3@gmail.com       │ PRO   │ 🔒 RESERVADA  │ 5H:  [██████████] 100% Disponible │ 5H:  [██████████] 100% Disponible │
+│          │ Intocable demo       │       │               │ Sem: [██████████] 100% Disponible │ Sem: [██████████] 100% Disponible │
+└──────────┴──────────────────────┴───────┴───────────────┴───────────────────────────────────┴───────────────────────────────────┘
 ```
 
-### Entrar directamente a Antigravity
-
-```bash
-agy01    # abre Antigravity aislado en ~/.agyc_homes/agy01 (dev1@gmail.com - ULTRA)
-agy02    # abre Antigravity aislado en ~/.agyc_homes/agy02 (dev2@gmail.com - PRO)
-agy03    # abre Antigravity aislado en ~/.agyc_homes/agy03 (dev3@gmail.com - PRO)
-```
+Lectura de la segunda línea de cada fila (manteniendo exactamente **131 columnas** de ancho total):
+- Bajo `CUENTA / EMAIL`: muestra la **nota** configurada con `agyc note` o el **motivo de bloqueo** de `agyc lock`.
+- En `ESTADO`: muestra `EN USO` + `▶ en pX` cuando la cuenta tiene sesiones vivas de `agy` en paneles de Herdr o terminales locales, y `🔒 RESERVADA` cuando está protegida con `agyc lock`.
 
 ---
 
 ## 5. Comandos de Referencia
 
 ### Lanzadores directos
-
 ```bash
-agy01                      # Entra directo a agy01 con --dangerously-skip-permissions
-agy02                      # Entra directo a agy02
-# ... hasta agy15
+agy01 .. agy15             # Entra directo a esa cuenta con perfil HOME aislado y --dangerously-skip-permissions
 agy                        # Entra con la cuenta activa/default usando el wrapper preservado
 ```
 
-### Gestión y consulta de cuentas
-
+### Consulta, notas y reservas
 ```bash
-agyc                       # Panel compacto de 6 columnas (por defecto)
-agyc list                  # Equivalente a agyc
+agyc / agyc list           # Panel de 6 columnas (131 cols) con paneles activos, notas y reservas
 agyc list -r               # Refresca cuotas y planes en vivo desde Google (--refresh)
-agyc list --json           # Salida JSON estructurada con plan y ambos grupos de cuota
-agyc add                   # Registra nueva cuenta correlativa (PRO o ULTRA)
-agyc add agy04             # Registra o sobrescribe un alias específico
-agyc renew agy03           # Re-vincula OAuth cuando Google pide re-autenticación
-agyc reauth agy03          # Alias de renew
-agyc rm agy03              # Elimina una cuenta y limpia su perfil aislado
-agyc wipe                  # Vacía TODAS las credenciales registradas (con confirmación)
-agyc wipe --force          # Limpieza total no interactiva (-y)
+agyc list --json           # Salida JSON estructurada (incluye in_use, panes, locked, lock_reason, note)
+agyc quota [alias]         # Desglose detallado de modelos y timestamps exactos de reinicio
+agyc note <alias> "<txt>"  # Guarda una nota descriptiva en la cuenta
+agyc note <alias> --clear  # Borra la nota de la cuenta
+agyc lock <alias> "[mot]"  # Marca la cuenta como 🔒 RESERVADA (excluida de agyc auto y sugerencias)
+agyc unlock <alias>        # Retira la reserva de la cuenta
 ```
 
-### Selección y rotación de cuentas
+### Selección, rotación inteligente y diagnóstico
+```bash
+agyc switch <alias>        # Cambia la cuenta activa global sin abrir la TUI
+agyc default <alias>       # Define la cuenta predeterminada para inicios con 'agy'
+agyc auto                  # Rota con motor Reserva ULTRA + Burn-First y anti-colisión de paneles
+agyc auto --allow-ultra    # Permite usar cuentas ULTRA también cuando el modelo activo no es Carbon
+agyc auto gemini           # Fuerza evaluación sobre el grupo Gemini (PRO primero salvo --allow-ultra)
+agyc auto claude           # Fuerza evaluación sobre el grupo Claude & GPT (PRO primero salvo --allow-ultra)
+agyc auto carbon / ultra   # Filtra EXCLUSIVAMENTE cuentas ULTRA libres y no bloqueadas
+agyc doctor                # Audita permisos, symlinks, caché .npm y configuración de hooks TUI/Herdr
+agyc doctor --fix          # Repara automáticamente todos los hallazgos detectados por doctor
+```
+
+### Autenticación y mantenimiento
+```bash
+agyc add [alias]           # Registra nueva cuenta (PRO o ULTRA) vía OAuth en navegador
+agyc renew <alias>         # Re-vincula OAuth cuando Google pide re-autenticación (alias: reauth)
+agyc rm <alias>            # Elimina una cuenta y limpia su perfil aislado
+agyc wipe [--force]        # Vacía TODAS las credenciales registradas
+agyc update / agy update   # Sincroniza repo, lib/, binarios, barras y motor oficial de Antigravity
+```
+
+---
+
+## 6. Visualización en Vivo y Alerta Inteligente al `≤15%` en Herdr
+
+`agyc v1.6` mantiene el orden unificado **`5H → Ctx → Sem`** en las cuatro superficies en vivo (`agyc-statusline`, `agyc-titleline`, `pane.report_metadata` y `agyc-topbar`) y añade detección proactiva de agotamiento inminente.
+
+### 6.1 Pie de `agy` (`agyc-statusline`) + Alerta Visual `≤15%`
+
+Cuando la cuota efectiva del modelo activo cae a **`≤15%`** (`min(5H, Sem) <= 15%`, excluyendo estados sin inicializar):
+1. **Badge ANSI inmediato:** Añade en la barra inferior `⚠ ≤15%` en naranja brillante (o `⚠ AGOTADA` en rojo brillante si llega a `0%`).
+2. **Marca en borde de panel Herdr:** Antepone `⚠` en `display_agent` de `pane.report_metadata` (con bypass inmediato del throttle de 8s al cambiar de estado) para alertar visualmente en el borde superior del panel dividido.
+
+```text
+# Barra inferior ANSI con cuota baja:
+⚡ agy02·PRO │ ⚠ ≤15% │ 🌿 main │ 🤖 Claude Sonnet 5.5 (high) │ 5H: [█░░░░░░░] 12% (⏳ 1h 40m) │ Ctx: [███░░░░░] 36% (90k/250k) │ Sem: [████████] 84% (5d 12h)
+
+# Borde superior del panel en Herdr:
+⚠ ⚡ agy02 [PRO] · Claude Sonnet 5.5 · 5H:12% Ctx:36% Sem:84%
+```
+
+### 6.2 Notificación Toast Única por Ciclo en Herdr (`maybe_notify_low_quota`)
+
+Al cruzar `≤15%` dentro de Herdr (`HERDR_ENV=1` o socket `~/.config/herdr/herdr.sock` + binario `~/.local/bin/herdr`):
+- **Cero spam (deduplicación estricta):** Registra `{"reset_key": "<reset_5h|reset_sem|active>", "notified_at": <ts>}` con permisos `0600` y `flock` atómico en `~/.cache/agyc/low_quota_alert_<alias>_<familia>.json`. Durante todo ese ciclo de reinicio (hasta 5 horas), **no vuelve a emitir otro toast**.
+- **Sugerencia inteligente en `<3ms`:** Escanea localmente `accounts/*.json`, `quota_cache_*.json` y `pane.list` del socket Herdr:
+  - Descarta la cuenta actual, cuentas con `is_revoked == True`, cuentas con `locked == True` (`🔒 RESERVADA`) y cuentas ocupadas en otros paneles de Herdr.
+  - Si el modelo contiene `"carbon"`, exige `plan_type == "ULTRA"`; en caso contrario, prefiere cuentas **`PRO`** saludables (*Reserva ULTRA*).
+- **Ejecución desacoplada (`<1ms`):** Lanza `herdr notification show --position top-right --sound none --body ...` mediante `subprocess.Popen(..., start_new_session=True)` sin bloquear jamás el renderizado de la TUI:
+  - Con reemplazo libre encontrado:
+    - Título: `⚠ Cuota baja en agy02 (12%)`
+    - Cuerpo: `Sugerida libre: agy04 [PRO] (100% 5H) · Ejecuta: agyc auto`
+  - Sin reemplazo libre disponible:
+    - Cuerpo: `Ventana Claude al 12% · Revisa con: agyc list`
+
+### 6.3 Barra Superior OSC (`agyc-titleline`) y Widget Global (`agyc-topbar`)
+
+- **`agyc-titleline`** (`"title"` en `settings.json`): emite texto limpio OSC para pestañas/ventanas (`⚡ agy01 [ULTRA] · Gemini 4 Carbon (high) · 5H: 82% (4h 25m) · Ctx: 36% · Sem: 91% (6d 23h)`).
+- **`agyc-topbar`** (`[[ui.tab_bar_right]]` en `~/.config/herdr/config.toml`): muestra en `<20ms` la cuenta activa del panel/pestaña enfocada en Herdr con `% Ctx` intercalado en `5H → Ctx → Sem`.
+
+---
+
+## 7. Aislamiento de Perfiles HOME y Deduplicación `.npm`
+
+Cada lanzador `agy01`..`agy15` inyecta `HOME=~/.agyc_homes/<alias>` antes de `os.execv()` hacia `agy-real`:
+
+```text
+~/.agyc_homes/<alias>/
+├── .npm                            ← 🔗 Symlink → ~/.npm (evita gigabytes duplicados en npx/MCP)
+└── .gemini/antigravity-cli/
+    ├── antigravity-oauth-token     ← 🔒 Copia exclusiva (0600) del alias
+    ├── bin/                        ← 🔗 Symlink → ~/.gemini/antigravity-cli/bin
+    ├── lib/                        ← 🔗 Symlink → ~/.gemini/antigravity-cli/lib
+    ├── settings.json               ← 🔗 Symlink → ~/.gemini/antigravity-cli/settings.json
+    ├── accounts/                   ← 🔗 Symlink → ~/.gemini/antigravity-cli/accounts
+    ├── conversations/              ← 🔗 Symlink → historial compartido para /resume entre cuentas
+    └── brain/                      ← 🔗 Symlink → artefactos y contexto compartido
+```
+
+---
+
+## 8. Uso en Múltiples Paneles y Detección `EN USO` (Anti-Colisión)
+
+Cuando trabajas con varios paneles abiertos en Herdr, tmux o terminales paralelas:
+1. `agyc` inspecciona los procesos `agy-real` en ejecución (`/proc`) y los paneles reportados por el socket de Herdr (`pane.list`).
+2. `agyc list` marca automáticamente esas cuentas como **`EN USO`** e indica en qué panel corren (`▶ en p1`, `▶ en p2`).
+3. Cuando ejecutas `agyc auto` en un panel cuya cuota se agotó, el motor **descarta las cuentas `EN USO` en otros paneles** y las cuentas **`🔒 RESERVADA`**, asignándote siempre una cuenta libre para evitar desgastar la misma ventana `5H` desde dos sesiones pesadas simultáneas.
+
+---
+
+## 9. Motor *"Reserva ULTRA + Burn-First"* (`agyc auto [--allow-ultra]`)
+
+El selector inteligente de `v1.6` aplica tres reglas jerárquicas:
+
+1. **Anti-colisión y bloqueo:** Excluye cuentas con `is_revoked == True`, `locked == True` (`agyc lock <alias>`) y cuentas `EN USO` en otros paneles activos.
+2. **Reserva ULTRA:**
+   - En modo `carbon` / `ultra` (o cuando el modelo activo en `settings.json` es `Gemini 4 Carbon`), exige **exclusivamente cuentas `ULTRA`**.
+   - En modos `gemini` (Argon, Hydrogen, 3.8 Flash) y `claude` (Sonnet, Opus, GPT-OSS), **protege las cuentas `ULTRA`** seleccionando primero entre cuentas **`PRO`** saludables. Solo recurre a una cuenta `ULTRA` si pasas `--allow-ultra` o si ninguna cuenta `PRO` libre tiene cuota disponible.
+3. **Burn-First (Quemar primero ventanas móviles abiertas):**
+   - Entre candidatas saludables del mismo nivel de plan (`>15%`), prioriza una cuenta cuya ventana móvil `5H` **ya esté en curso** (`15% < 5H < 100%`) antes de abrir una cuenta intacta al `100% Disponible`.
+   - Así evitas fragmentar media docena de cuentas al 85% y concentras el consumo hasta agotar ordenadamente la ventana cuyo reloj de 5 horas ya se está regenerando.
+
+---
+
+## 10. Diagnóstico y Auto-Reparación (`agyc doctor [--fix]`)
+
+El comando `agyc doctor` verifica de extremo a extremo la salud de la instalación:
+
+- **Permisos de seguridad:** Directorios sensibles (`~/.agyc_homes`, `accounts/`, `~/.cache/agyc`) en `0700` y credenciales JSON/tokens en `0600`.
+- **Integridad de binarios y librería:** Presencia de `agy-real`, wrapper `bin/agy`, `lib/agyc_core.py`, `agyc-statusline`, symlink `agyc-titleline` y `agyc-topbar`.
+- **Perfiles aislados y `.npm`:** Symlinks válidos en `~/.agyc_homes/*` y deduplicación de carpetas `.npm` hacia `~/.npm`.
+- **Hooks de telemetría:** Configuración activa de `"statusLine"` y `"title"` en `settings.json` e integración con Herdr (`agyc-topbar`).
+
+Al ejecutar `agyc doctor --fix`, repara permisos, recrea symlinks faltantes, deduplica `.npm` y restaura los hooks en `settings.json` de forma idempotente.
+
+---
+
+## 11. Librería Núcleo `lib/agyc_core.py` y Suite de Tests
+
+En `v1.6`, la lógica de dominio reutilizable reside en `lib/agyc_core.py` (instalada en `~/.gemini/antigravity-cli/lib/agyc_core.py`):
+- Gestión atómica de metadatos por cuenta (`note`, `locked`, `lock_reason`).
+- Detección en vivo de procesos `agy-real` y paneles de Herdr (`EN USO` / `▶ en pX`).
+- Motor de ranking *Reserva ULTRA + Burn-First + Anti-Colisión*.
+- Auditoría y reparación de `agyc doctor [--fix]`.
+
+Para ejecutar la suite completa de pruebas unitarias sin generar bytecode residual:
 
 ```bash
-agyc switch agy02          # Cambia la cuenta activa global sin abrir la TUI
-agyc agy02                 # Alias abreviado de switch
-agyc default agy01         # Define la cuenta predeterminada para inicios con 'agy'
-agyc quota                 # Reporte detallado de modelos y timestamps de reinicio (cuenta activa)
-agyc quota agy01           # Reporte detallado de una cuenta específica
-agyc auto                  # Rota automáticamente según el modelo activo en settings.json
-agyc auto gemini           # Fuerza evaluación sobre el grupo unificado Gemini (PRO + ULTRA)
-agyc auto claude           # Fuerza evaluación sobre el grupo unificado Claude & GPT (PRO + ULTRA)
-agyc auto carbon           # Filtra EXCLUSIVAMENTE cuentas ULTRA con mayor cuota Gemini/Carbon
-agyc auto ultra            # Alias equivalente a 'agyc auto carbon' (solo cuentas ULTRA)
-```
-
-### Actualización del ecosistema
-
-```bash
-agyc update                # Sincroniza repo, binarios, statusline/titleline/topbar y motor agy
-agy update                 # Interceptado por el wrapper bin/agy → delega a agyc update
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 ```
 
 ---
 
-## 6. Visualización de Consumo en Vivo: Pie y Barra Superior (Top Bar)
+## 12. Gestión de Tokens, Elegibilidad y Keyring
 
-`agyc v1.5` integra monitoreo continuo de cuotas y ventana de contexto real (cálculo exacto desde `current_usage` + estimación O(1) desde el final de `transcript.jsonl` respetando compactaciones `CHECKPOINT`), manteniendo el **orden unificado `5H → Ctx → Sem`** tanto en el **pie de terminal** como en todas las superficies de **Barra Superior (Top Bar)** y almacenando cachés/locks con permisos estrictos en `~/.cache/agyc` (`0700`).
-
-### 6.1 Pie de `agy` (`agyc-statusline`)
-
-Configurado en `~/.gemini/antigravity-cli/settings.json` bajo la clave `"statusLine"`:
-
-```json
-"statusLine": {
-  "type": "command",
-  "command": "agyc-statusline",
-  "enabled": true
-}
-```
-
-Renderiza en la parte inferior de la sesión interactiva de `agy` siguiendo el orden **`5H → Ctx → Sem`**:
-- Alias activo y badge de suscripción (`agy01·ULTRA` / `agy02·PRO`).
-- Rama Git actual del proyecto (lectura directa ultrarrápida desde `.git/HEAD`).
-- Modelo activo y nivel de esfuerzo (`Gemini 4 Carbon (high)`, `Claude Sonnet 5.5 (high)`, `GPT-OSS 120B (medium)`, etc.).
-- Ventana móvil `5H` coloreada con cuenta regresiva activa.
-- Consumo real de ventana de contexto (`Ctx` con barra de color invertida: verde <50%, amarillo <75%, naranja <85%, rojo ≥85%, mostrando techos exactos `1M`, `250k`, `200k`, `128k` o `64k`).
-- Ventana `Sem` coloreada con cuenta regresiva semanal activa.
-
-Ejemplo visual:
-
-```text
-⚡ agy01·ULTRA │ 🌿 main │ 🤖 Gemini 4 Carbon (high) │ 5H: [███████░] 91% (⏳ 3h 15m) │ Ctx: [███░░░░░] 36% (376k/1M) │ Sem: [████████] 97% (6d 21h)
-```
-
-### 6.2 Barra Superior (Top Bar) en `agy` y Borde por Panel en Herdr (`agyc-titleline` + `pane.report_metadata`)
-
-Antigravity CLI `1.5.10` soporta un generador dinámico de título de terminal mediante la clave `"title"` en `settings.json` (controlable también con el slash command `/title on` y `/title off`).
-
-`install.sh` crea el enlace simbólico `agyc-titleline -> agyc-statusline` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`, y preconfigura `settings.json`:
-
-```json
-"title": {
-  "type": "command",
-  "command": "agyc-titleline",
-  "enabled": true
-}
-```
-
-De forma combinada:
-- Cuando `agy` invoca `agyc-titleline` (o `agyc-statusline --title`), emite la línea OSC de texto limpio para la **Barra Superior de la ventana / pestaña** en orden **`5H → Ctx → Sem`**:
-
-```text
-⚡ agy01 [ULTRA] · Gemini 4 Carbon (high) · 5H: 91% (3h 15m) · Ctx: 36% · Sem: 97% (6d 21h)
-```
-
-- En **Herdr**, tanto `agyc-statusline` como `agyc-titleline` sincronizan los **metadatos dinámicos del borde superior de cada panel** (`pane.report_metadata`, con bypass inmediato de throttle si cambia la cuenta, el modelo o `ΔCtx ≥ 3%`), permitiendo ver cuenta, plan, modelo y **`5H → Ctx → Sem`** en cada panel dividido sin cambiar el foco:
-
-```text
-⚡ agy01 [ULTRA] · Gemini 4 Carbon · 5H:91% Ctx:36% Sem:97%
-```
-
-### 6.3 Barra Superior Derecha Global en Herdr (`agyc-topbar`)
-
-Además de los bordes individuales por panel, `agyc v1.5` incluye el widget ultraligero **`agyc-topbar`** (<20ms, sin bloqueo, instalado en `~/.local/bin/agyc-topbar` y `~/.gemini/antigravity-cli/bin/agyc-topbar`) diseñado para la zona derecha de la barra global de pestañas de Herdr (`ui.tab_bar_right`). Detecta automáticamente el panel `agy` activo (panel enfocado → panel principal de la pestaña actual → cuenta activa por defecto), carga su `% Ctx` persistido o estimado en `<1ms` desde `transcript.jsonl`, e inserta **`Ctx: XX%` entre `5H` y `Sem`** en la familia activa (`Gemini` o `Claude`):
-
-```text
-⚡ agy01 [ULTRA] │ Gemini 5H: 91% (3h15m) · Ctx: 36% · Sem: 97% (6d21h) │ Claude 5H: 100% · Sem: 100%
-```
-
-Si el panel enfocado trabaja con un modelo de la familia Claude & GPT (`Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`), `Ctx:` aparece en el segmento `Claude`:
-
-```text
-⚡ agy02 [PRO] │ Gemini 5H: 100% · Sem: 100% │ Claude 5H: 60% (4h25m) · Ctx: 24% · Sem: 50% (6d23h)
-```
-
-Para activarlo en `~/.config/herdr/config.toml`:
-
-```toml
-[[ui.tab_bar_right]]
-type = "command"
-command = "agyc-topbar"
-interval_seconds = 5
-timeout_seconds = 2
-```
-
-De esta forma, la esquina superior derecha de Herdr muestra permanentemente la cuenta activa, su plan (`PRO`/`ULTRA`), el `% Ctx` real del panel activo y los porcentajes `5H`/`Sem` con sus cuentas regresivas incluso cuando estás trabajando en un panel auxiliar de logs o Bash dentro de la misma pestaña.
+- **Renovación OAuth (`invalid_grant` o `Eligibility check failed`):** Ejecuta `agyc renew <alias>` para re-autenticar en navegador.
+- **Bypass de GNOME Keyring:** `agyc` y `bin/agy` inyectan `SSH_TTY="${SSH_TTY:-/dev/pts/0}"` solo al invocar `agy-real` (sin contaminar `~/.bashrc`), asegurando lectura directa desde `antigravity-oauth-token`.
 
 ---
 
-## 7. Aislamiento de Perfiles HOME
+## 13. Skill para el Agente de Antigravity
 
-### El problema en entornos multi-panel
-
-El binario nativo de Antigravity lee y refresca su credencial OAuth en:
-
-```text
-$HOME/.gemini/antigravity-cli/antigravity-oauth-token
-```
-
-Si dos paneles compartieran el mismo `$HOME`, cambiar de cuenta en un panel sobrescribiría el token en caliente del otro.
-
-### Solución: `prepare_isolated_home(alias)`
-
-Antes de invocar `os.execv()` hacia `agy-real`, `agyc` construye un directorio `HOME` aislado por alias:
-
-```python
-if alias:
-    isolated_home = prepare_isolated_home(alias)
-    os.environ["HOME"] = isolated_home  # ej. ~/.agyc_homes/agy01
-
-os.execv(real_agy, cmd_args)
-```
-
-### Mapa de archivos aislados vs. compartidos
-
-```text
-~/.agyc_homes/
-├── agy01/.gemini/antigravity-cli/
-│   ├── antigravity-oauth-token   ← 🔒 Copia exclusiva (0600) — dev1@gmail.com (ULTRA)
-│   ├── bin/                      ← 🔗 Symlink → ~/.gemini/antigravity-cli/bin
-│   ├── settings.json             ← 🔗 Symlink → ~/.gemini/antigravity-cli/settings.json
-│   ├── accounts/                 ← 🔗 Symlink → ~/.gemini/antigravity-cli/accounts/
-│   ├── conversations/            ← 🔗 Symlink → historial compartido
-│   └── brain/                    ← 🔗 Symlink → artefactos y contexto compartido
-├── agy02/.gemini/antigravity-cli/
-│   ├── antigravity-oauth-token   ← 🔒 Copia exclusiva (0600) — dev2@gmail.com (PRO)
-│   └── ...
-└── agy03/.gemini/antigravity-cli/
-    ├── antigravity-oauth-token   ← 🔒 Copia exclusiva (0600) — dev3@gmail.com (PRO)
-    └── ...
-```
-
-| Recurso | Tipo | Propósito |
-|---|---|---|
-| `antigravity-oauth-token` | 🔒 **Archivo exclusivo por alias** | Blindaje total de credenciales OAuth entre paneles paralelos |
-| `settings.json` | 🔗 Symlink compartido | Mantiene `statusLine`, `title` y preferencias sincronizadas |
-| `bin/` | 🔗 Symlink compartido | Acceso unificado a `agy-real`, `agy`, `agyc`, `agyc-statusline`, `agyc-titleline`, `agyc-topbar` |
-| `accounts/` | 🔗 Symlink compartido | `agyc list` y `agyc-topbar` leen el estado real desde cualquier panel |
-| `conversations/` y `brain/` | 🔗 Symlink compartido | Permite retomar (`/resume`) cualquier sesión desde otra cuenta tras rotar |
+`skills/agyc/SKILL.md` capacita al agente de IA para operar `agyc v1.6`:
+- Consultar `agyc list` / `agyc list --json` respetando cuentas `EN USO` y `🔒 RESERVADA`.
+- Administrar `agyc note`, `agyc lock`/`unlock`, `agyc doctor [--fix]` y `agyc auto [--allow-ultra]`.
+- Aplicar la política *Reserva ULTRA + Burn-First* y atender las alertas `≤15%` de Herdr sin exponer tokens OAuth.
 
 ---
 
-## 8. Uso en Múltiples Paneles (Herdr / tmux / zellij)
+## 14. `agyc wipe` y `agyc update`
 
-### Distribución recomendada combinando `ULTRA` y `PRO`
-
-```text
-Herdr (Top Bar derecha: agyc-topbar)
-├── Tab Backend
-│   ├── Panel Principal → agy01 (ULTRA - dev1@gmail.com) → Arquitectura crítica con Gemini 4 Carbon
-│   ├── Panel Monitor   → dev-monitor
-│   └── Panel Soporte   → agy02 (PRO   - dev2@gmail.com) → Implementación con Claude Sonnet 5.5
-└── Tab Frontend
-    ├── Panel Principal → agy03 (PRO   - dev3@gmail.com) → UI/Tests con Gemini 4 Argon / 3.8 Flash
-    └── Panel Logs      → npm run dev / playwright
-```
-
-Cada panel conserva su propio `HOME` aislado y reporta su propio título dinámico (`agyc-titleline`) al encabezado del panel en Herdr. Y gracias a que `conversations/` y `brain/` están enlazados al directorio común, si una cuenta agota su ventana `5H` puedes cerrar `agy02`, abrir `agy03` y ejecutar `/resume` para continuar exactamente en la misma conversación.
+- **`agyc wipe [--force]`:** Elimina credenciales `accounts/*.json` y tokens OAuth conservando `settings.json`, `conversations/` y `brain/`.
+- **`agyc update` (o `agy update`):** Sincroniza el repositorio, actualiza `lib/agyc_core.py`, binarios, wrappers, barras (`statusline`, `titleline`, `topbar`), lanzadores `agy01..15` y verifica actualizaciones oficiales de `agy-real`.
 
 ---
 
-## 9. Rotación Inteligente de Cuotas (`agyc auto`) y Estrategia Agotar y Rotar
+## 15. Historia de Versiones y Decisiones de Diseño
 
-### Modos de evaluación en `agyc auto [gemini|claude|carbon|ultra]`
-
-`agyc auto` inspecciona todas las cuentas no revocadas y calcula un puntaje ponderado según el modo indicado (o autodetectado leyendo `"model"` en `settings.json`):
-
-1. **Modo `carbon` o `ultra`** (`agyc auto carbon` / `agyc auto ultra`, o automático cuando el modelo activo en `settings.json` es **`Gemini 4 Carbon`**):
-   - **Filtro estricto de plan:** Descarta todas las cuentas `PRO` y evalúa **exclusivamente cuentas `ULTRA`** (`Google AI Ultra`).
-   - **Puntaje:** `score = (gemini_semanal × 0.7) + (gemini_5h × 0.3)` sobre el grupo unificado Gemini.
-   - Si ninguna cuenta `ULTRA` tiene saldo disponible, informa qué cuenta `ULTRA` se recuperará primero sin degradar silenciosamente a una cuenta `PRO` incompatible con Carbon.
-
-2. **Modo `claude`** (`agyc auto claude`, o automático con `Claude Sonnet 4.6/5.5`, `Claude Opus 4.6/5.5` o `GPT-OSS 120B`):
-   - **Filtro:** Evalúa cuentas `PRO` y `ULTRA` válidas.
-   - **Puntaje:** `score = (claude_semanal × 0.7) + (claude_5h × 0.3)` priorizando preservar reserva semanal de Claude & GPT.
-
-3. **Modo `gemini`** (`agyc auto gemini`, o automático con `Gemini 4 Argon`, `Gemini 4 Hydrogen`, `Orchestrator` estándar o `Gemini 3.8 Flash`):
-   - **Filtro:** Evalúa cuentas `PRO` y `ULTRA` válidas.
-   - **Puntaje:** Prioriza disponibilidad en la ventana móvil `5H` y utiliza la ventana semanal (`Sem`) como criterio de desempate.
-
-### Estrategia recomendada: Agotar y Rotar
-
-```text
-agy02 (100% Disponible) ──► trabajar hasta ~15-20% ──► agyc auto ──► agy03 (100% Disponible)
-         │
-         └── su ventana móvil 5H corre en segundo plano (4h 25m → 0m → vuelve a 100% Disponible)
-```
-
-- **Activa temprano la ventana móvil `5H`** de una cuenta y trabájala de corrido hasta ~15-20% antes de saltar a la siguiente: así el temporizador de 5 horas ya está corriendo mientras consumes otra cuenta.
-- **Reserva las cuentas `ULTRA`** para sesiones de `Gemini 4 Carbon` / `Orchestrator (Carbon)` cuando también dispongas de cuentas `PRO` para tareas cotidianas con `Argon`, `3.8 Flash` o `Sonnet`.
-
----
-
-## 10. Gestión de Tokens, Elegibilidad y Keyring
-
-### Token expirado o revocado (`invalid_grant`)
-
-```bash
-agyc renew agy03   # abre el navegador forzando selección de cuenta y renueva el token OAuth
-```
-
-### Verificación de elegibilidad (`Eligibility check failed`)
-
-Si Google solicita confirmar elegibilidad o términos al estrenar una cuenta:
-
-```bash
-agyc renew agy03
-```
-
-### Almacenamiento basado en archivo (Bypass de GNOME Keyring)
-
-`agyc` y el wrapper `bin/agy` aseguran `SSH_TTY="${SSH_TTY:-/dev/pts/0}"` para que Antigravity lea siempre `antigravity-oauth-token` desde el `HOME` correspondiente sin bloquearse esperando prompts gráficos de GNOME Keyring o D-Bus.
-
----
-
-## 11. Skill para el Agente de Antigravity
-
-El archivo `skills/agyc/SKILL.md` instruye a los agentes de IA sobre cómo operar `agyc v1.5`:
-
-- Interpretar la tabla de 6 columnas (`PLAN` `PRO`/`ULTRA` y los 2 grupos unificados `GEMINI` y `CLAUDE & GPT`), recordando que `5H` es una ventana móvil de 5 horas y no una cuota diaria.
-- Usar `agyc auto [gemini|claude|carbon|ultra]` sabiendo que `carbon`/`ultra` filtra exclusivamente cuentas `ULTRA`.
-- Conocer la arquitectura de telemetría en vivo (`agyc-statusline`, `agyc-titleline` y `agyc-topbar`).
-
-Instalación manual del skill si fuera necesario:
-
-```bash
-mkdir -p ~/proyectos/.agents/skills/agyc
-cp -f skills/agyc/SKILL.md ~/proyectos/.agents/skills/agyc/SKILL.md
-```
-
----
-
-## 12. `agyc wipe` — Reinicio Limpio
-
-Purga de forma segura todas las credenciales registradas para empezar desde cero:
-
-```bash
-agyc wipe          # solicita confirmación interactiva
-agyc wipe --force  # ejecución directa sin confirmación (-y)
-```
-
-- **Elimina:** `accounts/*.json`, `antigravity-oauth-token` principal y tokens aislados en `~/.agyc_homes/*`.
-- **Conserva intactos:** `settings.json` (`statusLine` y `title`), `conversations/`, `brain/` y `projects/`.
-
----
-
-## 13. `agyc update` — Actualizador Automático
-
-Mantiene al día todo el ecosistema `agyc` y el binario oficial de Antigravity:
-
-```bash
-agyc update      # actualiza repositorio, binarios, barras y motor Antigravity
-agy update       # atajo interceptado por el wrapper ~/.local/bin/agy
-```
-
-### Fases de actualización
-
-1. **Sincronización con GitHub:** Ejecuta `git pull` en el repositorio local (o descarga directa si se instaló sin Git).
-2. **Sincronización de Binarios y Wrappers:** Actualiza `agyc`, preserva el wrapper `bin/agy` en `~/.gemini/antigravity-cli/bin/agy` y `~/.local/bin/agy`, sincroniza `agyc-statusline`, mantiene el symlink `agyc-titleline -> agyc-statusline`, copia `agyc-topbar` y regenera los lanzadores `agy01..agy15`.
-3. **Motor Oficial Google Antigravity CLI:** Verifica la versión de `~/.gemini/antigravity-cli/bin/agy-real` contra el manifiesto oficial de releases de Google Antigravity (`1.5.10+`) y actualiza `agy-real` sin sobrescribir el wrapper `~/.local/bin/agy`.
-4. **Mantenimiento de Perfiles y `settings.json`:** Sincroniza symlinks en `~/.agyc_homes/*` y verifica que `"statusLine"` y `"title"` sigan activos.
-
----
-
-## 14. Historia de Versiones y Decisiones de Diseño
-
-### v1.0 — MVP (Oct 13, 2026)
-- **Funcionalidades:** `switch`, lanzadores directos `agy01..15`, tabla inicial de cuotas y flujo OAuth local.
-- **Decisión clave:** Uso de `os.execv()` en lugar de subprocesos envolventes para preservar señales, colores y redimensionado nativo de la TUI de `agy`.
-
-### v1.1 — Rotación Inteligente (Oct 14, 2026)
-- **Funcionalidades:** `agyc auto`, puntaje ponderado y autodetección de modelo desde `settings.json`, más bypass automático de keyring vía `SSH_TTY`.
-
-### v1.2 — Renovación OAuth y Limpieza (Oct 15, 2026)
-- **Funcionalidades:** `agyc renew` / `reauth` y `agyc wipe`. Corrección definitiva tras verificar que el binario de Antigravity resuelve `.gemini` desde `$HOME` y no desde `SNAP_USER_COMMON`.
-
-### v1.3 — Aislamiento Real de Perfiles `HOME` (Oct 15, 2026)
-- **Funcionalidad central:** `prepare_isolated_home(alias)` inyectando `os.environ["HOME"]` por panel con token exclusivo (`0600`) y symlinks compartidos para conversaciones, `settings.json` y cuentas.
-
-### v1.4 — Soporte Preliminar Gemini 4 Argon y Actualizador (Oct 16, 2026)
-- **Funcionalidades:** Columna dedicada temporal para el despliegue inicial de Gemini 4 Argon, comando `agyc update` y wrapper `bin/agy`.
-
-### v1.5 — Esquema Oficial Antigravity 1.5.10, Planes PRO/ULTRA y Top Bar en Vivo (Nov 2026)
-- **Soporte completo `PRO` y `ULTRA`:** Detección del plan de suscripción (**Google AI Pro** vs **Google AI Ultra**) con columna dedicada `PLAN` en `agyc list` y soporte para modelos exclusivos Ultra (`Gemini 4 Carbon`).
-- **Unificación en 2 grupos oficiales de cuotas:** Alineación con Google Antigravity `1.5.10` consolidando el consumo proporcional en **Gemini Models** (`Gemini 4 Carbon`, `Argon`, `Hydrogen`, `Orchestrator`, `Gemini 3.8 Flash`) y **Claude & GPT Models** (`Claude Sonnet 4.6/5.5`, `Claude Opus 4.6/5.5`, `GPT-OSS 120B`) bajo ventanas compartidas `5H` y `Sem`.
-- **Tabla compacta de 6 columnas:** Sustitución de contadores ficticios sin gasto por el estado explícito `Disponible` al 100%, mostrando contadores reales `(4h 25m)` / `(6d 23h)` únicamente cuando hay ventana activa.
-- **Rotación selectiva `ULTRA` (`agyc auto [gemini|claude|carbon|ultra]`):** Filtrado estricto de cuentas `ULTRA` cuando se solicita `carbon`/`ultra` o cuando el modelo activo en `settings.json` es `Gemini 4 Carbon`.
-- **Ecosistema completo de Telemetría Superior e Inferior (`5H → Ctx → Sem`):** Incorporación de `agyc-titleline` (symlink a `agyc-statusline` en `"title"` de `settings.json` para Top Bar de `agy` y bordes dinámicos por panel en Herdr) y `agyc-topbar` (widget global para `ui.tab_bar_right` en Herdr), con cálculo exacto de `% Contexto` post-compactación en O(1), orden unificado `5H → Ctx → Sem` en todas las barras, caché privada segura en `~/.cache/agyc` (`0700`) y preservación del wrapper `bin/agy` en `~/.local/bin/agy`.
+- **v1.0 (Oct 13, 2026):** MVP con `switch`, lanzadores `agy01..15` y `os.execv()`.
+- **v1.1 (Oct 14, 2026):** `agyc auto` inicial y bypass de keyring vía `SSH_TTY`.
+- **v1.2 (Oct 15, 2026):** `agyc renew` y `agyc wipe`.
+- **v1.3 (Oct 15, 2026):** Aislamiento real de perfiles `HOME` en `~/.agyc_homes/<alias>`.
+- **v1.4 (Oct 16, 2026):** Wrapper `bin/agy` y actualizador integrado `agyc update`.
+- **v1.5 (Nov 2026):** Esquema oficial Antigravity `1.5.10` (`PRO`/`ULTRA`, 2 grupos unificados `Gemini` y `Claude & GPT`), cálculo exacto de `% Ctx` post-compactación y orden unificado `5H → Ctx → Sem` en `agyc-statusline`, `agyc-titleline`, bordes Herdr y `agyc-topbar`.
+- **v1.6 (Nov 2026):**
+  1. Detección en vivo de paneles activos (`EN USO` / `▶ en pX`) y anti-colisión en `agyc auto`.
+  2. Notas y reservas por cuenta (`agyc note`, `agyc lock`/`unlock`) en la segunda línea de `agyc list` manteniendo **131 columnas**.
+  3. Motor ***Reserva ULTRA + Burn-First*** en `agyc auto [--allow-ultra]` + **alerta visual y Toast único al `≤15%` en Herdr**.
+  4. Diagnóstico y auto-reparación **`agyc doctor [--fix]`** (permisos `0700`/`0600`, symlinks, deduplicación `.npm` y hooks).
+  5. Librería núcleo **`lib/agyc_core.py`** y suite de pruebas **`python3 -m unittest discover -s tests`**.

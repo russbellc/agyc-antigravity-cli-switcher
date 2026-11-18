@@ -5,12 +5,14 @@ for Antigravity CLI (agy 1.5.10+).
 
 Modes:
   - Default (`agyc-statusline`): ANSI statusline + Herdr pane.report_metadata sync
-  - Title (`agyc-statusline --title` or symlink `agyc-titleline`): plain-text OSC title line
+  - Title (`agyc-statusline --title` or symlink `agyc-titleline`): plain-text OSC title line + Herdr sync
   - Background worker (`agyc-statusline --refresh-quota-bg <alias>`): parallel unified 1.5.10 quota fetcher
 """
 
 import sys
 import os
+import pwd
+import fcntl
 import json
 import math
 import time
@@ -38,14 +40,67 @@ GOOGLE_CLIENT_SECRET = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG"[::-1]
 # Unified Antigravity 1.5.10 User-Agent
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
 
-# Real home directory (not the agy-isolated one)
-REAL_HOME = "/home/aidev"
+
+def _clean_agyc_home_path(raw: str) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s or s == "~":
+        return None
+    if "/.agyc_homes/" in s:
+        s = s.split("/.agyc_homes/", 1)[0]
+    elif s.endswith("/.agyc_homes"):
+        s = s[: -len("/.agyc_homes")]
+    s = s.rstrip("/") or "/"
+    return s if os.path.isdir(s) else None
+
+
+def resolve_real_home() -> str:
+    """Resolves real user HOME dynamically, immune to isolated ~/.agyc_homes/<alias> sessions."""
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
+        val = os.environ.get(env_key, "").strip()
+        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
+            cleaned = _clean_agyc_home_path(val)
+            if cleaned:
+                return cleaned
+    try:
+        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
+        cleaned = _clean_agyc_home_path(pw_dir)
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+    for raw in (os.environ.get("HOME", ""), os.path.expanduser("~")):
+        cleaned = _clean_agyc_home_path(raw)
+        if cleaned:
+            return cleaned
+    return "/tmp"
+
+
+REAL_HOME = resolve_real_home()
+CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
+LOCKS_DIR = os.path.join(CACHE_DIR, "locks")
 
 # Live refresh & throttle parameters
 CACHE_TTL_SECONDS = 20
 REFRESH_LOCK_SECONDS = 15
 HERDR_META_THROTTLE_SECONDS = 8
 HORIZON_5H_SECONDS = 5 * 3600 + 5 * 60  # 5h + 5m
+
+
+def ensure_cache_dir(need_locks: bool = False) -> str:
+    """Ensures ~/.cache/agyc (and optionally locks/) exists with 0700 permissions."""
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        if need_locks:
+            os.makedirs(LOCKS_DIR, mode=0o700, exist_ok=True)
+    except Exception:
+        pass
+    return CACHE_DIR
+
+
+def safe_cache_key(raw: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in raw)
 
 
 def extract_agy_alias(text: str) -> str | None:
@@ -72,7 +127,7 @@ def extract_agy_alias(text: str) -> str | None:
 
 
 def fmt_pct(frac: float | None) -> int:
-    """Exact percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
+    """Exact quota percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
     if frac is None:
         return 100
     f = max(0.0, min(1.0, float(frac)))
@@ -81,6 +136,27 @@ def fmt_pct(frac: float | None) -> int:
     if f <= 0.0:
         return 0
     return int(math.floor(f * 100.0))
+
+
+def fmt_ctx_pct(frac: float | None) -> int:
+    """Exact context percentage: 0 if <=0, 100 if >=0.9995, min(99, round(frac*100)) otherwise."""
+    if frac is None:
+        return 0
+    f = float(frac)
+    if f <= 0.0:
+        return 0
+    if f >= 0.9995:
+        return 100
+    return min(99, int(round(f * 100.0)))
+
+
+def _safe_nonneg_int(val: object) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    try:
+        return max(0, int(val))  # type: ignore[arg-type]
+    except Exception:
+        return 0
 
 
 def parse_iso_utc(ts_str: str | None) -> datetime | None:
@@ -125,11 +201,14 @@ def normalize_quota_value(
 
 def atomic_write_json(path: str, data: dict, mode: int = 0o600, indent: int | None = None) -> None:
     """Atomically writes JSON with strict permissions via .tmp.{pid} + os.replace."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
     tmp_path = f"{path}.tmp.{os.getpid()}"
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=indent)
+            json.dump(data, f, indent=indent, ensure_ascii=False)
         os.chmod(tmp_path, mode)
         os.replace(tmp_path, path)
     except Exception:
@@ -206,9 +285,8 @@ def format_countdown(reset_iso: str | None, default_val: str = "5h 00m") -> str:
 def get_account_file_path(alias: str) -> str | None:
     """Returns the path to the account JSON file, searching REAL_HOME first."""
     acc_paths = [
-        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json",
-        f"/home/aidev/.gemini/antigravity-cli/accounts/{alias}.json",
-        f"/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/{alias}.json",
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", f"{alias}.json"),
+        os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", f"{alias}.json"),
     ]
     for ap in acc_paths:
         if os.path.exists(ap):
@@ -220,7 +298,7 @@ def detect_active_account(stdin_data: dict | None = None) -> str:
     """Detects the active agyc account alias (agy01..agy15)."""
     if stdin_data and stdin_data.get("email"):
         email = str(stdin_data.get("email", "")).strip().lower()
-        accounts_dir = f"{REAL_HOME}/.gemini/antigravity-cli/accounts"
+        accounts_dir = os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts")
         if email and os.path.isdir(accounts_dir):
             try:
                 for fname in os.listdir(accounts_dir):
@@ -245,9 +323,8 @@ def detect_active_account(stdin_data: dict | None = None) -> str:
         return alias
 
     config_paths = [
-        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/config.json",
-        "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
-        "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/config.json",
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", "config.json"),
+        os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
     ]
     for cp in config_paths:
         if os.path.exists(cp):
@@ -312,24 +389,48 @@ def get_vcs_info(stdin_data: dict | None) -> tuple[str | None, bool]:
     return get_git_branch(start_dir), False
 
 
+def _token_needs_refresh(token_data: dict | None) -> bool:
+    if not isinstance(token_data, dict):
+        return True
+    token_obj = token_data.get("token")
+    if not isinstance(token_obj, dict):
+        return True
+    if not token_obj.get("access_token") or not token_obj.get("expiry"):
+        return True
+    exp_dt = parse_iso_utc(token_obj.get("expiry"))
+    return exp_dt is None or (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300
+
+
+def _sync_isolated_oauth_token(alias: str, token_data: dict) -> None:
+    """Syncs renewed OAuth token to ~/.agyc_homes/{alias}/.gemini/antigravity-cli/antigravity-oauth-token if present."""
+    if not alias or not isinstance(token_data, dict) or not token_data:
+        return
+    iso_gemini = os.path.join(REAL_HOME, ".agyc_homes", alias, ".gemini", "antigravity-cli")
+    if not os.path.isdir(iso_gemini):
+        return
+    token_dst = os.path.join(iso_gemini, "antigravity-oauth-token")
+    if os.path.islink(token_dst):
+        try:
+            os.unlink(token_dst)
+        except Exception:
+            pass
+    try:
+        atomic_write_json(token_dst, token_data, mode=0o600, indent=2)
+    except Exception:
+        pass
+
+
 def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
     """Refresh OAuth access token if expired or expiring within 5 minutes."""
     import urllib.request
     import urllib.parse
 
-    token_obj = token_data.get("token", {})
+    if not _token_needs_refresh(token_data):
+        return token_data, False
+
+    token_obj = dict(token_data.get("token") or {})
     refresh_token = token_obj.get("refresh_token")
-    expiry_str = token_obj.get("expiry")
-    needs_refresh = False
-
-    if not token_obj.get("access_token") or not expiry_str:
-        needs_refresh = True
-    else:
-        exp_dt = parse_iso_utc(expiry_str)
-        if exp_dt is None or (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300:
-            needs_refresh = True
-
-    if not needs_refresh or not refresh_token:
+    if not refresh_token:
         return token_data, False
 
     payload = urllib.parse.urlencode({
@@ -352,10 +453,11 @@ def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
             token_obj["refresh_token"] = res["refresh_token"]
         expires_in = res.get("expires_in", 3600)
         token_obj["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+        updated = dict(token_data)
         if "id_token" in res:
-            token_data["id_token"] = res["id_token"]
-        token_data["token"] = token_obj
-        return token_data, True
+            updated["id_token"] = res["id_token"]
+        updated["token"] = token_obj
+        return updated, True
     except Exception:
         return token_data, False
 
@@ -379,15 +481,34 @@ def _merge_slot(
             slot["reset"] = rst
 
 
+def _read_cached_quota_file(alias: str) -> dict | None:
+    """Reads quota cache from ~/.cache/agyc with smooth fallback to legacy /tmp file."""
+    ensure_cache_dir()
+    primary = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
+    legacy = f"/tmp/agyc_quota_cache_{alias}.json"
+    for candidate in (primary, legacy):
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    return None
+
+
 def do_fetch_and_save_quota(alias: str) -> dict | None:
     """Unified 1.5.10 quota engine (--refresh-quota-bg <alias>).
-    Queries loadCodeAssist, retrieveUserQuotaSummary, and retrieveUserQuota in parallel
-    across daily-cloudcode-pa.googleapis.com and cloudcode-pa.googleapis.com.
+    1) Refreshes OAuth under non-blocking flock (~/.cache/agyc/locks/{alias}.oauth.lock) + syncs isolated HOME token.
+    2) Queries loadCodeAssist across daily & prod to obtain project_id and accurate plan_type (ULTRA/PRO/ENT/FREE).
+    3) Queries retrieveUserQuotaSummary & retrieveUserQuota with {"project": project_id} in parallel across daily & prod.
     """
     import urllib.request
     from concurrent.futures import ThreadPoolExecutor
 
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    ensure_cache_dir(need_locks=True)
+    cache_file = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
     now_ts = time.time()
     now_dt = datetime.now(timezone.utc)
 
@@ -401,29 +522,64 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     except Exception:
         return None
 
-    if not acc_data:
+    if not isinstance(acc_data, dict) or not acc_data:
         return None
 
-    fallback_quota = acc_data.get("quota") or {}
-    token_data = acc_data.get("token_data") or {}
+    fallback_quota = acc_data.get("quota") if isinstance(acc_data.get("quota"), dict) else {}
+    token_data = acc_data.get("token_data") if isinstance(acc_data.get("token_data"), dict) else {}
 
-    token_data, refreshed = refresh_token_if_needed(token_data)
-    if refreshed:
+    if _token_needs_refresh(token_data):
+        oauth_lock_path = os.path.join(LOCKS_DIR, f"{safe_cache_key(alias)}.oauth.lock")
+        lock_fd = None
         try:
-            acc_data["token_data"] = token_data
-            acc_data["is_revoked"] = False
-            atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
-        except Exception:
-            pass
-
-    token = (token_data.get("token") or {}).get("access_token")
-    if not token:
-        if os.path.exists(cache_file):
+            lock_fd = os.open(oauth_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
             try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                os.chmod(oauth_lock_path, 0o600)
             except Exception:
                 pass
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                # Re-read account file inside lock in case another worker already refreshed it
+                try:
+                    with open(acc_path, "r", encoding="utf-8") as f:
+                        latest_on_disk = json.load(f)
+                    if isinstance(latest_on_disk, dict) and isinstance(latest_on_disk.get("token_data"), dict):
+                        acc_data = latest_on_disk
+                        token_data = latest_on_disk["token_data"]
+                except Exception:
+                    pass
+
+                if _token_needs_refresh(token_data):
+                    token_data, refreshed = refresh_token_if_needed(token_data)
+                    if refreshed:
+                        try:
+                            acc_data["token_data"] = token_data
+                            acc_data["is_revoked"] = False
+                            atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
+                        except Exception:
+                            pass
+                        _sync_isolated_oauth_token(alias, token_data)
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+        except BlockingIOError:
+            pass
+        except Exception:
+            pass
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except Exception:
+                    pass
+
+    token = (token_data.get("token") or {}).get("access_token") if isinstance(token_data, dict) else None
+    if not token:
+        existing = _read_cached_quota_file(alias)
+        if existing:
+            return existing
         return fallback_quota if fallback_quota else None
 
     hosts = ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]
@@ -435,11 +591,10 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     lca_payload = json.dumps({
         "metadata": {
             "ideType": "ANTIGRAVITY",
-            "platform": "PLATFORM_UNSPECIFIED",
+            "platform": "LINUX_AMD64",
             "pluginType": "GEMINI",
         }
     }).encode("utf-8")
-    empty_payload = b"{}"
 
     def _call_api(endpoint: str, host: str, body: bytes) -> dict | None:
         url = f"https://{host}/v1internal:{endpoint}"
@@ -450,37 +605,53 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         except Exception:
             return None
 
-    tasks = [
-        ("lca_daily", "loadCodeAssist", hosts[0], lca_payload),
-        ("lca_prod", "loadCodeAssist", hosts[1], lca_payload),
-        ("sum_daily", "retrieveUserQuotaSummary", hosts[0], empty_payload),
-        ("sum_prod", "retrieveUserQuotaSummary", hosts[1], empty_payload),
-        ("mod_daily", "retrieveUserQuota", hosts[0], empty_payload),
-        ("mod_prod", "retrieveUserQuota", hosts[1], empty_payload),
-    ]
-
-    results: dict[str, dict | None] = {}
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {
-            key: pool.submit(_call_api, ep, host, body)
-            for key, ep, host, body in tasks
+    # Phase 1: loadCodeAssist on daily & prod in parallel to resolve project_id and tier
+    lca_results: dict[str, dict | None] = {}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        lca_futs = {
+            "lca_daily": pool.submit(_call_api, "loadCodeAssist", hosts[0], lca_payload),
+            "lca_prod": pool.submit(_call_api, "loadCodeAssist", hosts[1], lca_payload),
         }
-        for key, fut in futs.items():
+        for key, fut in lca_futs.items():
             try:
-                results[key] = fut.result()
+                lca_results[key] = fut.result()
             except Exception:
-                results[key] = None
+                lca_results[key] = None
+
+    project_id: str | None = None
+    for lca_key in ("lca_prod", "lca_daily"):
+        lca = lca_results.get(lca_key)
+        if not isinstance(lca, dict):
+            continue
+        raw_proj = lca.get("cloudaicompanionProject")
+        if isinstance(raw_proj, dict) and raw_proj.get("id"):
+            project_id = str(raw_proj["id"]).strip()
+            break
+        elif isinstance(raw_proj, str) and raw_proj.strip():
+            project_id = raw_proj.strip()
+            break
+    if not project_id:
+        raw_fb_proj = acc_data.get("project_id") or fallback_quota.get("project_id")
+        if isinstance(raw_fb_proj, str) and raw_fb_proj.strip():
+            project_id = raw_fb_proj.strip()
 
     plan_type = acc_data.get("plan_type") or fallback_quota.get("plan_type")
+    tier_id = fallback_quota.get("tier_id")
+    tier_name = fallback_quota.get("tier_name")
     supports_carbon = bool(acc_data.get("supports_carbon") or fallback_quota.get("supports_carbon", False))
     has_gemini4 = bool(acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False))
 
-    for lca_key in ("lca_daily", "lca_prod"):
-        lca = results.get(lca_key)
+    for lca_key in ("lca_prod", "lca_daily"):
+        lca = lca_results.get(lca_key)
         if not isinstance(lca, dict):
             continue
-        paid_tier = lca.get("paidTier") or {}
-        curr_tier = lca.get("currentTier") or {}
+        paid_tier = lca.get("paidTier") if isinstance(lca.get("paidTier"), dict) else {}
+        curr_tier = lca.get("currentTier") if isinstance(lca.get("currentTier"), dict) else {}
+        tier_obj = paid_tier or curr_tier
+        if tier_obj.get("id"):
+            tier_id = str(tier_obj["id"])
+        if tier_obj.get("name"):
+            tier_name = str(tier_obj["name"])
         paid_str = f"{paid_tier.get('id', '')} {paid_tier.get('name', '')} {paid_tier.get('description', '')}".lower()
         curr_str = f"{curr_tier.get('id', '')} {curr_tier.get('name', '')}".lower()
         if "ultra" in paid_str or "ultra" in curr_str:
@@ -488,11 +659,39 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             supports_carbon = True
             has_gemini4 = True
             break
-        elif "pro" in paid_str or "standard" in paid_str or "pro" in curr_str:
+        elif "pro" in paid_str or "pro" in curr_str:
             plan_type = "PRO"
+            supports_carbon = False
             break
-        elif not paid_tier and "free" in curr_str:
+        elif "enterprise" in paid_str or (paid_tier and "standard" in paid_str) or "enterprise" in curr_str:
+            plan_type = "ENT"
+            supports_carbon = False
+            break
+        elif paid_tier or curr_tier:
             plan_type = "FREE"
+            supports_carbon = False
+
+    quota_payload = json.dumps({"project": project_id}).encode("utf-8") if project_id else b"{}"
+
+    # Phase 2: retrieveUserQuotaSummary & retrieveUserQuota with {"project": project_id}
+    quota_tasks = [
+        ("sum_daily", "retrieveUserQuotaSummary", hosts[0], quota_payload),
+        ("sum_prod", "retrieveUserQuotaSummary", hosts[1], quota_payload),
+        ("mod_daily", "retrieveUserQuota", hosts[0], quota_payload),
+        ("mod_prod", "retrieveUserQuota", hosts[1], quota_payload),
+    ]
+
+    results: dict[str, dict | None] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {
+            key: pool.submit(_call_api, ep, host, body)
+            for key, ep, host, body in quota_tasks
+        }
+        for key, fut in futs.items():
+            try:
+                results[key] = fut.result()
+            except Exception:
+                results[key] = None
 
     slots = {
         ("gemini", "5h"): {"frac": 1.0, "reset": None, "disabled": False},
@@ -564,7 +763,7 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             family = None
             if any(k in mid for k in ("claude", "sonnet", "opus", "haiku", "gpt")):
                 family = "claude"
-            elif ("gemini" in mid or any(k in mid for k in ("argon", "carbon", "hydrogen"))) and "image" not in mid:
+            elif ("gemini" in mid or "orchestrator" in mid or any(k in mid for k in ("argon", "carbon", "hydrogen"))) and "image" not in mid:
                 family = "gemini"
 
             if not family:
@@ -586,12 +785,9 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
             _merge_slot(slots[(family, window)], frac, rst, now_dt=now_dt, disabled=dis)
 
     if not any_quota_ok:
-        if os.path.exists(cache_file):
-            try:
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
+        existing = _read_cached_quota_file(alias)
+        if existing:
+            return existing
         return fallback_quota if fallback_quota else None
 
     g5 = slots[("gemini", "5h")]
@@ -616,8 +812,11 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     c5_frac, c5_rst, _ = normalize_quota_value(c5["frac"], c5["reset"], now_dt=now_dt, disabled=c_dis)
     cw_frac, cw_rst, _ = normalize_quota_value(cw["frac"], cw["reset"], now_dt=now_dt, disabled=c_dis)
 
-    metrics = {
+    metrics: dict = {
         "plan_type": plan_type,
+        "tier_id": tier_id,
+        "tier_name": tier_name,
+        "project_id": project_id,
         "supports_carbon": bool(supports_carbon),
         "has_gemini4": bool(has_gemini4),
         "gemini_5h_fraction": g5_frac,
@@ -647,6 +846,8 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
         latest_acc["quota"] = metrics
         if plan_type:
             latest_acc["plan_type"] = plan_type
+        if project_id:
+            latest_acc["project_id"] = project_id
         latest_acc["supports_carbon"] = bool(supports_carbon)
         latest_acc["has_gemini4"] = bool(has_gemini4)
         latest_acc["updated_at"] = metrics["fetched_at"]
@@ -659,7 +860,8 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
 
 def spawn_background_refresh(alias: str) -> None:
     """Spawns background refresh throttled by lock file (max 1 refresh per 15s)."""
-    lock_file = f"/tmp/agyc_quota_refreshing_{alias}.lock"
+    ensure_cache_dir()
+    lock_file = os.path.join(CACHE_DIR, f"quota_refreshing_{safe_cache_key(alias)}.lock")
     now_ts = time.time()
     if os.path.exists(lock_file):
         try:
@@ -681,6 +883,7 @@ def spawn_background_refresh(alias: str) -> None:
         import subprocess
         env = os.environ.copy()
         env["HOME"] = REAL_HOME
+        env["AGYC_REAL_HOME"] = REAL_HOME
         subprocess.Popen(
             [sys.executable, "-S", os.path.abspath(__file__), "--refresh-quota-bg", alias],
             stdout=subprocess.DEVNULL,
@@ -693,21 +896,31 @@ def spawn_background_refresh(alias: str) -> None:
 
 
 def fetch_online_quota(alias: str) -> dict | None:
-    """Non-blocking quota reader with 20s background refresh TTL (<2ms foreground)."""
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    """Non-blocking quota reader from ~/.cache/agyc (fallback /tmp) with 20s background refresh TTL."""
+    ensure_cache_dir()
+    primary_cache = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
+    legacy_cache = f"/tmp/agyc_quota_cache_{alias}.json"
     now_ts = time.time()
     cached = None
+    used_legacy = False
 
-    if os.path.exists(cache_file):
+    if os.path.exists(primary_cache):
         try:
-            with open(cache_file, "r", encoding="utf-8") as f:
+            with open(primary_cache, "r", encoding="utf-8") as f:
                 cached = json.load(f)
         except Exception:
-            pass
+            cached = None
+    elif os.path.exists(legacy_cache):
+        try:
+            with open(legacy_cache, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            used_legacy = True
+        except Exception:
+            cached = None
 
     if isinstance(cached, dict):
         cache_age = now_ts - float(cached.get("cached_at", 0) or 0)
-        if cache_age >= CACHE_TTL_SECONDS or "fetched_at" not in cached:
+        if used_legacy or cache_age >= CACHE_TTL_SECONDS or "fetched_at" not in cached:
             spawn_background_refresh(alias)
         return cached
 
@@ -819,7 +1032,7 @@ def merge_cached_and_stdin_quota(cached: dict | None, stdin_quota: dict | None) 
 
 
 def resolve_plan_type(quota: dict | None, account: str) -> str | None:
-    """Resolves account plan_type ('ULTRA', 'PRO', 'FREE') from cache or account file."""
+    """Resolves account plan_type ('ULTRA', 'PRO', 'ENT', 'FREE') without mislabeling FREE/unknown as PRO."""
     if quota and quota.get("plan_type"):
         return str(quota["plan_type"]).upper()
     acc_path = get_account_file_path(account)
@@ -838,32 +1051,98 @@ def resolve_plan_type(quota: dict | None, account: str) -> str | None:
 
 
 def _prettify_model_slug(raw: str) -> tuple[str, str | None]:
-    """Converts CLI model slugs (e.g. 'gemini-4-carbon-high') into clean display names."""
+    """Converts CLI model slugs (e.g. 'gemini-4-carbon-high', 'claude-opus-5-5-thinking') into clean display names."""
     s = raw.strip()
     if " " in s or "-" not in s:
         return s, None
     low = s.lower()
-    extracted_effort = None
-    for eff in ("xhigh", "high", "medium", "low", "max"):
-        if low.endswith(f"-{eff}"):
-            extracted_effort = eff
-            low = low[: -(len(eff) + 1)]
+    extracted_effort: str | None = None
+
+    # Strip trailing modifiers (-thinking, -tiered, -<effort>) in any order
+    for _ in range(4):
+        changed = False
+        if low.endswith("-tiered"):
+            low = low[:-7]
+            changed = True
+        if low.endswith("-thinking"):
+            low = low[:-9]
+            changed = True
+        for eff in ("xhigh", "high", "medium", "low", "max", "minimal"):
+            if low.endswith(f"-{eff}"):
+                if extracted_effort is None:
+                    extracted_effort = eff
+                low = low[: -(len(eff) + 1)]
+                changed = True
+                break
+        if not changed:
             break
-    if low.endswith("-tiered"):
-        low = low[:-7]
+
+    if "orchestrator" in low:
+        if "carbon" in low:
+            return "Gemini Pro Orchestrator (Carbon)", extracted_effort
+        if "argon" in low:
+            return "Gemini Pro Orchestrator (Argon)", extracted_effort
+        return "Gemini Pro Orchestrator", extracted_effort
     if "gemini-4-carbon" in low:
         return "Gemini 4 Carbon", extracted_effort
     if "gemini-4-argon" in low:
         return "Gemini 4 Argon", extracted_effort
     if "gemini-4-hydrogen" in low:
         return "Gemini 4 Hydrogen", extracted_effort
-    if "gemini-3.8-flash" in low:
+    if "gemini-3.8-flash" in low or "gemini-3-8-flash" in low:
+        if "image" in low:
+            return "Gemini 3.8 Flash Image", extracted_effort
         return "Gemini 3.8 Flash", extracted_effort
-    if "claude-opus-4-6" in low:
+    if "flash-image" in low:
+        return "Gemini Flash Image", extracted_effort
+    if "pro-image" in low:
+        return "Gemini Pro Image", extracted_effort
+    if "claude-opus-5-5" in low or "claude-opus-5.5" in low:
+        return "Claude Opus 5.5", extracted_effort
+    if "claude-sonnet-5-5" in low or "claude-sonnet-5.5" in low:
+        return "Claude Sonnet 5.5", extracted_effort
+    if "claude-opus-4-6" in low or "claude-opus-4.6" in low:
         return "Claude Opus 4.6", extracted_effort
-    if "claude-sonnet-4-6" in low:
+    if "claude-sonnet-4-6" in low or "claude-sonnet-4.6" in low:
         return "Claude Sonnet 4.6", extracted_effort
+    if "claude-haiku-4-5" in low or "claude-haiku-4.5" in low:
+        return "Claude Haiku 4.5", extracted_effort
+    if "gpt-oss-120b" in low or ("gpt-oss" in low and "120b" in low):
+        return "GPT-OSS 120B", extracted_effort
+    if "gpt-oss" in low:
+        return "GPT-OSS", extracted_effort
     return s, extracted_effort
+
+
+def default_max_tokens_for_model(model_name: str) -> int:
+    """Returns exact default context window capacity by model family."""
+    m = (model_name or "").lower()
+    if "flash-image" in m or "pro-image" in m or ("image" in m and "gemini" in m):
+        return 65_536
+    if any(k in m for k in ("gpt-oss", "120b", "gpt")):
+        return 131_072
+    if any(k in m for k in ("claude", "sonnet", "opus", "haiku")):
+        if "haiku" in m:
+            return 200_000
+        if any(v in m for v in ("4-6", "4.6", "5-5", "5.5")):
+            return 250_000
+        return 200_000
+    return 1_048_576
+
+
+def format_max_tokens_k(max_tokens: int) -> str:
+    """Formats max_tokens cleanly: 1048576 -> '1M', 131072 -> '128k', 65536 -> '64k', 250000 -> '250k'."""
+    if max_tokens >= 1_000_000:
+        if max_tokens % 1_048_576 == 0:
+            return f"{max_tokens // 1_048_576}M"
+        if max_tokens % 1_000_000 == 0:
+            return f"{max_tokens // 1_000_000}M"
+        return f"{round(max_tokens / 1_000_000, 1):g}M"
+    if max_tokens % 1024 == 0 and (max_tokens // 1024) in (32, 64, 128, 256, 512):
+        return f"{max_tokens // 1024}k"
+    if max_tokens >= 1000:
+        return f"{max_tokens // 1000}k"
+    return str(max_tokens)
 
 
 def get_model_and_effort(stdin_data: dict | None, account: str) -> tuple[str, str, str]:
@@ -912,9 +1191,8 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> tuple[str, st
         app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
         candidate_paths = [
             os.path.join(app_data, "settings.json") if app_data else "",
-            f"{REAL_HOME}/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json",
-            f"/home/aidev/.agyc_homes/{account}/.gemini/antigravity-cli/settings.json",
-            f"{REAL_HOME}/.gemini/antigravity-cli/settings.json",
+            os.path.join(REAL_HOME, ".agyc_homes", account, ".gemini", "antigravity-cli", "settings.json"),
+            os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "settings.json"),
         ]
         for cp in candidate_paths:
             if cp and os.path.exists(cp):
@@ -966,17 +1244,15 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> tuple[str, st
 
 
 def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, float, str | None, str]:
-    """Returns (frac_5h, reset_5h, frac_sem, reset_sem, label) based on active model family.
-    - Claude/GPT models -> (claude_5h, claude_5h_reset, claude_weekly, claude_weekly_reset, "Claude")
-    - ALL Gemini models (including Carbon, Argon, Hydrogen, Orchestrator, 3.8 Flash)
-      -> BOTH (gemini_5h, gemini_5h_reset, gemini_weekly, gemini_weekly_reset, "Gemini")!
-    """
-    if not quota:
-        return 1.0, None, 1.0, None, "Gemini"
-
+    """Returns (frac_5h, reset_5h, frac_sem, reset_sem, label) based on active model family."""
     m = (model_name or "").lower()
+    is_claude_family = any(k in m for k in ("claude", "sonnet", "opus", "haiku", "gpt"))
+    label = "Claude" if is_claude_family else "Gemini"
 
-    if any(k in m for k in ("claude", "sonnet", "opus", "haiku", "gpt")):
+    if not quota:
+        return 1.0, None, 1.0, None, label
+
+    if is_claude_family:
         frac_5h = quota.get("claude_5h_fraction")
         if frac_5h is None:
             frac_5h = 1.0
@@ -1018,7 +1294,7 @@ def find_parent_agy_pid() -> int | None:
                 try:
                     with open(cmd_file, "rb") as f:
                         cmd = f.read().decode("utf-8", errors="ignore")
-                    if "agy" in cmd and "statusline" not in cmd and "titleline" not in cmd:
+                    if "agy" in cmd and "statusline" not in cmd and "titleline" not in cmd and "topbar" not in cmd:
                         return pid
                 except Exception:
                     pass
@@ -1080,7 +1356,7 @@ def get_herdr_env() -> tuple[str | None, str | None]:
             cur = nxt
 
     if pane_id and not sock_path:
-        default_sock = f"{REAL_HOME}/.config/herdr/herdr.sock"
+        default_sock = os.path.join(REAL_HOME, ".config", "herdr", "herdr.sock")
         if os.path.exists(default_sock):
             sock_path = default_sock
 
@@ -1092,36 +1368,73 @@ def report_herdr_pane_metadata(
     plan_type: str | None,
     model_name: str,
     p5: int,
+    ctx_percent: int,
     ps: int,
+    allow_without_parent: bool = False,
 ) -> None:
-    """Reports live account, plan, model and quota to Herdr pane header via UNIX socket (8s throttle)."""
+    """Reports live account, plan, model and 5H -> Ctx -> Sem telemetry to Herdr pane header.
+    Uses 8s throttle in ~/.cache/agyc/herdr_meta_{safe_pane}.json with immediate bypass on
+    account/plan/model change or abs(ctx_pct - prev_ctx) >= 3.
+    """
+    if not allow_without_parent and find_parent_agy_pid() is None:
+        return
+
     sock_path, pane_id = get_herdr_env()
     if not sock_path or not pane_id or not os.path.exists(sock_path):
         return
 
-    safe_pane = "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in pane_id)
-    ts_file = f"/tmp/agyc_herdr_meta_{safe_pane}.ts"
+    ensure_cache_dir()
+    safe_pane = safe_cache_key(pane_id)
+    meta_file = os.path.join(CACHE_DIR, f"herdr_meta_{safe_pane}.json")
     now_ts = time.time()
 
-    if os.path.exists(ts_file):
+    plan_tag = (plan_type or "").strip().upper()
+    short_model = model_name.strip()
+
+    if os.path.exists(meta_file):
         try:
-            with open(ts_file, "r", encoding="utf-8") as f:
-                last_ts = float(f.read().strip())
-            if now_ts - last_ts < HERDR_META_THROTTLE_SECONDS:
-                return
+            with open(meta_file, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev, dict):
+                last_ts = float(prev.get("ts", 0) or 0)
+                same_identity = (
+                    prev.get("account") == account
+                    and prev.get("plan") == plan_tag
+                    and prev.get("model") == short_model
+                )
+                prev_ctx = prev.get("ctx_pct")
+                ctx_changed = (prev_ctx is None) or (abs(ctx_percent - int(prev_ctx)) >= 3)
+                if same_identity and not ctx_changed and (now_ts - last_ts < HERDR_META_THROTTLE_SECONDS):
+                    return
         except Exception:
             pass
 
     try:
-        fd = os.open(ts_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(str(now_ts))
+        atomic_write_json(
+            meta_file,
+            {
+                "ts": now_ts,
+                "account": account,
+                "plan": plan_tag,
+                "model": short_model,
+                "ctx_pct": ctx_percent,
+                "p5": p5,
+                "ps": ps,
+            },
+            mode=0o600,
+        )
     except Exception:
         pass
 
-    plan_tag = (plan_type or "PRO").upper()
-    short_model = model_name.strip()
     seq = int(now_ts * 1000)
+    acc_head = f"⚡ {account} [{plan_tag}]" if plan_tag else f"⚡ {account}"
+    display_agent = f"{acc_head} · {short_model} · 5H:{p5}% Ctx:{ctx_percent}% Sem:{ps}%"
+    tokens: dict[str, str | None] = {
+        "quota": f"5H:{p5}% Ctx:{ctx_percent}% Sem:{ps}%",
+        "ctx": f"{ctx_percent}%",
+        "ctx_pct": str(ctx_percent),
+        "plan": plan_tag if plan_tag else None,
+    }
 
     payload = {
         "id": f"agyc:{seq}",
@@ -1129,8 +1442,8 @@ def report_herdr_pane_metadata(
         "params": {
             "pane_id": pane_id,
             "source": "agyc",
-            "display_agent": f"⚡ {account} [{plan_tag}] · {short_model} · 5H:{p5}% Sem:{ps}%",
-            "tokens": {"quota": f"5H:{p5}% Sem:{ps}%", "plan": plan_tag},
+            "display_agent": display_agent,
+            "tokens": tokens,
             "seq": seq,
         },
     }
@@ -1190,9 +1503,9 @@ def find_active_transcript(conv_id: str | None = None, account: str = "agy01") -
 
     candidate_bases = [
         os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
-        f"{REAL_HOME}/.agyc_homes/{account}/.gemini/antigravity-cli",
+        os.path.join(REAL_HOME, ".agyc_homes", account, ".gemini", "antigravity-cli"),
         os.path.expanduser("~/.gemini/antigravity-cli"),
-        f"{REAL_HOME}/.gemini/antigravity-cli",
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli"),
     ]
 
     for base in candidate_bases:
@@ -1206,57 +1519,319 @@ def find_active_transcript(conv_id: str | None = None, account: str = "agy01") -
     return None
 
 
-def get_context_usage(stdin_data: dict | None, model_name: str = "", account: str = "agy01") -> tuple[float, int, int]:
-    """Returns (fraction, estimated_tokens, max_tokens)."""
-    m = (model_name or "").lower()
-    if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
-        max_tokens = 200_000
-    else:
-        max_tokens = 1_000_000
+def _scan_transcript_window(raw_bytes: bytes, drop_first_partial: bool, max_tokens: int) -> tuple[float, int, int] | None:
+    lines = raw_bytes.splitlines()
+    if drop_first_partial and lines:
+        lines = lines[1:]
+    trailing_chars = 0
 
-    if stdin_data:
+    for raw_line in reversed(lines):
+        line_str = raw_line.decode("utf-8", errors="ignore").strip()
+        if not line_str:
+            continue
         try:
-            ctx = stdin_data.get("context_window") or stdin_data.get("context") or {}
-            if isinstance(ctx, dict) and ctx:
-                max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
-                used_pct = ctx.get("used_percentage")
-                used = (
-                    ctx.get("total_input_tokens")
-                    or ctx.get("used_tokens")
-                    or ctx.get("total_tokens")
+            entry = json.loads(line_str)
+        except Exception:
+            trailing_chars += len(line_str)
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        etype = str(entry.get("type") or "")
+        raw_content = entry.get("content")
+        if isinstance(raw_content, str):
+            content_str = raw_content
+        elif raw_content is not None:
+            content_str = json.dumps(raw_content, ensure_ascii=False)
+        else:
+            content_str = ""
+
+        # 1. Compaction marker reached before any PLANNER_RESPONSE with token usage
+        if (
+            etype in ("CHECKPOINT", "CONTEXT_SUMMARY", "COMPACTION")
+            or "# Resuming from a compaction" in content_str
+            or "<CONTEXT_SUMMARY>" in content_str
+        ):
+            est = 16_000 + int((trailing_chars + len(content_str)) / 4.0)
+            frac = min(1.0, max(0.0, est / float(max_tokens)))
+            return (frac, est, max_tokens)
+
+        # 2. Latest PLANNER_RESPONSE with real token usage counters
+        if etype == "PLANNER_RESPONSE":
+            usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+            in_tok = entry.get("input_tokens") if entry.get("input_tokens") is not None else usage.get("input_tokens")
+            cr_tok = entry.get("cache_read_tokens")
+            if cr_tok is None:
+                cr_tok = entry.get("cache_read_input_tokens")
+            if cr_tok is None:
+                cr_tok = usage.get("cache_read_tokens")
+            if cr_tok is None:
+                cr_tok = usage.get("cache_read_input_tokens")
+            cc_tok = entry.get("cache_creation_input_tokens")
+            if cc_tok is None:
+                cc_tok = entry.get("cache_creation_tokens")
+            if cc_tok is None:
+                cc_tok = usage.get("cache_creation_input_tokens")
+            if cc_tok is None:
+                cc_tok = usage.get("cache_creation_tokens")
+            out_tok = entry.get("output_tokens") if entry.get("output_tokens") is not None else usage.get("output_tokens")
+
+            if in_tok is not None or cr_tok is not None:
+                est = (
+                    _safe_nonneg_int(in_tok)
+                    + _safe_nonneg_int(cr_tok)
+                    + _safe_nonneg_int(cc_tok)
+                    + _safe_nonneg_int(out_tok)
+                    + int(trailing_chars / 4.0)
                 )
-                if used is not None and max_t:
-                    frac = min(1.0, float(used) / float(max_t))
-                    return (frac, int(used), int(max_t))
-                elif used_pct is not None and max_t:
-                    frac = min(1.0, float(used_pct) / 100.0)
-                    used_t = int(round(frac * float(max_t)))
-                    return (frac, used_t, int(max_t))
+                frac = min(1.0, max(0.0, est / float(max_tokens)))
+                return (frac, est, max_tokens)
+
+        step_chars = len(content_str)
+        if entry.get("tool_calls"):
+            try:
+                step_chars += len(json.dumps(entry["tool_calls"], ensure_ascii=False))
+            except Exception:
+                pass
+        trailing_chars += step_chars
+
+    return None
+
+
+def estimate_context_from_transcript(transcript_path: str, max_tokens: int) -> tuple[float, int, int]:
+    """O(1) tail context estimator from EOF (128 KB -> 512 KB -> post-CHECKPOINT legacy fallback).
+    Never uses pre-compaction full file size.
+    """
+    if max_tokens <= 0:
+        max_tokens = 1_048_576
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return (0.0, 0, max_tokens)
+
+    try:
+        file_size = os.path.getsize(transcript_path)
+    except Exception:
+        return (0.0, 0, max_tokens)
+
+    if file_size <= 0:
+        return (0.0, 0, max_tokens)
+
+    try:
+        with open(transcript_path, "rb") as f:
+            for win_bytes in (131_072, 524_288):
+                offset = max(0, file_size - win_bytes)
+                f.seek(offset)
+                buf = f.read(file_size - offset)
+                res = _scan_transcript_window(buf, drop_first_partial=(offset > 0), max_tokens=max_tokens)
+                if res is not None:
+                    return res
+                if offset == 0:
+                    break
+
+            # Legacy fallback: bytes after the last CHECKPOINT / compaction marker divided by 4
+            chunk_size = 1_048_576
+            pos = file_size
+            overlap = b""
+            markers = (b'"CHECKPOINT"', b'"CONTEXT_SUMMARY"', b'"COMPACTION"', b"# Resuming from a compaction", b"<CONTEXT_SUMMARY>")
+            while pos > 0:
+                read_start = max(0, pos - chunk_size)
+                f.seek(read_start)
+                chunk = f.read(pos - read_start)
+                search_buf = chunk + overlap
+                best_idx = -1
+                for mk in markers:
+                    idx = search_buf.rfind(mk)
+                    if idx > best_idx:
+                        best_idx = idx
+                if best_idx != -1:
+                    nl_idx = search_buf.rfind(b"\n", 0, best_idx)
+                    line_offset = read_start + (nl_idx + 1 if nl_idx != -1 else 0)
+                    bytes_after = max(0, file_size - line_offset)
+                    est = int(bytes_after / 4.0)
+                    frac = min(1.0, max(0.0, est / float(max_tokens)))
+                    return (frac, est, max_tokens)
+                overlap = chunk[:128]
+                pos = read_start
+    except Exception:
+        return (0.0, 0, max_tokens)
+
+    # Uncompacted small legacy transcript with no token counters and no CHECKPOINT
+    est = int(file_size / 4.0)
+    frac = min(1.0, max(0.0, est / float(max_tokens)))
+    return (frac, est, max_tokens)
+
+
+def resolve_conv_and_transcript(stdin_data: dict | None, account: str = "agy01") -> tuple[str | None, str | None]:
+    """Resolves (conv_id, transcript_path) with minimal overhead."""
+    conv_id: str | None = None
+    transcript_path: str | None = None
+
+    if isinstance(stdin_data, dict):
+        raw_cid = stdin_data.get("conversation_id") or stdin_data.get("session_id")
+        if isinstance(raw_cid, str) and raw_cid.strip():
+            conv_id = raw_cid.strip()
+        raw_tp = stdin_data.get("transcript_path")
+        if isinstance(raw_tp, str) and raw_tp.strip() and os.path.isfile(raw_tp.strip()):
+            transcript_path = raw_tp.strip()
+
+    if not conv_id:
+        conv_id = get_session_conv_id()
+
+    if not transcript_path and conv_id:
+        transcript_path = find_active_transcript(conv_id, account=account)
+
+    return conv_id, transcript_path
+
+
+def get_context_usage(
+    stdin_data: dict | None,
+    model_name: str = "",
+    account: str = "agy01",
+    transcript_path: str | None = None,
+) -> tuple[float, int, int]:
+    """Returns (fraction, used_tokens, max_tokens) with exact current_usage + O(1) transcript fallback."""
+    default_max = default_max_tokens_for_model(model_name)
+    ctx = None
+    if isinstance(stdin_data, dict):
+        raw_ctx = stdin_data.get("context_window")
+        if not isinstance(raw_ctx, dict):
+            raw_ctx = stdin_data.get("context")
+        if isinstance(raw_ctx, dict):
+            ctx = raw_ctx
+
+    max_t = default_max
+    if isinstance(ctx, dict):
+        raw_max = ctx.get("context_window_size")
+        if raw_max is None:
+            raw_max = ctx.get("max_tokens")
+        parsed_max = _safe_nonneg_int(raw_max)
+        if parsed_max > 0:
+            max_t = parsed_max
+
+    # Priority 1: Live CascadeState current_usage dict (never cumulative total_output_tokens / total_input_tokens)
+    if isinstance(ctx, dict) and isinstance(ctx.get("current_usage"), dict):
+        cu = ctx["current_usage"]
+        cu_in = _safe_nonneg_int(cu.get("input_tokens"))
+        cu_cc = _safe_nonneg_int(
+            cu.get("cache_creation_input_tokens")
+            if cu.get("cache_creation_input_tokens") is not None
+            else cu.get("cache_creation_tokens")
+        )
+        cu_cr = _safe_nonneg_int(
+            cu.get("cache_read_input_tokens")
+            if cu.get("cache_read_input_tokens") is not None
+            else cu.get("cache_read_tokens")
+        )
+        cu_out = _safe_nonneg_int(cu.get("output_tokens"))
+        cu_tokens = cu_in + cu_cc + cu_cr + cu_out
+
+        raw_pct = ctx.get("used_percentage")
+        pct_val: float | None = None
+        if raw_pct is not None and not isinstance(raw_pct, bool):
+            try:
+                cand_pct = float(raw_pct)
+                if 0.0 <= cand_pct <= 100.0:
+                    pct_val = cand_pct
+            except Exception:
+                pct_val = None
+
+        if pct_val is not None:
+            pct_tokens = int(round((pct_val / 100.0) * max_t))
+            if cu_tokens == 0:
+                frac = min(1.0, max(0.0, pct_val / 100.0))
+                return (frac, pct_tokens, max_t)
+            # Respect post-compaction or multi-call intra-turn sum when used_percentage is < 60% of cu_tokens
+            if cu_tokens >= max(16_384, int(max_t * 0.02)) and pct_tokens < cu_tokens * 0.6:
+                frac = min(1.0, max(0.0, pct_val / 100.0))
+                return (frac, pct_tokens, max_t)
+            # Respect intra-turn growth if used_percentage exceeds cu_tokens beyond rounding tolerance
+            if pct_tokens > cu_tokens + max(2_048, int(max_t * 0.01)):
+                frac = min(1.0, max(0.0, pct_val / 100.0))
+                return (frac, pct_tokens, max_t)
+
+        frac = min(1.0, max(0.0, cu_tokens / float(max_t)))
+        return (frac, cu_tokens, max_t)
+
+    # Priority 2: current_usage is None (reopened session with CascadeState == nil or no stdin_data)
+    if not transcript_path:
+        _, transcript_path = resolve_conv_and_transcript(stdin_data, account=account)
+
+    if transcript_path and os.path.isfile(transcript_path):
+        return estimate_context_from_transcript(transcript_path, max_t)
+
+    if isinstance(ctx, dict):
+        raw_pct = ctx.get("used_percentage")
+        if raw_pct is not None and not isinstance(raw_pct, bool):
+            try:
+                cand_pct = float(raw_pct)
+                if 0.0 < cand_pct <= 100.0:
+                    frac = min(1.0, cand_pct / 100.0)
+                    return (frac, int(round(frac * max_t)), max_t)
+            except Exception:
+                pass
+        tot_in = ctx.get("total_input_tokens")
+        if tot_in is None or _safe_nonneg_int(tot_in) == 0:
+            return (0.0, 0, max_t)
+
+    return (0.0, 0, max_t)
+
+
+def persist_pane_context(
+    pane_id: str | None,
+    conv_id: str | None,
+    account: str,
+    plan_type: str | None,
+    model_name: str,
+    effort: str,
+    family: str,
+    ctx_frac: float,
+    ctx_pct: int,
+    ctx_tokens: int,
+    ctx_max: int,
+    transcript_path: str | None,
+    allow_without_parent: bool = False,
+) -> None:
+    """Atomically persists live context snapshot (0600) in ~/.cache/agyc/pane_ctx_{pane|conv}.json."""
+    if not pane_id and not conv_id:
+        return
+    if not allow_without_parent and not conv_id and find_parent_agy_pid() is None:
+        return
+
+    ensure_cache_dir()
+    payload = {
+        "pane_id": pane_id,
+        "conv_id": conv_id,
+        "account": account,
+        "plan": plan_type,
+        "model": model_name,
+        "effort": effort,
+        "family": family,
+        "ctx_frac": round(float(ctx_frac), 6),
+        "ctx_pct": int(ctx_pct),
+        "ctx_tokens": int(ctx_tokens),
+        "ctx_max": int(ctx_max),
+        "transcript_path": transcript_path,
+        "updated_at": time.time(),
+    }
+
+    if pane_id:
+        try:
+            atomic_write_json(
+                os.path.join(CACHE_DIR, f"pane_ctx_{safe_cache_key(pane_id)}.json"),
+                payload,
+                mode=0o600,
+            )
         except Exception:
             pass
 
-    conv_id = None
-    if stdin_data:
-        conv_id = stdin_data.get("conversation_id") or stdin_data.get("session_id")
-    if not conv_id:
-        conv_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-
-    transcript_path = None
-    if stdin_data and stdin_data.get("transcript_path"):
-        tp = str(stdin_data.get("transcript_path"))
-        if os.path.exists(tp):
-            transcript_path = tp
-
-    if not transcript_path:
-        transcript_path = find_active_transcript(conv_id, account=account)
-
-    if transcript_path and os.path.exists(transcript_path):
-        size_bytes = os.path.getsize(transcript_path)
-        estimated_tokens = int(size_bytes / 4.0)
-        fraction = min(1.0, estimated_tokens / float(max_tokens))
-        return (fraction, estimated_tokens, max_tokens)
-
-    return (0.0, 0, max_tokens)
+    if conv_id:
+        try:
+            atomic_write_json(
+                os.path.join(CACHE_DIR, f"pane_ctx_{safe_cache_key(conv_id)}.json"),
+                payload,
+                mode=0o600,
+            )
+        except Exception:
+            pass
 
 
 def read_stdin_json(max_wait_sec: float = 0.020) -> dict | None:
@@ -1326,6 +1901,7 @@ def build_account_badge(account: str, plan_type: str | None) -> str:
 def main() -> None:
     is_title_mode = ("--title" in sys.argv[1:]) or (os.path.basename(sys.argv[0]) == "agyc-titleline")
     stdin_data = read_stdin_json(0.020)
+    has_stdin = isinstance(stdin_data, dict)
 
     # 1. Active Account
     account = detect_active_account(stdin_data)
@@ -1335,29 +1911,61 @@ def main() -> None:
 
     # 3. Quota (always read cached 20s TTL + merge stdin_quota in memory only, NEVER overwriting disk!)
     cached_quota = fetch_online_quota(account)
-    stdin_quota = stdin_data.get("quota") if isinstance(stdin_data, dict) else None
+    stdin_quota = stdin_data.get("quota") if has_stdin else None
     quota = merge_cached_and_stdin_quota(cached_quota, stdin_quota)
 
     plan_type = resolve_plan_type(quota, account)
-    f5, r5, fs, rs, _ = get_quota_for_model(quota, model_name)
+    f5, r5, fs, rs, family = get_quota_for_model(quota, model_name)
     p5 = fmt_pct(f5)
     ps = fmt_pct(fs)
 
-    # 4. Context Usage
-    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name, account=account)
-    ctx_percent = int(round(ctx_frac * 100))
+    # 4. Context Usage + Persistence BEFORE is_title_mode branch
+    conv_id, transcript_path = resolve_conv_and_transcript(stdin_data, account=account)
+    ctx_frac, ctx_tokens, ctx_max = get_context_usage(
+        stdin_data,
+        model_name,
+        account=account,
+        transcript_path=transcript_path,
+    )
+    ctx_percent = fmt_ctx_pct(ctx_frac)
 
-    # 5. Titleline Mode (--title or agyc-titleline): plain text without ANSI codes
+    _, pane_id = get_herdr_env()
+    persist_pane_context(
+        pane_id=pane_id,
+        conv_id=conv_id,
+        account=account,
+        plan_type=plan_type,
+        model_name=model_name,
+        effort=effort,
+        family=family,
+        ctx_frac=ctx_frac,
+        ctx_pct=ctx_percent,
+        ctx_tokens=ctx_tokens,
+        ctx_max=ctx_max,
+        transcript_path=transcript_path,
+        allow_without_parent=has_stdin,
+    )
+
+    # 5. Titleline Mode (--title or agyc-titleline): plain text without ANSI codes (5H -> Ctx -> Sem)
     if is_title_mode:
         acc_part = f"⚡ {account} [{plan_type}]" if plan_type else f"⚡ {account}"
         model_part = f"{model_name} ({effort})"
         part_5h = f"5H: {p5}%" if (p5 >= 100 or not r5) else f"5H: {p5}% ({format_countdown(r5)})"
-        part_sem = f"Sem: {ps}%" if (ps >= 100 or not rs) else f"Sem: {ps}% ({format_countdown(rs, default_val='7d 00h')})"
         ctx_part = f"Ctx: {ctx_percent}%"
-        print(" · ".join([acc_part, model_part, part_5h, part_sem, ctx_part]))
+        part_sem = f"Sem: {ps}%" if (ps >= 100 or not rs) else f"Sem: {ps}% ({format_countdown(rs, default_val='7d 00h')})"
+        print(" · ".join([acc_part, model_part, part_5h, ctx_part, part_sem]), flush=True)
+        report_herdr_pane_metadata(
+            account,
+            plan_type,
+            model_name,
+            p5,
+            ctx_percent,
+            ps,
+            allow_without_parent=has_stdin,
+        )
         sys.exit(0)
 
-    # 6. Normal ANSI Statusline Mode
+    # 6. Normal ANSI Statusline Mode (5H -> Ctx -> Sem)
     acc_badge = build_account_badge(account, plan_type)
 
     branch, is_dirty = get_vcs_info(stdin_data)
@@ -1374,6 +1982,11 @@ def main() -> None:
     else:
         str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
 
+    ctx_bar = make_context_linebar(ctx_frac, length=8)
+    tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)
+    max_k = format_max_tokens_k(ctx_max)
+    ctx_badge = f"{C_BLUE}Ctx:{C_RESET} {ctx_bar} {C_BOLD}{ctx_percent}%{C_RESET} {C_DIM}({tokens_k}/{max_k}){C_RESET}"
+
     cs = C_GREEN if ps >= 50 else (C_YELLOW if ps >= 20 else C_RED)
     bar_s = make_linebar(fs, length=8)
     if ps >= 100 or not rs:
@@ -1382,27 +1995,31 @@ def main() -> None:
         cd_s = format_countdown(rs, default_val="7d 00h")
         str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET} {C_DIM}({cd_s}){C_RESET}"
 
-    ctx_bar = make_context_linebar(ctx_frac, length=8)
-    tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)
-    max_k = f"{ctx_max // 1_000_000}M" if ctx_max >= 1_000_000 else f"{ctx_max // 1000}k"
-    ctx_badge = f"{C_BLUE}Ctx:{C_RESET} {ctx_bar} {C_BOLD}{ctx_percent}%{C_RESET} {C_DIM}({tokens_k}/{max_k}){C_RESET}"
-
     sep = f" {C_GRAY}│{C_RESET} "
     parts = [acc_badge]
     if branch_badge:
         parts.append(branch_badge)
-    parts.extend([model_badge, str_5h, str_sem, ctx_badge])
+    parts.extend([model_badge, str_5h, ctx_badge, str_sem])
 
-    print(sep.join(parts))
+    print(sep.join(parts), flush=True)
 
-    # 7. Sync metadata with Herdr pane top bar (zero subprocesses, 8s throttle, 50ms socket timeout)
-    report_herdr_pane_metadata(account, plan_type, model_name, p5, ps)
+    # 7. Sync metadata with Herdr pane top bar (8s throttle with bypass on model/account/ctx>=3% delta)
+    report_herdr_pane_metadata(
+        account,
+        plan_type,
+        model_name,
+        p5,
+        ctx_percent,
+        ps,
+        allow_without_parent=has_stdin,
+    )
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--refresh-quota-bg":
         alias = sys.argv[2]
         os.environ["HOME"] = REAL_HOME
+        os.environ["AGYC_REAL_HOME"] = REAL_HOME
         do_fetch_and_save_quota(alias)
         sys.exit(0)
     main()

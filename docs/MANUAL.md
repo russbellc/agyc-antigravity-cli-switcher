@@ -238,7 +238,7 @@ agy update                 # Interceptado por el wrapper bin/agy → delega a ag
 
 ## 6. Visualización de Consumo en Vivo: Pie y Barra Superior (Top Bar)
 
-`agyc v1.5` integra monitoreo continuo de consumo sin tener que salir de Antigravity ni ejecutar comandos manuales, cubriendo tanto el **pie de terminal** como la **Barra Superior (Top Bar)**.
+`agyc v1.5` integra monitoreo continuo de cuotas y ventana de contexto real (cálculo exacto desde `current_usage` + estimación O(1) desde el final de `transcript.jsonl` respetando compactaciones `CHECKPOINT`), manteniendo el **orden unificado `5H → Ctx → Sem`** tanto en el **pie de terminal** como en todas las superficies de **Barra Superior (Top Bar)** y almacenando cachés/locks con permisos estrictos en `~/.cache/agyc` (`0700`).
 
 ### 6.1 Pie de `agy` (`agyc-statusline`)
 
@@ -252,14 +252,21 @@ Configurado en `~/.gemini/antigravity-cli/settings.json` bajo la clave `"statusL
 }
 ```
 
-Renderiza en la parte inferior de la sesión interactiva de `agy`:
-- Alias activo y badge de suscripción (`agy01 ULTRA` / `agy02 PRO`).
+Renderiza en la parte inferior de la sesión interactiva de `agy` siguiendo el orden **`5H → Ctx → Sem`**:
+- Alias activo y badge de suscripción (`agy01·ULTRA` / `agy02·PRO`).
 - Rama Git actual del proyecto (lectura directa ultrarrápida desde `.git/HEAD`).
-- Modelo activo y nivel de esfuerzo (`Gemini 4 Carbon (High)`, `Claude Sonnet 5.5`, etc.).
-- Barra de progreso coloreada y cuenta regresiva (`5H` y `Sem`) del grupo de cuota correspondiente al modelo en curso.
-- Consumo de ventana de contexto de la conversación (`Ctx` con barra de color invertida: verde <50%, amarillo <75%, naranja <85%, rojo ≥85%).
+- Modelo activo y nivel de esfuerzo (`Gemini 4 Carbon (high)`, `Claude Sonnet 5.5 (high)`, `GPT-OSS 120B (medium)`, etc.).
+- Ventana móvil `5H` coloreada con cuenta regresiva activa.
+- Consumo real de ventana de contexto (`Ctx` con barra de color invertida: verde <50%, amarillo <75%, naranja <85%, rojo ≥85%, mostrando techos exactos `1M`, `250k`, `200k`, `128k` o `64k`).
+- Ventana `Sem` coloreada con cuenta regresiva semanal activa.
 
-### 6.2 Barra Superior (Top Bar) en `agy` y Metadatos por Panel en Herdr (`agyc-titleline` + `pane.report_metadata`)
+Ejemplo visual:
+
+```text
+⚡ agy01·ULTRA │ 🌿 main │ 🤖 Gemini 4 Carbon (high) │ 5H: [███████░] 91% (⏳ 3h 15m) │ Ctx: [███░░░░░] 36% (376k/1M) │ Sem: [████████] 97% (6d 21h)
+```
+
+### 6.2 Barra Superior (Top Bar) en `agy` y Borde por Panel en Herdr (`agyc-titleline` + `pane.report_metadata`)
 
 Antigravity CLI `1.5.10` soporta un generador dinámico de título de terminal mediante la clave `"title"` en `settings.json` (controlable también con el slash command `/title on` y `/title off`).
 
@@ -274,12 +281,31 @@ Antigravity CLI `1.5.10` soporta un generador dinámico de título de terminal m
 ```
 
 De forma combinada:
-- Cuando `agy` invoca `agyc-titleline` (o `agyc-statusline --title`), emite la línea OSC de texto limpio para la **Barra Superior de la ventana / pestaña** con alias, plan, modelo y porcentaje `5H`/`Sem`.
-- En **Herdr**, `agyc-statusline` sincroniza además los **metadatos dinámicos de cada panel** (`pane.report_metadata`), permitiendo identificar de un vistazo qué cuenta (`agy01 ULTRA`, `agy02 PRO`, etc.) y cuánto saldo queda en cada panel dividido sin cambiar el foco.
+- Cuando `agy` invoca `agyc-titleline` (o `agyc-statusline --title`), emite la línea OSC de texto limpio para la **Barra Superior de la ventana / pestaña** en orden **`5H → Ctx → Sem`**:
+
+```text
+⚡ agy01 [ULTRA] · Gemini 4 Carbon (high) · 5H: 91% (3h 15m) · Ctx: 36% · Sem: 97% (6d 21h)
+```
+
+- En **Herdr**, tanto `agyc-statusline` como `agyc-titleline` sincronizan los **metadatos dinámicos del borde superior de cada panel** (`pane.report_metadata`, con bypass inmediato de throttle si cambia la cuenta, el modelo o `ΔCtx ≥ 3%`), permitiendo ver cuenta, plan, modelo y **`5H → Ctx → Sem`** en cada panel dividido sin cambiar el foco:
+
+```text
+⚡ agy01 [ULTRA] · Gemini 4 Carbon · 5H:91% Ctx:36% Sem:97%
+```
 
 ### 6.3 Barra Superior Derecha Global en Herdr (`agyc-topbar`)
 
-Además de los metadatos individuales por panel, `agyc v1.5` incluye el widget ultraligero **`agyc-topbar`** (<20ms, sin bloqueo, instalado en `~/.local/bin/agyc-topbar` y `~/.gemini/antigravity-cli/bin/agyc-topbar`) diseñado para la zona derecha de la barra global de pestañas de Herdr (`ui.tab_bar_right`). Detecta automáticamente la cuenta activa del panel enfocado (o de la pestaña actual / cuenta activa por defecto) y renderiza en vivo las cuotas `5H` y `Sem` de Gemini y Claude.
+Además de los bordes individuales por panel, `agyc v1.5` incluye el widget ultraligero **`agyc-topbar`** (<20ms, sin bloqueo, instalado en `~/.local/bin/agyc-topbar` y `~/.gemini/antigravity-cli/bin/agyc-topbar`) diseñado para la zona derecha de la barra global de pestañas de Herdr (`ui.tab_bar_right`). Detecta automáticamente el panel `agy` activo (panel enfocado → panel principal de la pestaña actual → cuenta activa por defecto), carga su `% Ctx` persistido o estimado en `<1ms` desde `transcript.jsonl`, e inserta **`Ctx: XX%` entre `5H` y `Sem`** en la familia activa (`Gemini` o `Claude`):
+
+```text
+⚡ agy01 [ULTRA] │ Gemini 5H: 91% (3h15m) · Ctx: 36% · Sem: 97% (6d21h) │ Claude 5H: 100% · Sem: 100%
+```
+
+Si el panel enfocado trabaja con un modelo de la familia Claude & GPT (`Claude Opus 5.5`, `Claude Sonnet 5.5`, `GPT-OSS 120B`), `Ctx:` aparece en el segmento `Claude`:
+
+```text
+⚡ agy02 [PRO] │ Gemini 5H: 100% · Sem: 100% │ Claude 5H: 60% (4h25m) · Ctx: 24% · Sem: 50% (6d23h)
+```
 
 Para activarlo en `~/.config/herdr/config.toml`:
 
@@ -291,7 +317,7 @@ interval_seconds = 5
 timeout_seconds = 2
 ```
 
-De esta forma, la esquina superior derecha de Herdr muestra permanentemente el resumen consolidado de la cuenta activa, su plan (`PRO`/`ULTRA`) y los porcentajes `5H`/`Sem` de los 2 grupos unificados incluso cuando estás trabajando en un panel de código, logs o terminal Bash fuera de `agy`.
+De esta forma, la esquina superior derecha de Herdr muestra permanentemente la cuenta activa, su plan (`PRO`/`ULTRA`), el `% Ctx` real del panel activo y los porcentajes `5H`/`Sem` con sus cuentas regresivas incluso cuando estás trabajando en un panel auxiliar de logs o Bash dentro de la misma pestaña.
 
 ---
 
@@ -493,4 +519,4 @@ agy update       # atajo interceptado por el wrapper ~/.local/bin/agy
 - **Unificación en 2 grupos oficiales de cuotas:** Alineación con Google Antigravity `1.5.10` consolidando el consumo proporcional en **Gemini Models** (`Gemini 4 Carbon`, `Argon`, `Hydrogen`, `Orchestrator`, `Gemini 3.8 Flash`) y **Claude & GPT Models** (`Claude Sonnet 4.6/5.5`, `Claude Opus 4.6/5.5`, `GPT-OSS 120B`) bajo ventanas compartidas `5H` y `Sem`.
 - **Tabla compacta de 6 columnas:** Sustitución de contadores ficticios sin gasto por el estado explícito `Disponible` al 100%, mostrando contadores reales `(4h 25m)` / `(6d 23h)` únicamente cuando hay ventana activa.
 - **Rotación selectiva `ULTRA` (`agyc auto [gemini|claude|carbon|ultra]`):** Filtrado estricto de cuentas `ULTRA` cuando se solicita `carbon`/`ultra` o cuando el modelo activo en `settings.json` es `Gemini 4 Carbon`.
-- **Ecosistema completo de Telemetría Superior e Inferior:** Incorporación de `agyc-titleline` (symlink a `agyc-statusline` en `"title"` de `settings.json` para Top Bar de `agy` y metadatos dinámicos por panel en Herdr) y `agyc-topbar` (widget global para `ui.tab_bar_right` en Herdr), preservando siempre el wrapper `bin/agy` en `~/.local/bin/agy`.
+- **Ecosistema completo de Telemetría Superior e Inferior (`5H → Ctx → Sem`):** Incorporación de `agyc-titleline` (symlink a `agyc-statusline` en `"title"` de `settings.json` para Top Bar de `agy` y bordes dinámicos por panel en Herdr) y `agyc-topbar` (widget global para `ui.tab_bar_right` en Herdr), con cálculo exacto de `% Contexto` post-compactación en O(1), orden unificado `5H → Ctx → Sem` en todas las barras, caché privada segura en `~/.cache/agyc` (`0700`) y preservación del wrapper `bin/agy` en `~/.local/bin/agy`.

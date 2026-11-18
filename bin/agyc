@@ -17,11 +17,18 @@ Características:
 import sys
 import os
 import re
+import pwd
 import glob
 import math
 import json
 import time
+import hmac
+import html
+import fcntl
 import base64
+import hashlib
+import secrets
+import tempfile
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -36,6 +43,61 @@ from datetime import datetime, timezone, timedelta
 
 # Expresión regular para quitar secuencias de escape ANSI
 ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*m")
+
+# Validación estricta anti-traversal para alias de cuentas
+ALIAS_REGEX = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+RESERVED_ALIASES = {
+    "config",
+    "agy",
+    "agi",
+    "agyc",
+    "agy-real",
+    "agyc-statusline",
+    "agyc-titleline",
+    "agyc-topbar",
+    "list",
+    "switch",
+    "use",
+    "default",
+    "set-default",
+    "add",
+    "renew",
+    "reauth",
+    "login",
+    "capture",
+    "import-current",
+    "remove",
+    "rm",
+    "quota",
+    "auto",
+    "lock",
+    "unlock",
+    "wipe",
+    "clean",
+    "purge",
+    "update",
+    "upgrade",
+    "help",
+}
+
+SAFE_QUOTA_KEYS = (
+    "gemini_5h_fraction",
+    "gemini_5h_reset",
+    "gemini_weekly_fraction",
+    "gemini_weekly_reset",
+    "gemini_disabled",
+    "claude_5h_fraction",
+    "claude_5h_reset",
+    "claude_weekly_fraction",
+    "claude_weekly_reset",
+    "claude_disabled",
+    "plan_type",
+    "tier_id",
+    "tier_name",
+    "supports_carbon",
+    "fetched_at",
+    "cached_at",
+)
 
 
 def strip_ansi(s: str) -> str:
@@ -59,23 +121,39 @@ def pad_visible(s: str, width: int, align: str = "left") -> str:
         return s + (" " * pad)
 
 
+def _strip_agyc_homes(path: str) -> str:
+    p = (path or "").strip()
+    if "/.agyc_homes/" in p:
+        p = p.split("/.agyc_homes/")[0]
+    elif p.endswith("/.agyc_homes"):
+        p = p[: -len("/.agyc_homes")]
+    return p.rstrip("/") or "/"
+
+
 def resolve_real_home() -> str:
-    """Resuelve el HOME real del usuario, inmune a sesiones con HOME aislado en ~/.agyc_homes/."""
+    """Resuelve el HOME real del usuario dinámicamente, inmune a sesiones con HOME aislado en ~/.agyc_homes/."""
     for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
         val = os.environ.get(env_key, "").strip()
-        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
-            return val.rstrip("/") or "/"
+        if val:
+            cleaned = _strip_agyc_homes(val)
+            if cleaned and os.path.isdir(cleaned):
+                return cleaned
     expanded = os.path.expanduser("~")
-    if "/.agyc_homes/" in expanded:
-        prefix = expanded.split("/.agyc_homes/")[0]
-        if prefix:
-            return prefix
-    if expanded and expanded != "~" and "/.agyc_homes" not in expanded and os.path.isdir(expanded):
-        return expanded.rstrip("/") or "/"
-    return "/home/aidev"
+    if expanded and expanded != "~":
+        cleaned_exp = _strip_agyc_homes(expanded)
+        if cleaned_exp and os.path.isdir(cleaned_exp):
+            return cleaned_exp
+    try:
+        pw_dir = _strip_agyc_homes(pwd.getpwuid(os.getuid()).pw_dir)
+        if pw_dir and os.path.isdir(pw_dir):
+            return pw_dir
+    except Exception:
+        pass
+    return "/tmp"
 
 
 REAL_HOME = resolve_real_home()
+CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
 
 # User-Agent oficial Antigravity 1.5.10 que habilita ambos grupos unificados en CloudCode PA
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
@@ -117,15 +195,50 @@ def normalize_alias(alias: str | None) -> str | None:
     return alias.strip()
 
 
+def validate_alias(alias: str | None) -> str:
+    """Valida el alias contra path traversal y nombres reservados."""
+    norm = normalize_alias(alias)
+    if (
+        not norm
+        or ".." in norm
+        or "/" in norm
+        or "\\" in norm
+        or not ALIAS_REGEX.match(norm)
+    ):
+        raise ValueError(
+            f"Alias inválido '{alias}': debe cumplir ^[a-zA-Z0-9_-]{{1,32}}$ (sin '..' ni '/')."
+        )
+    if norm.lower() in RESERVED_ALIASES:
+        raise ValueError(
+            f"El alias '{norm}' está reservado por el sistema. Usa otro nombre (ej. agy01, work)."
+        )
+    return norm
+
+
+def _ensure_private_dir(path: str, mode: int = 0o700) -> str:
+    os.makedirs(path, mode=mode, exist_ok=True)
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+    return path
+
+
+def get_cache_dir() -> str:
+    return _ensure_private_dir(os.path.join(resolve_real_home(), ".cache", "agyc"), 0o700)
+
+
+def get_locks_dir() -> str:
+    return _ensure_private_dir(os.path.join(get_cache_dir(), "locks"), 0o700)
+
+
 def get_base_dir() -> str:
     real_home = resolve_real_home()
     candidates = [
         os.environ.get("ANTIGRAVITY_HOME"),
         os.environ.get("AGY_CONFIG_DIR"),
         os.path.join(real_home, ".gemini", "antigravity-cli"),
-        "/home/aidev/.gemini/antigravity-cli",
         os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
-        "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli",
     ]
     for c in candidates:
         if c and "/.agyc_homes/" not in c and not c.endswith("/.agyc_homes") and os.path.exists(c):
@@ -144,8 +257,7 @@ def get_bin_dir() -> str:
 def get_accounts_dir() -> str:
     base = get_base_dir()
     d = os.path.join(base, "accounts")
-    os.makedirs(d, exist_ok=True)
-    return d
+    return _ensure_private_dir(d, 0o700)
 
 
 def get_active_token_path() -> str:
@@ -189,11 +301,15 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    _atomic_write_json(get_config_path(), cfg, indent=2)
+    _atomic_write_json(get_config_path(), cfg, mode=0o600, indent=2)
 
 
 def load_account(alias: str) -> dict | None:
-    p = os.path.join(get_accounts_dir(), f"{alias}.json")
+    try:
+        safe_alias = validate_alias(alias)
+    except ValueError:
+        return None
+    p = os.path.join(get_accounts_dir(), f"{safe_alias}.json")
     if os.path.exists(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
@@ -206,7 +322,11 @@ def load_account(alias: str) -> dict | None:
 def _sync_isolated_token_if_present(alias: str, token_data: dict | None):
     if not alias or not isinstance(token_data, dict) or not token_data:
         return
-    iso_gemini = os.path.join(resolve_real_home(), ".agyc_homes", alias, ".gemini", "antigravity-cli")
+    try:
+        safe_alias = validate_alias(alias)
+    except ValueError:
+        return
+    iso_gemini = os.path.join(resolve_real_home(), ".agyc_homes", safe_alias, ".gemini", "antigravity-cli")
     if not os.path.isdir(iso_gemini):
         return
     token_dst = os.path.join(iso_gemini, "antigravity-oauth-token")
@@ -222,42 +342,44 @@ def _sync_isolated_token_if_present(alias: str, token_data: dict | None):
 
 
 def save_account(alias: str, data: dict, sync_links: bool = True):
-    data["alias"] = alias
+    safe_alias = validate_alias(alias)
+    data["alias"] = safe_alias
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     if "created_at" not in data:
         data["created_at"] = data["updated_at"]
-    p = os.path.join(get_accounts_dir(), f"{alias}.json")
+    p = os.path.join(get_accounts_dir(), f"{safe_alias}.json")
     _atomic_write_json(p, data, mode=0o600, indent=2)
-    _sync_isolated_token_if_present(alias, data.get("token_data"))
+    _sync_isolated_token_if_present(safe_alias, data.get("token_data"))
     if sync_links:
         sync_account_symlinks()
 
 
 def write_quota_cache(alias: str, quota_dict: dict):
-    """Guarda de forma atómica (0600) la caché de cuotas en /tmp/agyc_quota_cache_{alias}.json."""
+    """Guarda de forma atómica (0600) la caché privada de cuotas en ~/.cache/agyc/quota_cache_{alias}.json."""
     if not alias or not isinstance(quota_dict, dict):
         return
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
-    tmp_file = f"{cache_file}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        safe_alias = validate_alias(alias)
+    except ValueError:
+        return
+    cache_file = os.path.join(get_cache_dir(), f"quota_cache_{safe_alias}.json")
     payload = dict(quota_dict)
     payload["cached_at"] = time.time()
     try:
-        fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.chmod(tmp_file, 0o600)
-        os.replace(tmp_file, cache_file)
+        _atomic_write_json(cache_file, payload, mode=0o600, indent=None)
     except Exception:
-        try:
-            if os.path.exists(tmp_file):
-                os.remove(tmp_file)
-        except Exception:
-            pass
+        pass
 
 
 def read_quota_cache(alias: str, max_age: float = 60.0) -> dict | None:
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
-    if not os.path.exists(cache_file):
+    try:
+        safe_alias = validate_alias(alias)
+    except ValueError:
+        return None
+    primary = os.path.join(get_cache_dir(), f"quota_cache_{safe_alias}.json")
+    legacy = f"/tmp/agyc_quota_cache_{safe_alias}.json"
+    cache_file = primary if os.path.exists(primary) else (legacy if os.path.exists(legacy) else None)
+    if not cache_file:
         return None
     try:
         with open(cache_file, "r", encoding="utf-8") as cf:
@@ -274,7 +396,9 @@ def list_account_aliases() -> list[str]:
     aliases = []
     for f in sorted(os.listdir(d)):
         if f.endswith(".json") and f != "config.json":
-            aliases.append(f[:-5])
+            stem = f[:-5]
+            if ALIAS_REGEX.match(stem) and stem.lower() not in RESERVED_ALIASES:
+                aliases.append(stem)
     return aliases
 
 
@@ -325,13 +449,15 @@ def sync_account_symlinks():
 
 
 def ensure_statusline_configured():
-    """Garantiza que agyc-statusline y agyc-titleline estén configurados y activos en settings.json."""
+    """Garantiza que agyc-statusline y agyc-titleline estén configurados y activos en settings.json (0600)."""
     real_home = resolve_real_home()
     bin_dir = get_bin_dir()
+    script_bin_dir = os.path.dirname(os.path.abspath(__file__))
     statusline_bin = os.path.join(bin_dir, "agyc-statusline")
     if not os.path.exists(statusline_bin):
         for cand in [
-            "/home/aidev/proyectos/agyc-antigravity-cli-switcher/bin/agyc-statusline",
+            os.path.join(script_bin_dir, "agyc-statusline"),
+            os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher", "bin", "agyc-statusline"),
             os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
             os.path.join(real_home, ".local", "bin", "agyc-statusline"),
         ]:
@@ -355,13 +481,22 @@ def ensure_statusline_configured():
     base_paths = [
         get_base_dir(),
         os.path.join(real_home, ".gemini", "antigravity-cli"),
-        "/home/aidev/.gemini/antigravity-cli",
     ]
     homes_base = os.path.join(real_home, ".agyc_homes")
     if os.path.exists(homes_base):
         try:
+            os.chmod(homes_base, 0o700)
+        except Exception:
+            pass
+        try:
             for h in os.listdir(homes_base):
-                cand = os.path.join(homes_base, h, ".gemini", "antigravity-cli")
+                iso_dir = os.path.join(homes_base, h)
+                if os.path.isdir(iso_dir) and not os.path.islink(iso_dir):
+                    try:
+                        os.chmod(iso_dir, 0o700)
+                    except Exception:
+                        pass
+                cand = os.path.join(iso_dir, ".gemini", "antigravity-cli")
                 if os.path.exists(cand):
                     base_paths.append(cand)
         except Exception:
@@ -394,7 +529,12 @@ def ensure_statusline_configured():
                 s["title"] = desired_tl
                 changed = True
             if changed:
-                _atomic_write_json(real_sp, s, indent=2)
+                _atomic_write_json(real_sp, s, mode=0o600, indent=2)
+            else:
+                try:
+                    os.chmod(real_sp, 0o600)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -541,25 +681,25 @@ class TokenRevokedError(Exception):
     pass
 
 
-def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict, bool]:
+def _token_needs_refresh(token_data: dict | None, margin_seconds: int = 300) -> bool:
+    if not isinstance(token_data, dict):
+        return True
     token_obj = token_data.get("token", {})
-    refresh_token = token_obj.get("refresh_token")
+    if not isinstance(token_obj, dict):
+        return True
     expiry_str = token_obj.get("expiry")
-    needs_refresh = force
-
     if not token_obj.get("access_token") or not expiry_str:
-        needs_refresh = True
-    else:
-        try:
-            exp_dt = parse_iso_datetime(expiry_str)
-            if (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300:
-                needs_refresh = True
-        except Exception:
-            needs_refresh = True
+        return True
+    try:
+        exp_dt = parse_iso_datetime(expiry_str)
+        return (exp_dt - datetime.now(timezone.utc)).total_seconds() < margin_seconds
+    except Exception:
+        return True
 
-    if not needs_refresh:
-        return token_data, False
 
+def _perform_oauth_refresh_request(token_data: dict) -> tuple[dict, bool]:
+    token_obj = dict(token_data.get("token") or {})
+    refresh_token = token_obj.get("refresh_token")
     if not refresh_token:
         return token_data, False
 
@@ -588,16 +728,86 @@ def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict
             raise TokenRevokedError("Token revocado o expirado por Google (invalid_grant)")
         raise e
 
+    new_td = dict(token_data)
     token_obj["access_token"] = res["access_token"]
     if "refresh_token" in res:
         token_obj["refresh_token"] = res["refresh_token"]
     expires_in = res.get("expires_in", 3600)
     token_obj["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
     if "id_token" in res:
-        token_data["id_token"] = res["id_token"]
+        new_td["id_token"] = res["id_token"]
 
-    token_data["token"] = token_obj
-    return token_data, True
+    new_td["token"] = token_obj
+    return new_td, True
+
+
+def refresh_token_if_needed(
+    token_data: dict,
+    force: bool = False,
+    alias: str | None = None,
+) -> tuple[dict, bool]:
+    """
+    Renueva el token OAuth solo cuando expira en <300s (o force=True).
+    Cuando se indica alias, protege la operación con fcntl.flock exclusivo sobre
+    ~/.cache/agyc/locks/{alias}.oauth.lock (0600), relee accounts/{alias}.json
+    (double-checked locking) y sincroniza antigravity-oauth-token aislado antes de soltar el lock.
+    """
+    if not force and not _token_needs_refresh(token_data, margin_seconds=300):
+        return token_data, False
+
+    if not alias:
+        return _perform_oauth_refresh_request(token_data)
+
+    safe_alias = validate_alias(alias)
+    lock_path = os.path.join(get_locks_dir(), f"{safe_alias}.oauth.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.chmod(lock_path, 0o600)
+    except Exception:
+        pass
+
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        # Double-checked locking: releer accounts/{alias}.json por si otro panel ya renovó el token
+        disk_acc = load_account(safe_alias)
+        working_td = token_data
+        if isinstance(disk_acc, dict) and isinstance(disk_acc.get("token_data"), dict) and disk_acc["token_data"]:
+            working_td = disk_acc["token_data"]
+            if not force and not _token_needs_refresh(working_td, margin_seconds=300):
+                _sync_isolated_token_if_present(safe_alias, working_td)
+                return working_td, False
+            # Si dos procesos piden force=True simultáneamente y uno acaba de renovar (<30s), reutilizar
+            if force and not _token_needs_refresh(working_td, margin_seconds=3570):
+                _sync_isolated_token_if_present(safe_alias, working_td)
+                return working_td, False
+
+        try:
+            new_td, did_refresh = _perform_oauth_refresh_request(working_td)
+        except TokenRevokedError:
+            latest_acc = load_account(safe_alias) or disk_acc
+            if isinstance(latest_acc, dict):
+                latest_acc["is_revoked"] = True
+                save_account(safe_alias, latest_acc, sync_links=False)
+            raise
+
+        if did_refresh:
+            latest_acc = load_account(safe_alias) or disk_acc
+            if isinstance(latest_acc, dict):
+                latest_acc["token_data"] = new_td
+                latest_acc["is_revoked"] = False
+                save_account(safe_alias, latest_acc, sync_links=False)
+            else:
+                _sync_isolated_token_if_present(safe_alias, new_td)
+            return new_td, True
+
+        return working_td, False
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(lock_fd)
 
 
 def _post_cloudcode_json(url: str, body: dict, access_token: str, timeout: int = 5) -> dict | None:
@@ -657,7 +867,8 @@ def fetch_quota_summary(access_token: str) -> dict | None:
         return None
 
     # a) loadCodeAssist para detectar plan Pro / Ultra y cloudaicompanionProject
-    lca_res = {}
+    #    Si cloudcode-pa no devuelve paidTier, consulta también daily-cloudcode-pa para nunca degradar PRO/ULTRA a FREE.
+    lca_res: dict = {}
     lca_ok = False
     lca_payload = {
         "metadata": {
@@ -666,6 +877,21 @@ def fetch_quota_summary(access_token: str) -> dict | None:
             "pluginType": "GEMINI",
         }
     }
+
+    def _lca_tier_rank(resp_obj: dict) -> int:
+        t_obj = resp_obj.get("paidTier") or resp_obj.get("currentTier") or {}
+        if not isinstance(t_obj, dict):
+            return 0
+        tid = (t_obj.get("id") or "").lower()
+        tnm = (t_obj.get("name") or "").lower()
+        if "ultra" in tid or "ultra" in tnm:
+            return 3
+        if "pro" in tid or "pro" in tnm:
+            return 2
+        if "enterprise" in tid or "standard" in tid:
+            return 1
+        return 0
+
     for host in ("cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"):
         try:
             res = _post_cloudcode_json(
@@ -675,9 +901,22 @@ def fetch_quota_summary(access_token: str) -> dict | None:
                 timeout=5,
             )
             if isinstance(res, dict):
-                lca_res = res
                 lca_ok = True
-                break
+                if not lca_res:
+                    lca_res = dict(res)
+                else:
+                    if (res.get("paidTier") and not lca_res.get("paidTier")) or (
+                        _lca_tier_rank(res) > _lca_tier_rank(lca_res)
+                    ):
+                        merged_lca = dict(res)
+                        if not merged_lca.get("cloudaicompanionProject") and lca_res.get("cloudaicompanionProject"):
+                            merged_lca["cloudaicompanionProject"] = lca_res["cloudaicompanionProject"]
+                        lca_res = merged_lca
+                    elif not lca_res.get("cloudaicompanionProject") and res.get("cloudaicompanionProject"):
+                        lca_res["cloudaicompanionProject"] = res["cloudaicompanionProject"]
+
+                if lca_res.get("paidTier"):
+                    break
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 break
@@ -1104,16 +1343,16 @@ def ensure_auto_migration():
 
 def switch_active_account(alias: str, silent: bool = False) -> dict:
     """Cambia la sesión activa global de agy al alias indicado, renueva el token y sincroniza caché."""
-    alias = normalize_alias(alias) or alias
+    alias = validate_alias(alias)
     data = load_account(alias)
     if not data:
         raise ValueError(f"La cuenta '{alias}' no existe.")
 
     token_data = data.get("token_data", {})
     try:
-        token_data, refreshed = refresh_token_if_needed(token_data)
+        token_data, refreshed = refresh_token_if_needed(token_data, alias=alias)
+        data["token_data"] = token_data
         if refreshed:
-            data["token_data"] = token_data
             data["is_revoked"] = False
             save_account(alias, data)
     except TokenRevokedError as e:
@@ -1165,15 +1404,29 @@ def launch_real_agy(extra_args: list[str], alias: str | None = None):
     real_home = resolve_real_home()
     candidates = [
         os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real"),
-        "/home/aidev/.gemini/antigravity-cli/bin/agy-real",
         "/snap/antigravity-cli/current/bin/agy",
         "/snap/antigravity-cli/23/bin/agy",
     ]
-    real_agy = candidates[0]
+    real_agy = None
     for c in candidates:
-        if os.path.exists(c):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
             real_agy = c
             break
+
+    if not real_agy:
+        for snap_c in sorted(glob.glob("/snap/antigravity-cli/*/bin/agy"), reverse=True):
+            if os.path.isfile(snap_c) and os.access(snap_c, os.X_OK):
+                real_agy = snap_c
+                break
+
+    if not real_agy:
+        print(
+            f"{C_RED}Error:{C_RESET} No se encontró el binario nativo 'agy-real' en "
+            f"{os.path.join(real_home, '.gemini', 'antigravity-cli', 'bin', 'agy-real')} ni en /snap/antigravity-cli/current/bin/agy.",
+            file=sys.stderr,
+        )
+        print(f"Ejecuta {C_CYAN}agyc update{C_RESET} para descargar e instalar el motor oficial.", file=sys.stderr)
+        sys.exit(1)
 
     if not os.environ.get("SSH_TTY") and not os.environ.get("SSH_CLIENT"):
         os.environ["SSH_TTY"] = "/dev/pts/0"
@@ -1193,26 +1446,46 @@ def launch_real_agy(extra_args: list[str], alias: str | None = None):
 
 def prepare_isolated_home(alias: str) -> str:
     """
-    Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/.
-    - Escribe directamente acc["token_data"] de forma atómica (0600) en
-      isolated_gemini/antigravity-oauth-token (jamás copia shared_base/antigravity-oauth-token).
-    - Enlaza recursos compartidos (settings.json, accounts/, projects/, brain/, conversations/, etc.)
-      al directorio base real para compartir contexto e historial sin mezclar tokens.
+    Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/ (0700).
+    - Enlaza dotfiles esenciales (.gitconfig, .git-credentials, .ssh, .config/gh, .config/herdr) desde real_home.
+    - Escribe directamente acc["token_data"] de forma atómica (0600) en isolated_gemini/antigravity-oauth-token.
+    - Fuerza que builtin y mcp en isolated_gemini sean siempre symlinks hacia shared_base.
     """
-    alias = normalize_alias(alias) or alias
+    alias = validate_alias(alias)
     real_home = resolve_real_home()
-    homes_base = os.path.join(real_home, ".agyc_homes")
-    isolated_home = os.path.join(homes_base, alias)
-    isolated_gemini = os.path.join(isolated_home, ".gemini", "antigravity-cli")
-    os.makedirs(isolated_gemini, exist_ok=True)
+    homes_base = _ensure_private_dir(os.path.join(real_home, ".agyc_homes"), 0o700)
+    isolated_home = _ensure_private_dir(os.path.join(homes_base, alias), 0o700)
+    isolated_gemini = _ensure_private_dir(os.path.join(isolated_home, ".gemini", "antigravity-cli"), 0o700)
 
     shared_base = get_base_dir()
+
+    # ── Enlazar dotfiles esenciales del usuario si existen en real_home y no existen en isolated_home ──
+    essential_dotfiles = (
+        ".gitconfig",
+        ".git-credentials",
+        ".ssh",
+        os.path.join(".config", "gh"),
+        os.path.join(".config", "herdr"),
+    )
+    for rel_dot in essential_dotfiles:
+        src_dot = os.path.join(real_home, rel_dot)
+        dst_dot = os.path.join(isolated_home, rel_dot)
+        if os.path.exists(src_dot) and not os.path.exists(dst_dot):
+            try:
+                if os.path.islink(dst_dot):
+                    os.unlink(dst_dot)
+                _ensure_private_dir(os.path.dirname(dst_dot), 0o700)
+                os.symlink(src_dot, dst_dot)
+            except Exception:
+                pass
 
     # ── Enlazar .gemini/config para compartir servidores MCP globales ──
     user_gemini_config = os.path.join(real_home, ".gemini", "config")
     iso_gemini_config = os.path.join(isolated_home, ".gemini", "config")
-    if os.path.exists(user_gemini_config) and not os.path.lexists(iso_gemini_config):
+    if os.path.exists(user_gemini_config) and not os.path.exists(iso_gemini_config):
         try:
+            if os.path.islink(iso_gemini_config):
+                os.unlink(iso_gemini_config)
             os.symlink(user_gemini_config, iso_gemini_config)
         except Exception:
             pass
@@ -1236,7 +1509,7 @@ def prepare_isolated_home(alias: str) -> str:
     if not os.path.exists(user_gemini_bin):
         user_gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
     iso_gemini_bin = os.path.join(isolated_gemini, "bin")
-    if os.path.exists(user_gemini_bin):
+    if os.path.exists(user_gemini_bin) and os.path.abspath(iso_gemini_bin) != os.path.abspath(user_gemini_bin):
         if os.path.islink(iso_gemini_bin):
             if os.readlink(iso_gemini_bin) != user_gemini_bin:
                 try:
@@ -1256,7 +1529,7 @@ def prepare_isolated_home(alias: str) -> str:
             except Exception:
                 pass
 
-    # ── settings.json por perfil: preserva el modelo elegido en cada cuenta (PRO vs ULTRA) ──
+    # ── settings.json por perfil (0600): preserva el modelo elegido en cada cuenta (PRO vs ULTRA) ──
     iso_settings = os.path.join(isolated_gemini, "settings.json")
     shared_settings = os.path.join(shared_base, "settings.json")
     try:
@@ -1282,7 +1555,10 @@ def prepare_isolated_home(alias: str) -> str:
     except Exception:
         pass
 
-    # ── Recursos compartidos para unificar conversaciones, memoria e historial ──
+    # Garantizar que shared_base/mcp exista para que el symlink siempre apunte a un directorio válido
+    os.makedirs(os.path.join(shared_base, "mcp"), exist_ok=True)
+
+    # ── Recursos compartidos para unificar conversaciones, memoria, skills, builtin y mcp ──
     shared_items = [
         "accounts",
         "projects",
@@ -1298,41 +1574,49 @@ def prepare_isolated_home(alias: str) -> str:
         "jetski_state.pbtxt",
         "skills",
         "builtin",
+        "mcp",
     ]
+    force_symlink_dirs = {"builtin", "mcp"}
 
-    for item in shared_items:
-        target = os.path.join(shared_base, item)
-        link = os.path.join(isolated_gemini, item)
-        if not os.path.exists(target):
-            continue
+    if os.path.abspath(isolated_gemini) != os.path.abspath(shared_base):
+        for item in shared_items:
+            target = os.path.join(shared_base, item)
+            link = os.path.join(isolated_gemini, item)
+            if not os.path.exists(target):
+                continue
 
-        if os.path.islink(link):
-            try:
-                if os.readlink(link) == target:
-                    continue
-                os.unlink(link)
-            except Exception:
-                pass
-
-        if os.path.isdir(link) and not os.path.islink(link):
-            if not os.listdir(link):
+            if os.path.islink(link):
                 try:
-                    os.rmdir(link)
+                    if os.readlink(link) == target:
+                        continue
+                    os.unlink(link)
+                except Exception:
+                    pass
+
+            if os.path.isdir(link) and not os.path.islink(link):
+                if item in force_symlink_dirs:
+                    try:
+                        shutil.rmtree(link)
+                    except Exception:
+                        continue
+                elif not os.listdir(link):
+                    try:
+                        os.rmdir(link)
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+            if os.path.isfile(link) and not os.path.islink(link):
+                try:
+                    os.remove(link)
                 except Exception:
                     continue
-            else:
-                continue
 
-        if os.path.isfile(link) and not os.path.islink(link):
             try:
-                os.remove(link)
+                os.symlink(target, link)
             except Exception:
-                continue
-
-        try:
-            os.symlink(target, link)
-        except Exception:
-            pass
+                pass
 
     return isolated_home
 
@@ -1355,7 +1639,7 @@ def _load_or_refresh_account_for_list(alias: str, force_refresh: bool) -> dict |
 
     token_data = data.get("token_data", {})
     try:
-        token_data, refreshed = refresh_token_if_needed(token_data, force=force_refresh)
+        token_data, refreshed = refresh_token_if_needed(token_data, force=force_refresh, alias=alias)
         data["token_data"] = token_data
         data["is_revoked"] = False
         access_token = token_data.get("token", {}).get("access_token")
@@ -1391,6 +1675,9 @@ def cmd_list(args):
     default = cfg.get("default_account")
 
     if not aliases:
+        if getattr(args, "json", False):
+            print(json.dumps({"active_account": active, "default_account": default, "accounts": []}, indent=2))
+            return
         print(f"\n{C_YELLOW}No hay cuentas registradas actualmente.{C_RESET}")
         print(f"Usa {C_CYAN}agyc add{C_RESET} para registrar automáticamente tu primera cuenta (agy01).")
         print(f"O usa {C_CYAN}agyc capture{C_RESET} para importar la sesión abierta actualmente.\n")
@@ -1405,10 +1692,37 @@ def cmd_list(args):
             accounts.append(item)
 
     if getattr(args, "json", False):
+        sanitized_accounts = []
+        for acc in accounts:
+            al = acc.get("alias", "")
+            q_norm = _sanitize_cached_or_stored_quota(acc.get("quota", {}))
+            clean_quota = {k: q_norm[k] for k in SAFE_QUOTA_KEYS if k in q_norm}
+            plan_type = clean_quota.get("plan_type") or acc.get("plan_type") or "FREE"
+            tier_id = clean_quota.get("tier_id") or acc.get("tier_id") or "free-tier"
+            tier_name = clean_quota.get("tier_name") or acc.get("tier_name") or "Antigravity"
+            supports_carbon = bool(
+                clean_quota.get("supports_carbon", acc.get("supports_carbon", plan_type == "ULTRA"))
+            )
+            sanitized_accounts.append({
+                "alias": al,
+                "email": acc.get("email", ""),
+                "name": acc.get("name", ""),
+                "plan_type": plan_type,
+                "tier_id": tier_id,
+                "tier_name": tier_name,
+                "supports_carbon": supports_carbon,
+                "is_active": bool(al == active),
+                "is_default": bool(al == default),
+                "is_revoked": bool(acc.get("is_revoked", False)),
+                "locked": bool(acc.get("locked", False)),
+                "note": acc.get("note") or "",
+                "quota": clean_quota,
+                "updated_at": acc.get("updated_at"),
+            })
         out = {
             "active_account": active,
             "default_account": default,
-            "accounts": accounts,
+            "accounts": sanitized_accounts,
         }
         print(json.dumps(out, indent=2))
         return
@@ -1470,6 +1784,9 @@ def cmd_list(args):
             elif is_active:
                 state_str = f"{C_GREEN}* ACTIVA{C_RESET}"
                 alias_disp = f"{C_BOLD}{C_GREEN}* {alias}{C_RESET}"
+            elif acc.get("locked"):
+                state_str = f"{C_YELLOW}  RESERVADA{C_RESET}"
+                alias_disp = f"  {alias}"
             elif is_default:
                 state_str = f"{C_CYAN}  DEFAULT{C_RESET}"
                 alias_disp = f"  {alias}"
@@ -1531,7 +1848,11 @@ def cmd_list(args):
 
 
 def cmd_switch(args):
-    alias = normalize_alias(args.alias) or args.alias
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1576,7 +1897,11 @@ def cmd_switch(args):
 
 
 def cmd_default(args):
-    alias = normalize_alias(args.alias) or args.alias
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1596,6 +1921,7 @@ def cmd_default(args):
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     auth_code = None
     error = None
+    expected_state = None
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
@@ -1605,13 +1931,31 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             return
 
         params = urllib.parse.parse_qs(parsed.query)
+        received_state = params.get("state", [None])[0]
 
-        if "code" in params:
+        if "error" in params:
+            raw_err = str(params["error"][0])
+            OAuthCallbackHandler.error = raw_err
+            safe_err = html.escape(raw_err, quote=True)
+            self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"Error de autenticación: {safe_err}".encode("utf-8"))
+        elif "code" in params:
+            if OAuthCallbackHandler.expected_state and received_state != OAuthCallbackHandler.expected_state:
+                msg = "Estado OAuth inválido (posible CSRF o sesión caduca)."
+                OAuthCallbackHandler.error = msg
+                self.send_response(400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(f"Error de seguridad: {html.escape(msg, quote=True)}".encode("utf-8"))
+                return
+
             OAuthCallbackHandler.auth_code = params["code"][0]
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            html = """
+            page_html = """
             <!DOCTYPE html>
             <html lang="es">
             <head>
@@ -1636,13 +1980,7 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             </body>
             </html>
             """
-            self.wfile.write(html.encode("utf-8"))
-        elif "error" in params:
-            OAuthCallbackHandler.error = params["error"][0]
-            self.send_response(400)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(f"Error de autenticación: {OAuthCallbackHandler.error}".encode("utf-8"))
+            self.wfile.write(page_html.encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1651,19 +1989,51 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def _find_alias_by_email(email: str | None) -> str | None:
+    if not email:
+        return None
+    target_em = email.strip().lower()
+    for al in list_account_aliases():
+        acc = load_account(al)
+        if acc and (acc.get("email") or "").strip().lower() == target_em:
+            return al
+    return None
+
+
 def cmd_add(args):
-    alias = normalize_alias(getattr(args, "alias", None))
-    if not alias:
-        alias = get_next_correlative_alias()
-        print(f"{C_BOLD}{C_GREEN}▶ Asignando automáticamente alias correlativo: {alias}{C_RESET}")
+    raw_alias = getattr(args, "alias", None)
+    subcmd = (getattr(args, "subcommand", "add") or "add").lower()
+    is_renew_cmd = subcmd in ("renew", "reauth")
+    force = bool(getattr(args, "force", False))
+
+    if raw_alias:
+        try:
+            alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+    else:
+        if is_renew_cmd:
+            cfg = load_config()
+            alias = cfg.get("active_account") or get_next_correlative_alias()
+            alias = validate_alias(alias)
+        else:
+            alias = get_next_correlative_alias()
+            print(f"{C_BOLD}{C_GREEN}▶ Asignando automáticamente alias correlativo: {alias}{C_RESET}")
 
     existing = load_account(alias)
-    if existing:
+    if existing and not is_renew_cmd and not force:
         print(f"{C_YELLOW}Aviso:{C_RESET} Ya existe una cuenta con el alias '{alias}' ({existing.get('email')}).")
-        ans = input("¿Deseas sobrescribirla? (s/N): ").strip().lower()
-        if ans not in ("s", "si", "y", "yes"):
-            print("Operación cancelada.")
-            return
+        if sys.stdin.isatty():
+            ans = input("¿Deseas sobrescribirla/renovarla? (s/N): ").strip().lower()
+            if ans not in ("s", "si", "y", "yes"):
+                print("Operación cancelada.")
+                return
+        else:
+            print(f"{C_RED}Error:{C_RESET} Usa --force para sobrescribir '{alias}' en modo no interactivo.")
+            sys.exit(1)
+    elif existing and is_renew_cmd:
+        print(f"{C_CYAN}▶ Renovando credenciales OAuth para '{alias}' ({existing.get('email')})...{C_RESET}")
 
     server = None
     selected_port = None
@@ -1679,6 +2049,7 @@ def cmd_add(args):
         print(f"{C_RED}Error:{C_RESET} No se pudo abrir ninguno de los puertos OAuth {OAUTH_PORTS}.")
         sys.exit(1)
 
+    oauth_state = secrets.token_urlsafe(24)
     redirect_uri = f"http://localhost:{selected_port}/oauth-callback"
     auth_params = {
         "client_id": GOOGLE_CLIENT_ID,
@@ -1687,12 +2058,18 @@ def cmd_add(args):
         "scope": " ".join(GOOGLE_SCOPES),
         "access_type": "offline",
         "prompt": "select_account consent",
+        "state": oauth_state,
     }
+    if existing and existing.get("email") and "@" in str(existing.get("email")):
+        auth_params["login_hint"] = str(existing["email"]).strip()
+
     auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(auth_params)}"
 
     print()
     print(f"{C_BOLD}{C_CYAN}══════════════════════════════════════════════════════════════════════════{C_RESET}")
     print(f"{C_BOLD} VINCULAR CUENTA DE GOOGLE ANTIGRAVITY: {C_GREEN}{alias}{C_RESET}")
+    if existing and existing.get("email"):
+        print(f" Cuenta esperada: {C_YELLOW}{existing.get('email')}{C_RESET}")
     print(f"{C_BOLD}{C_CYAN}══════════════════════════════════════════════════════════════════════════{C_RESET}")
     print("1. Abre el enlace en tu navegador para autorizar la cuenta:")
     print(f"\n   {C_CYAN}{C_BOLD}{auth_url}{C_RESET}\n")
@@ -1705,6 +2082,7 @@ def cmd_add(args):
 
     OAuthCallbackHandler.auth_code = None
     OAuthCallbackHandler.error = None
+    OAuthCallbackHandler.expected_state = oauth_state
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -1741,6 +2119,14 @@ def cmd_add(args):
                         if "code=" in raw_val:
                             parsed = urllib.parse.urlparse(raw_val)
                             p_qs = urllib.parse.parse_qs(parsed.query)
+                            if "state" in p_qs and p_qs["state"][0] != oauth_state:
+                                print(f"\n{C_RED}Error de seguridad:{C_RESET} El parámetro state de la URL no coincide.")
+                                try:
+                                    server.shutdown()
+                                    server.server_close()
+                                except Exception:
+                                    pass
+                                sys.exit(1)
                             auth_code = p_qs.get("code", [raw_val])[0]
                         else:
                             auth_code = raw_val
@@ -1802,18 +2188,75 @@ def cmd_add(args):
         claims = decode_jwt_payload(token_res["id_token"])
         email = claims.get("email")
 
+    # ── Protección contra cruce de cuentas en renew y duplicados en alta nueva ──
+    old_email = (existing.get("email") or "").strip().lower() if existing else ""
+    new_email = (email or "").strip().lower()
+    placeholders = {"", "desconocido@google.com", "cuenta@google.com", f"{alias.lower()}@google.com"}
+
+    if existing and old_email not in placeholders and new_email and new_email != old_email:
+        if not force:
+            print(
+                f"\n{C_BOLD}{C_RED}✗ Error de seguridad: El correo autenticado ('{email}') NO coincide "
+                f"con la cuenta registrada en '{alias}' ('{existing.get('email')}').{C_RESET}"
+            )
+            print("Se abortó la operación para evitar sobrescribir otra cuenta por error.")
+            print(f"  • Para renovar '{alias}', vuelve a ejecutar {C_GREEN}agyc renew {alias}{C_RESET} y elige {existing.get('email')}.")
+            print(f"  • Si deseas reemplazar '{alias}' intencionalmente, usa: {C_YELLOW}agyc {subcmd} {alias} --force{C_RESET}\n")
+            sys.exit(1)
+        else:
+            print(f"{C_YELLOW}⚠ Aviso (--force): Reemplazando '{existing.get('email')}' por '{email}' en '{alias}'.{C_RESET}")
+
+    if not existing and new_email:
+        dup_alias = _find_alias_by_email(new_email)
+        if dup_alias and dup_alias != alias:
+            print(f"\n{C_YELLOW}⚠ Aviso:{C_RESET} El correo '{email}' ya se encuentra registrado bajo el alias '{dup_alias}'.")
+            if force or not sys.stdin.isatty():
+                print(f"{C_CYAN}→ Actualizando credenciales sobre el alias existente '{dup_alias}' (evitando duplicado).{C_RESET}")
+                alias = dup_alias
+                existing = load_account(dup_alias)
+            else:
+                try:
+                    dup_ans = input(
+                        f"¿Actualizar el alias existente '{dup_alias}' en lugar de crear un duplicado '{alias}'? (S/n): "
+                    ).strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print("\nOperación cancelada.")
+                    return
+                if dup_ans in ("", "s", "si", "y", "yes"):
+                    alias = dup_alias
+                    existing = load_account(dup_alias)
+                else:
+                    try:
+                        confirm_dup = input(f"¿Guardar de todos modos como cuenta duplicada en '{alias}'? (s/N): ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        confirm_dup = "n"
+                    if confirm_dup not in ("s", "si", "y", "yes"):
+                        print("Operación cancelada.")
+                        return
+
     print(f"{C_CYAN}Consultando plan y cuotas para {email}...{C_RESET}")
     quota = extract_quota_metrics(fetch_quota_summary(access_token))
+
+    # Conservar refresh_token previo si Google no emitió uno nuevo en reauth parcial, así como metadatos locked/note
+    if existing and not token_data["token"].get("refresh_token") and new_email == old_email:
+        prev_rt = ((existing.get("token_data") or {}).get("token") or {}).get("refresh_token")
+        if prev_rt:
+            token_data["token"]["refresh_token"] = prev_rt
 
     acc_data = {
         "alias": alias,
         "email": email or f"{alias}@google.com",
-        "name": profile.get("name") or "Usuario Antigravity",
-        "picture": profile.get("picture"),
+        "name": profile.get("name") or (existing.get("name") if existing else None) or "Usuario Antigravity",
+        "picture": profile.get("picture") or (existing.get("picture") if existing else None),
         "token_data": token_data,
         "quota": quota,
         "is_revoked": False,
+        "locked": bool(existing.get("locked", False)) if existing else False,
+        "note": (existing.get("note") or "") if existing else "",
     }
+    if existing and existing.get("created_at"):
+        acc_data["created_at"] = existing["created_at"]
+
     save_account(alias, acc_data)
     write_quota_cache(alias, quota)
     prepare_isolated_home(alias)
@@ -1834,9 +2277,11 @@ def cmd_add(args):
         save_config(cfg)
         switch_active_account(alias, silent=True)
         print(f"{C_BOLD}{C_GREEN}★ Cuenta '{alias}' configurada automáticamente como activa y predeterminada.{C_RESET}\n")
-    else:
+    elif current_active == alias:
+        switch_active_account(alias, silent=True)
+    elif sys.stdin.isatty():
         try:
-            ans = input(f"¿Deseas cambiar la sesión activa a '{alias}' ahora? (s/N): ").strip().lower()
+            ans = input(f"¿Deseas cambiar la sesión activa global a '{alias}' ahora? (s/N): ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = "n"
         if ans in ("s", "si", "y", "yes"):
@@ -1846,8 +2291,14 @@ def cmd_add(args):
 
 
 def cmd_capture(args):
-    alias = normalize_alias(getattr(args, "alias", None))
-    if not alias:
+    raw_alias = getattr(args, "alias", None)
+    if raw_alias:
+        try:
+            alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+    else:
         alias = get_next_correlative_alias()
 
     token_path = get_active_token_path()
@@ -1867,6 +2318,11 @@ def cmd_capture(args):
             claims = decode_jwt_payload(token_data["id_token"])
             email = claims.get("email")
 
+        dup_alias = _find_alias_by_email(email)
+        if dup_alias and not raw_alias:
+            alias = dup_alias
+
+        existing = load_account(alias)
         quota = extract_quota_metrics(fetch_quota_summary(access_token)) if access_token else {}
 
         acc_data = {
@@ -1877,6 +2333,8 @@ def cmd_capture(args):
             "token_data": token_data,
             "quota": quota,
             "is_revoked": False,
+            "locked": bool(existing.get("locked", False)) if existing else False,
+            "note": (existing.get("note") or "") if existing else "",
         }
         save_account(alias, acc_data)
         if quota:
@@ -1894,7 +2352,11 @@ def cmd_capture(args):
 
 
 def cmd_remove(args):
-    alias = normalize_alias(args.alias) or args.alias
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1912,8 +2374,16 @@ def cmd_remove(args):
         except Exception:
             pass
 
-    # Limpiar caché temporal de cuota del alias
-    for tmp_p in glob.glob(f"/tmp/agyc_quota_cache_{alias}.json*") + glob.glob(f"/tmp/agyc_quota_refreshing_{alias}.lock"):
+    # Limpiar caché privada (~/.cache/agyc) y caché legacy (/tmp) del alias
+    priv_cache = get_cache_dir()
+    cache_patterns = (
+        glob.glob(os.path.join(priv_cache, f"quota_cache_{alias}.json*"))
+        + glob.glob(os.path.join(priv_cache, f"*{alias}*.lock"))
+        + glob.glob(os.path.join(priv_cache, "locks", f"{alias}.*lock*"))
+        + glob.glob(f"/tmp/agyc_quota_cache_{alias}.json*")
+        + glob.glob(f"/tmp/agyc_quota_refreshing_{alias}.lock")
+    )
+    for tmp_p in cache_patterns:
         try:
             os.remove(tmp_p)
         except Exception:
@@ -1951,6 +2421,7 @@ def cmd_wipe(args):
     accounts_dir = get_accounts_dir()
     token_path = get_active_token_path()
     cache_dir = os.path.join(base_dir, "cache")
+    priv_cache_dir = get_cache_dir()
     config_path = get_config_path()
     homes_base = os.path.join(real_home, ".agyc_homes")
 
@@ -1962,7 +2433,7 @@ def cmd_wipe(args):
     print(f"  • {len(aliases)} cuenta(s) registrada(s) en {accounts_dir}")
     print(f"  • Configuración de cuentas ({config_path})")
     print(f"  • Token activo y tokens aislados en {homes_base}/*/.gemini/antigravity-cli/")
-    print("  • Archivos temporales /tmp/agyc_quota_cache_*.json y caché de sesión")
+    print(f"  • Caché privada ({priv_cache_dir}), /tmp/agyc_quota_cache_*.json y caché de sesión")
     print(f"{C_DIM}--------------------------------------------------------------------------{C_RESET}")
     print("Esto garantiza un reinicio limpio desde cero para registrar agy01, agy02, etc.")
     print("sin residuos ni caídas silenciosas (fallback) a credenciales anteriores.\n")
@@ -1990,7 +2461,7 @@ def cmd_wipe(args):
                 except Exception as e:
                     print(f"  {C_YELLOW}Aviso:{C_RESET} No se pudo eliminar {fp}: {e}")
 
-    # 2. Restablecer config.json vacío
+    # 2. Restablecer config.json vacío (0600)
     save_config({"default_account": None, "active_account": None})
 
     # 3. Eliminar antigravity-oauth-token global, snap y sus .tmp
@@ -2025,8 +2496,15 @@ def cmd_wipe(args):
         except Exception:
             pass
 
-    # 5. Limpiar cachés de cuotas en /tmp/agyc_quota_cache_*.json y locks
-    for cp in glob.glob("/tmp/agyc_quota_cache_*.json*") + glob.glob("/tmp/agyc_quota_refreshing_*.lock"):
+    # 5. Limpiar cachés de cuotas y locks en ~/.cache/agyc y /tmp/agyc_quota_*
+    wipe_cache_patterns = (
+        glob.glob(os.path.join(priv_cache_dir, "quota_cache_*.json*"))
+        + glob.glob(os.path.join(priv_cache_dir, "*.lock"))
+        + glob.glob(os.path.join(priv_cache_dir, "locks", "*.lock*"))
+        + glob.glob("/tmp/agyc_quota_cache_*.json*")
+        + glob.glob("/tmp/agyc_quota_refreshing_*.lock")
+    )
+    for cp in wipe_cache_patterns:
         try:
             os.remove(cp)
             deleted_count += 1
@@ -2058,9 +2536,15 @@ def cmd_wipe(args):
 
 
 def cmd_quota(args):
-    target_alias = normalize_alias(getattr(args, "alias", None))
+    raw_alias = getattr(args, "alias", None)
     cfg = load_config()
-    if not target_alias:
+    if raw_alias:
+        try:
+            target_alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+    else:
         target_alias = cfg.get("active_account")
         if not target_alias:
             aliases = list_account_aliases()
@@ -2077,9 +2561,9 @@ def cmd_quota(args):
 
     token_data = data.get("token_data", {})
     try:
-        token_data, refreshed = refresh_token_if_needed(token_data)
+        token_data, refreshed = refresh_token_if_needed(token_data, alias=target_alias)
+        data["token_data"] = token_data
         if refreshed:
-            data["token_data"] = token_data
             data["is_revoked"] = False
     except TokenRevokedError:
         data["is_revoked"] = True
@@ -2180,15 +2664,22 @@ def cmd_quota(args):
 
 
 def get_active_model_name() -> str:
+    candidate_paths = []
+    cur_home = os.environ.get("HOME", "").strip()
+    if cur_home and ("/.agyc_homes/" in cur_home or cur_home.endswith("/.agyc_homes")):
+        candidate_paths.append(os.path.join(cur_home, ".gemini", "antigravity-cli", "settings.json"))
     base = get_base_dir()
-    settings_path = os.path.join(base, "settings.json")
-    if os.path.exists(settings_path):
-        try:
-            with open(settings_path, "r", encoding="utf-8") as f:
-                s = json.load(f)
-                return s.get("model", "Gemini 3.8 Flash (High)")
-        except Exception:
-            pass
+    candidate_paths.append(os.path.join(base, "settings.json"))
+
+    for sp in candidate_paths:
+        if os.path.exists(sp):
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+                if isinstance(s, dict) and s.get("model"):
+                    return str(s["model"])
+            except Exception:
+                pass
     return "Gemini 3.8 Flash (High)"
 
 
@@ -2197,9 +2688,11 @@ def _eval_account_for_auto(alias: str) -> tuple[str, dict | None, dict]:
     if not data:
         return alias, None, {}
     old_q = data.get("quota", {}) if isinstance(data.get("quota"), dict) else {}
+    if data.get("locked") is True and old_q.get("plan_type"):
+        return alias, data, _sanitize_cached_or_stored_quota(old_q)
     token_data = data.get("token_data", {})
     try:
-        token_data, _ = refresh_token_if_needed(token_data)
+        token_data, _ = refresh_token_if_needed(token_data, alias=alias)
         data["token_data"] = token_data
         data["is_revoked"] = False
         access_token = token_data.get("token", {}).get("access_token")
@@ -2285,7 +2778,7 @@ def cmd_auto(args):
             print(f"  • {alias:<8} ({email}): {C_RED}[EXPIRADA - Re-vincular con 'agyc renew {alias}']{C_RESET}")
             continue
 
-        plan_type = (quota.get("plan_type") or "FREE").upper()
+        plan_type = (quota.get("plan_type") or data.get("plan_type") or "FREE").upper()
         supports_carbon = bool(quota.get("supports_carbon") or plan_type == "ULTRA")
         plan_badge = format_plan_badge(plan_type)
 
@@ -2295,6 +2788,11 @@ def cmd_auto(args):
 
         if supports_carbon:
             ultra_count += 1
+
+        if data.get("locked") is True:
+            note_suffix = f" ({data.get('note')})" if data.get("note") else ""
+            print(f"  • {alias:<8} [{plan_badge}] ({email}): {C_YELLOW}[Reservada]{C_RESET}{C_DIM}{note_suffix}{C_RESET}")
+            continue
 
         q5h, r5h = normalize_window(quota.get(f"{fam_key}_5h_fraction"), quota.get(f"{fam_key}_5h_reset"))
         qweek, rweek = normalize_window(quota.get(f"{fam_key}_weekly_fraction"), quota.get(f"{fam_key}_weekly_reset"))
@@ -2320,7 +2818,9 @@ def cmd_auto(args):
 
         # Requisito estricto: AMBAS ventanas deben tener saldo disponible (AND, nunca OR)
         if q5h > 0.001 and qweek > 0.001:
-            if target_mode == "claude":
+            if target_mode == "carbon":
+                score = (qweek * 0.70) + (q5h * 0.30)
+            elif target_mode == "claude":
                 score = (qweek * 0.65) + (q5h * 0.35)
             else:
                 score = (q5h * 0.65) + (qweek * 0.35)
@@ -2330,7 +2830,7 @@ def cmd_auto(args):
                 best_week = qweek
                 best_alias = alias
         else:
-            # Si está bloqueada, medir cuándo vuelve a estar operativa (weekly si semanal=0, sino 5h)
+            # Si está bloqueada por cuota, medir cuándo vuelve a estar operativa (weekly si semanal=0, sino 5h)
             blocking_rst = rweek if qweek <= 0.001 else r5h
             if blocking_rst:
                 try:
@@ -2363,6 +2863,39 @@ def cmd_auto(args):
         print(f"\n{C_YELLOW}No se encontró ninguna cuenta disponible con saldo en 5H y Semanal para {family_label}.{C_RESET}\n")
 
 
+def cmd_lock(args):
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
+    data = load_account(alias)
+    if not data:
+        print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
+        sys.exit(1)
+    data["locked"] = True
+    if getattr(args, "note", None) is not None:
+        data["note"] = str(args.note).strip()
+    save_account(alias, data, sync_links=False)
+    note_msg = f" ({data['note']})" if data.get("note") else ""
+    print(f"{C_BOLD}{C_YELLOW}🔒 Cuenta '{alias}' marcada como RESERVADA{note_msg}.{C_RESET} 'agyc auto' la omitirá.\n")
+
+
+def cmd_unlock(args):
+    try:
+        alias = validate_alias(args.alias)
+    except ValueError as e:
+        print(f"{C_RED}Error:{C_RESET} {e}")
+        sys.exit(1)
+    data = load_account(alias)
+    if not data:
+        print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
+        sys.exit(1)
+    data["locked"] = False
+    save_account(alias, data, sync_links=False)
+    print(f"{C_BOLD}{C_GREEN}🔓 Cuenta '{alias}' liberada.{C_RESET} Disponible nuevamente para 'agyc auto'.\n")
+
+
 def _copy_executable(src: str, dst: str) -> bool:
     if not os.path.exists(src):
         return False
@@ -2383,19 +2916,39 @@ def _copy_executable(src: str, dst: str) -> bool:
         return False
 
 
+def _verify_sha512(file_path: str, expected: str) -> bool:
+    exp = (expected or "").strip()
+    if not exp:
+        return True
+    if exp.lower().startswith("sha512-"):
+        exp = exp[7:].strip()
+    h = hashlib.sha512()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest_bytes = h.digest()
+    digest_hex = digest_bytes.hex()
+    digest_b64 = base64.b64encode(digest_bytes).decode("ascii")
+    if re.fullmatch(r"[0-9a-fA-F]{128}", exp):
+        return hmac.compare_digest(digest_hex.lower(), exp.lower())
+    return hmac.compare_digest(digest_b64.rstrip("="), exp.rstrip("="))
+
+
 def cmd_update(args):
     real_home = resolve_real_home()
     print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY (v1.5){C_RESET}")
     print(f"{C_DIM}{'=' * 68}{C_RESET}\n")
 
+    self_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     repo_candidates = [
-        "/home/aidev/proyectos/agyc-antigravity-cli-switcher",
-        "/home/aidev/proyectos/agyc",
-        "/home/aidev/proyectos/antigravity-switcher",
+        self_repo,
+        os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher"),
+        os.path.join(real_home, "proyectos", "agyc"),
+        os.path.join(real_home, "proyectos", "antigravity-switcher"),
     ]
-    repo_dir = "/home/aidev/proyectos/agyc-antigravity-cli-switcher"
+    repo_dir = os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher")
     for cand in repo_candidates:
-        if os.path.isdir(os.path.join(cand, ".git")):
+        if cand and os.path.isdir(os.path.join(cand, ".git")):
             repo_dir = cand
             break
 
@@ -2422,8 +2975,12 @@ def cmd_update(args):
             with urllib.request.urlopen(url, timeout=10) as resp:
                 code = resp.read().decode("utf-8")
                 if "agyc" in code and len(code) > 10000:
-                    with open(__file__, "w", encoding="utf-8") as f:
+                    self_path = os.path.abspath(__file__)
+                    tmp_self = f"{self_path}.tmp.{os.getpid()}"
+                    with open(tmp_self, "w", encoding="utf-8") as f:
                         f.write(code)
+                    os.chmod(tmp_self, 0o755)
+                    os.replace(tmp_self, self_path)
                     print(f"  {C_GREEN}✓ Binario agyc actualizado desde GitHub.{C_RESET}")
         except Exception as e:
             print(f"  {C_YELLOW}⚠ Descarga omitida: {e}{C_RESET}")
@@ -2433,7 +2990,7 @@ def cmd_update(args):
     gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
     snap_bin = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin")
     local_bin = os.path.join(real_home, ".local", "bin")
-    backup_bin = "/home/aidev/proyectos/backup_agyc/bin"
+    backup_bin = os.path.join(real_home, "proyectos", "backup_agyc", "bin")
 
     os.makedirs(gemini_bin, exist_ok=True)
     os.makedirs(local_bin, exist_ok=True)
@@ -2513,22 +3070,45 @@ def cmd_update(args):
             mani = json.loads(resp.read().decode("utf-8"))
             latest_ver = mani.get("version")
             download_url = mani.get("url")
+            expected_sha512 = str(mani.get("sha512") or mani.get("sha512sum") or "").strip()
 
         if (not current_ver or current_ver != latest_ver) and download_url:
             print(f"  {C_CYAN}→ Descargando release oficial de Google Antigravity CLI v{latest_ver}...{C_RESET}")
-            scratch_tar = "/tmp/antigravity_cli_latest.tar.gz"
-            urllib.request.urlretrieve(download_url, scratch_tar)
             import tarfile
-            with tarfile.open(scratch_tar, "r:gz") as tar:
-                tar.extract("antigravity", path="/tmp/")
-            if os.path.lexists(native_bin):
-                try:
-                    os.unlink(native_bin)
-                except Exception:
-                    pass
-            shutil.move("/tmp/antigravity", native_bin)
-            os.chmod(native_bin, 0o755)
-            print(f"  {C_GREEN}✓ Antigravity CLI actualizado al release oficial v{latest_ver} ({native_bin}){C_RESET}")
+            native_parent = os.path.dirname(native_bin)
+            os.makedirs(native_parent, exist_ok=True)
+            tmp_update_dir = tempfile.mkdtemp(prefix=".agy-update-", dir=native_parent)
+            try:
+                scratch_tar = os.path.join(tmp_update_dir, "antigravity_cli.tar.gz")
+                dl_req = urllib.request.Request(download_url, headers={"User-Agent": "curl/7.88.1"})
+                with urllib.request.urlopen(dl_req, timeout=60) as dl_resp, open(scratch_tar, "wb") as out_f:
+                    shutil.copyfileobj(dl_resp, out_f)
+
+                tmp_bin = os.path.join(tmp_update_dir, f"agy-real.tmp.{os.getpid()}")
+                with tarfile.open(scratch_tar, "r:gz") as tar:
+                    target_member = None
+                    for member in tar.getmembers():
+                        if os.path.basename(member.name) == "antigravity" and member.isfile():
+                            target_member = member
+                            break
+                    if not target_member:
+                        raise RuntimeError("No se encontró el binario 'antigravity' dentro del paquete oficial.")
+                    extracted_stream = tar.extractfile(target_member)
+                    if extracted_stream is None:
+                        raise RuntimeError("No se pudo extraer el flujo del binario 'antigravity'.")
+                    with extracted_stream, open(tmp_bin, "wb") as bin_f:
+                        shutil.copyfileobj(extracted_stream, bin_f)
+
+                if expected_sha512:
+                    if not (_verify_sha512(scratch_tar, expected_sha512) or _verify_sha512(tmp_bin, expected_sha512)):
+                        raise RuntimeError("Verificación de integridad SHA-512 fallida; actualización abortada.")
+                    print(f"  {C_GREEN}✓ Integridad SHA-512 verificada.{C_RESET}")
+
+                os.chmod(tmp_bin, 0o755)
+                os.replace(tmp_bin, native_bin)
+                print(f"  {C_GREEN}✓ Antigravity CLI actualizado atómicamente a v{latest_ver} ({native_bin}){C_RESET}")
+            finally:
+                shutil.rmtree(tmp_update_dir, ignore_errors=True)
         else:
             print(f"  {C_GREEN}✓ Antigravity CLI nativo en su última versión oficial: v{current_ver or '1.5.10'}{C_RESET}")
     except Exception as e:
@@ -2556,10 +3136,11 @@ def cmd_update(args):
 
 
 def main():
-    sync_account_symlinks()
     prog_name = os.path.basename(sys.argv[0])
 
     # 1. Lanzamiento directo por alias invocado como comando: 'agy01', 'agy02', 'agi05', etc.
+    #    Arranque instantáneo (<50ms): prepara HOME aislado y refresca token solo si expira en <300s,
+    #    SIN mutar active_account global ni bloquear con fetch_quota_summary síncrono.
     m_prog = re.match(r"^(?:agy|agi)(\d+)$", prog_name)
     if m_prog:
         alias = f"agy{int(m_prog.group(1)):02d}"
@@ -2570,16 +3151,27 @@ def main():
             sys.exit(1)
         sys_argv_to_pass = [a for a in sys.argv[1:] if a not in ("-y", "--yes", "-f", "--force")]
 
-        try:
-            switch_active_account(alias, silent=True)
-        except TokenRevokedError:
-            print(f"\n{C_BOLD}{C_RED}Error: El token de Google para '{alias}' ({data.get('email')}) expiró o fue revocado (invalid_grant).{C_RESET}")
-            print(f"\n{C_BOLD}Solución:{C_RESET} Re-vincula la cuenta ejecutando:")
-            print(f"  {C_GREEN}agyc renew {alias}{C_RESET}\n")
-            sys.exit(1)
+        token_data = data.get("token_data", {})
+        if _token_needs_refresh(token_data, margin_seconds=300):
+            try:
+                token_data, _ = refresh_token_if_needed(token_data, force=False, alias=alias)
+                data["token_data"] = token_data
+            except TokenRevokedError:
+                print(
+                    f"\n{C_BOLD}{C_RED}Error: El token de Google para '{alias}' ({data.get('email')}) "
+                    f"expiró o fue revocado (invalid_grant).{C_RESET}"
+                )
+                print(f"\n{C_BOLD}Solución:{C_RESET} Re-vincula la cuenta ejecutando:")
+                print(f"  {C_GREEN}agyc renew {alias}{C_RESET}\n")
+                sys.exit(1)
+            except Exception as e:
+                print(f"{C_YELLOW}Aviso al refrescar token de '{alias}':{C_RESET} {e}")
+
         print(f"{C_BOLD}{C_GREEN}✓ Entrando a cuenta {alias} ({data.get('email')}) [modo: --dangerously-skip-permissions]...{C_RESET}\n")
         launch_real_agy(sys_argv_to_pass, alias=alias)
         return
+
+    sync_account_symlinks()
 
     # 2. Ejecución directa 'agyc <alias>' para switch rápido
     if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
@@ -2600,7 +3192,7 @@ def main():
     # list
     p_list = subparsers.add_parser("list", help="Lista todas las cuentas, planes y barras de consumo")
     p_list.add_argument("-r", "--refresh", action="store_true", help="Forzar actualización en paralelo desde Google")
-    p_list.add_argument("--json", action="store_true", help="Salida en formato JSON")
+    p_list.add_argument("--json", action="store_true", help="Salida en formato JSON sanitizada (sin secretos)")
     p_list.set_defaults(func=cmd_list)
 
     # switch / use
@@ -2616,6 +3208,7 @@ def main():
     # add
     p_add = subparsers.add_parser("add", aliases=["renew", "reauth", "login"], help="Registra o renueva una cuenta (ej. agyc renew agy03)")
     p_add.add_argument("alias", nargs="?", default=None, help="Alias opcional (por defecto correlativo automático)")
+    p_add.add_argument("-f", "--force", action="store_true", help="Forzar sobrescritura aunque difiera el email registrado")
     p_add.set_defaults(func=cmd_add)
 
     # capture
@@ -2642,6 +3235,16 @@ def main():
         help="Familia/modo: gemini (argon/hydrogen/flash), claude (gpt/3p) o carbon (ultra)",
     )
     p_auto.set_defaults(func=cmd_auto)
+
+    # lock / unlock
+    p_lock = subparsers.add_parser("lock", help="Marca una cuenta como reservada para que 'agyc auto' no la seleccione")
+    p_lock.add_argument("alias", help="Alias de la cuenta a reservar (ej. agy10)")
+    p_lock.add_argument("-m", "--note", default=None, help="Nota opcional de reserva")
+    p_lock.set_defaults(func=cmd_lock)
+
+    p_unlock = subparsers.add_parser("unlock", help="Desbloquea una cuenta reservada para 'agyc auto'")
+    p_unlock.add_argument("alias", help="Alias de la cuenta a liberar")
+    p_unlock.set_defaults(func=cmd_unlock)
 
     # wipe / clean / purge
     p_wipe = subparsers.add_parser("wipe", aliases=["clean", "purge"], help="Vacía todas las credenciales, tokens aislados y caché")

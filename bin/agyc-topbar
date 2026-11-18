@@ -1,21 +1,72 @@
 #!/usr/bin/python3 -S
 """
 agyc-topbar: Ultra-lightweight (<20ms) Global Top Bar widget for Herdr (ui.tab_bar_right).
-Detects the active/focused agy account in Herdr (focused pane -> same tab -> active_account)
-and renders live Gemini + Claude 5H & Weekly quota without blocking.
+Detects the active/focused agy account & panel in Herdr (focused pane -> same tab -> active_account)
+and renders live Gemini + Claude quota plus active conversation context in `5H -> Ctx -> Sem` order.
 """
 
 import sys
 import os
+import pwd
 import json
 import math
 import time
 import _socket
 from datetime import datetime, timezone
 
-REAL_HOME = "/home/aidev"
+
+def _clean_agyc_home_path(raw: str) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s or s == "~":
+        return None
+    if "/.agyc_homes/" in s:
+        s = s.split("/.agyc_homes/", 1)[0]
+    elif s.endswith("/.agyc_homes"):
+        s = s[: -len("/.agyc_homes")]
+    s = s.rstrip("/") or "/"
+    return s if os.path.isdir(s) else None
+
+
+def resolve_real_home() -> str:
+    """Resolves real user HOME dynamically, immune to isolated ~/.agyc_homes/<alias> sessions."""
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
+        val = os.environ.get(env_key, "").strip()
+        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
+            cleaned = _clean_agyc_home_path(val)
+            if cleaned:
+                return cleaned
+    try:
+        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
+        cleaned = _clean_agyc_home_path(pw_dir)
+        if cleaned:
+            return cleaned
+    except Exception:
+        pass
+    for raw in (os.environ.get("HOME", ""), os.path.expanduser("~")):
+        cleaned = _clean_agyc_home_path(raw)
+        if cleaned:
+            return cleaned
+    return "/tmp"
+
+
+REAL_HOME = resolve_real_home()
+CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
 CACHE_STALE_SECONDS = 30
 REFRESH_LOCK_SECONDS = 15
+
+
+def ensure_cache_dir() -> str:
+    try:
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    except Exception:
+        pass
+    return CACHE_DIR
+
+
+def safe_cache_key(raw: str) -> str:
+    return "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in raw)
 
 
 def extract_agy_alias(text: str) -> str | None:
@@ -59,8 +110,27 @@ def has_agy_word(text: str) -> bool:
         idx = pos + 3
 
 
+def extract_uuid_from_text(text: str) -> str | None:
+    """Extracts a 36-char UUID (8-4-4-4-12) from text without regex import overhead."""
+    if not text or len(text) < 36:
+        return None
+    n = len(text)
+    for i in range(n - 35):
+        cand = text[i : i + 36]
+        if (
+            cand[8] == "-"
+            and cand[13] == "-"
+            and cand[18] == "-"
+            and cand[23] == "-"
+            and all(c in "0123456789abcdefABCDEF-" for c in cand)
+            and cand.count("-") == 4
+        ):
+            return cand.lower()
+    return None
+
+
 def fmt_pct(frac: float | None) -> int:
-    """Exact percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
+    """Exact quota percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
     if frac is None:
         return 100
     f = max(0.0, min(1.0, float(frac)))
@@ -69,6 +139,50 @@ def fmt_pct(frac: float | None) -> int:
     if f <= 0.0:
         return 0
     return int(math.floor(f * 100.0))
+
+
+def fmt_ctx_pct(frac: float | None) -> int:
+    """Exact context percentage: 0 if <=0, 100 if >=0.9995, min(99, round(frac*100)) otherwise."""
+    if frac is None:
+        return 0
+    f = float(frac)
+    if f <= 0.0:
+        return 0
+    if f >= 0.9995:
+        return 100
+    return min(99, int(round(f * 100.0)))
+
+
+def _safe_nonneg_int(val: object) -> int:
+    if val is None or isinstance(val, bool):
+        return 0
+    try:
+        return max(0, int(val))  # type: ignore[arg-type]
+    except Exception:
+        return 0
+
+
+def default_max_tokens_for_model(model_name: str) -> int:
+    """Returns exact default context window capacity by model family."""
+    m = (model_name or "").lower()
+    if "flash-image" in m or "pro-image" in m or ("image" in m and "gemini" in m):
+        return 65_536
+    if any(k in m for k in ("gpt-oss", "120b", "gpt")):
+        return 131_072
+    if any(k in m for k in ("claude", "sonnet", "opus", "haiku")):
+        if "haiku" in m:
+            return 200_000
+        if any(v in m for v in ("4-6", "4.6", "5-5", "5.5")):
+            return 250_000
+        return 200_000
+    return 1_048_576
+
+
+def infer_model_family(hint: str | None) -> str:
+    m = (hint or "").lower()
+    if any(k in m for k in ("claude", "sonnet", "opus", "haiku", "gpt")):
+        return "Claude"
+    return "Gemini"
 
 
 def parse_iso_utc(ts_str: str | None) -> datetime | None:
@@ -127,8 +241,8 @@ def format_compact_countdown(reset_iso: str | None) -> str | None:
 
 def get_default_active_account() -> str:
     config_paths = [
-        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/config.json",
-        "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", "config.json"),
+        os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
     ]
     for cp in config_paths:
         if os.path.exists(cp):
@@ -142,13 +256,13 @@ def get_default_active_account() -> str:
     return "agy01"
 
 
-def scan_proc_agy_panes(default_active: str) -> dict[str, str]:
-    """Maps HERDR_PANE_ID -> agy alias for running agy-real processes via /proc/<pid>/comm."""
-    pane_to_alias: dict[str, str] = {}
+def scan_proc_agy_panes(default_active: str) -> dict[str, tuple[str, int]]:
+    """Maps HERDR_PANE_ID -> (agy alias, pid) for running agy-real processes via /proc/<pid>/comm."""
+    pane_to_info: dict[str, tuple[str, int]] = {}
     try:
         pids = sorted((int(p) for p in os.listdir("/proc") if p.isdigit()))
     except Exception:
-        return pane_to_alias
+        return pane_to_info
 
     for pid in pids:
         try:
@@ -169,16 +283,16 @@ def scan_proc_agy_panes(default_active: str) -> dict[str, str]:
                     if found:
                         alias = found
             if pane_id:
-                pane_to_alias[pane_id] = alias or default_active
+                pane_to_info[pane_id] = (alias or default_active, pid)
         except Exception:
             continue
 
-    return pane_to_alias
+    return pane_to_info
 
 
 def query_herdr_panes() -> list[dict]:
     """Queries Herdr socket for pane.list with 80ms timeout using C-level _socket."""
-    sock_path = os.environ.get("HERDR_SOCKET_PATH") or f"{REAL_HOME}/.config/herdr/herdr.sock"
+    sock_path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(REAL_HOME, ".config", "herdr", "herdr.sock")
     if not os.path.exists(sock_path):
         return []
     s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -210,56 +324,91 @@ def query_herdr_panes() -> list[dict]:
 
 def extract_alias_from_pane(
     pane: dict,
-    proc_map_holder: list[dict[str, str] | None],
+    proc_map_holder: list[dict[str, tuple[str, int]] | None],
     default_active: str,
+    require_live: bool = True,
 ) -> str | None:
     """Returns agy alias if this pane runs agy, else None."""
-    for field in ("display_agent", "terminal_title_stripped", "terminal_title"):
-        val = pane.get(field)
-        if isinstance(val, str) and val:
-            found = extract_agy_alias(val)
-            if found:
-                return found
-
+    pane_id = pane.get("pane_id")
     session = pane.get("agent_session") or {}
-    is_agy_hint = (
+    title_stripped = str(pane.get("terminal_title_stripped") or "")
+    title_raw = str(pane.get("terminal_title") or "")
+
+    title_alias = extract_agy_alias(title_stripped) or extract_agy_alias(title_raw)
+    is_agy_session = (
         pane.get("agent") == "agy"
         or session.get("agent") == "agy"
-        or has_agy_word(str(pane.get("terminal_title_stripped") or ""))
+        or bool(title_alias)
+        or has_agy_word(title_stripped)
     )
 
-    pane_id = pane.get("pane_id")
     if proc_map_holder[0] is None:
         proc_map_holder[0] = scan_proc_agy_panes(default_active)
     proc_map = proc_map_holder[0] or {}
+    proc_entry = proc_map.get(pane_id) if pane_id else None
 
-    if pane_id and pane_id in proc_map:
-        return proc_map[pane_id]
+    if proc_entry is not None:
+        pane["_agy_pid"] = proc_entry[1]
+        return proc_entry[0]
 
-    if is_agy_hint:
+    if is_agy_session:
+        for val in (pane.get("display_agent"), title_stripped, title_raw, pane.get("label")):
+            if isinstance(val, str) and val:
+                found = extract_agy_alias(val)
+                if found:
+                    return found
         return default_active
+
+    if not require_live:
+        disp = pane.get("display_agent")
+        if isinstance(disp, str) and disp:
+            found = extract_agy_alias(disp)
+            if found:
+                return found
 
     return None
 
 
-def detect_target_account() -> tuple[str, str, str | None]:
-    """Returns (alias, source, pane_id)."""
+def detect_target_account(forced_alias: str | None = None) -> tuple[str, str, dict | None]:
+    """Returns (alias, source, target_pane)."""
     default_active = get_default_active_account()
     panes = query_herdr_panes()
     if not panes:
+        if forced_alias:
+            return forced_alias, "cli_arg", None
         for env_k in ("HOME", "ANTIGRAVITY_APP_DATA_DIR"):
             found = extract_agy_alias(os.environ.get(env_k, ""))
             if found:
                 return found, "env", None
         return default_active, "active_account", None
 
-    proc_map_holder: list[dict[str, str] | None] = [None]
-
+    proc_map_holder: list[dict[str, tuple[str, int]] | None] = [None]
     focused_pane = next((p for p in panes if p.get("focused")), None)
+
+    if forced_alias:
+        if focused_pane:
+            a = extract_alias_from_pane(focused_pane, proc_map_holder, default_active, require_live=True)
+            if a == forced_alias:
+                return forced_alias, "cli_arg", focused_pane
+            focused_tab = focused_pane.get("tab_id")
+            if focused_tab:
+                tab_panes = [
+                    p for p in panes
+                    if p.get("tab_id") == focused_tab and p.get("pane_id") != focused_pane.get("pane_id")
+                ]
+                tab_panes.sort(key=lambda p: 0 if "principal" in str(p.get("label") or "").lower() else 1)
+                for tp in tab_panes:
+                    if extract_alias_from_pane(tp, proc_map_holder, default_active, require_live=True) == forced_alias:
+                        return forced_alias, "cli_arg", tp
+        for p in panes:
+            if extract_alias_from_pane(p, proc_map_holder, default_active, require_live=True) == forced_alias:
+                return forced_alias, "cli_arg", p
+        return forced_alias, "cli_arg", None
+
     if focused_pane:
-        alias = extract_alias_from_pane(focused_pane, proc_map_holder, default_active)
+        alias = extract_alias_from_pane(focused_pane, proc_map_holder, default_active, require_live=True)
         if alias:
-            return alias, "focused_pane", focused_pane.get("pane_id")
+            return alias, "focused_pane", focused_pane
 
         focused_tab = focused_pane.get("tab_id")
         if focused_tab:
@@ -269,16 +418,358 @@ def detect_target_account() -> tuple[str, str, str | None]:
             ]
             tab_panes.sort(key=lambda p: 0 if "principal" in str(p.get("label") or "").lower() else 1)
             for tp in tab_panes:
-                alias = extract_alias_from_pane(tp, proc_map_holder, default_active)
+                alias = extract_alias_from_pane(tp, proc_map_holder, default_active, require_live=True)
                 if alias:
-                    return alias, "tab_pane", tp.get("pane_id")
+                    return alias, "tab_pane", tp
+
+        # Fallback if focused pane had sticky metadata and no live agy pane exists in the tab
+        sticky_alias = extract_alias_from_pane(focused_pane, proc_map_holder, default_active, require_live=False)
+        if sticky_alias:
+            return sticky_alias, "focused_pane", None
 
     return default_active, "active_account", None
 
 
+def _scan_transcript_window(raw_bytes: bytes, drop_first_partial: bool, max_tokens: int) -> tuple[float, int, int] | None:
+    lines = raw_bytes.splitlines()
+    if drop_first_partial and lines:
+        lines = lines[1:]
+    trailing_chars = 0
+
+    for raw_line in reversed(lines):
+        line_str = raw_line.decode("utf-8", errors="ignore").strip()
+        if not line_str:
+            continue
+        try:
+            entry = json.loads(line_str)
+        except Exception:
+            trailing_chars += len(line_str)
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        etype = str(entry.get("type") or "")
+        raw_content = entry.get("content")
+        if isinstance(raw_content, str):
+            content_str = raw_content
+        elif raw_content is not None:
+            content_str = json.dumps(raw_content, ensure_ascii=False)
+        else:
+            content_str = ""
+
+        if (
+            etype in ("CHECKPOINT", "CONTEXT_SUMMARY", "COMPACTION")
+            or "# Resuming from a compaction" in content_str
+            or "<CONTEXT_SUMMARY>" in content_str
+        ):
+            est = 16_000 + int((trailing_chars + len(content_str)) / 4.0)
+            frac = min(1.0, max(0.0, est / float(max_tokens)))
+            return (frac, est, max_tokens)
+
+        if etype == "PLANNER_RESPONSE":
+            usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+            in_tok = entry.get("input_tokens") if entry.get("input_tokens") is not None else usage.get("input_tokens")
+            cr_tok = entry.get("cache_read_tokens")
+            if cr_tok is None:
+                cr_tok = entry.get("cache_read_input_tokens")
+            if cr_tok is None:
+                cr_tok = usage.get("cache_read_tokens")
+            if cr_tok is None:
+                cr_tok = usage.get("cache_read_input_tokens")
+            cc_tok = entry.get("cache_creation_input_tokens")
+            if cc_tok is None:
+                cc_tok = entry.get("cache_creation_tokens")
+            if cc_tok is None:
+                cc_tok = usage.get("cache_creation_input_tokens")
+            if cc_tok is None:
+                cc_tok = usage.get("cache_creation_tokens")
+            out_tok = entry.get("output_tokens") if entry.get("output_tokens") is not None else usage.get("output_tokens")
+
+            if in_tok is not None or cr_tok is not None:
+                est = (
+                    _safe_nonneg_int(in_tok)
+                    + _safe_nonneg_int(cr_tok)
+                    + _safe_nonneg_int(cc_tok)
+                    + _safe_nonneg_int(out_tok)
+                    + int(trailing_chars / 4.0)
+                )
+                frac = min(1.0, max(0.0, est / float(max_tokens)))
+                return (frac, est, max_tokens)
+
+        step_chars = len(content_str)
+        if entry.get("tool_calls"):
+            try:
+                step_chars += len(json.dumps(entry["tool_calls"], ensure_ascii=False))
+            except Exception:
+                pass
+        trailing_chars += step_chars
+
+    return None
+
+
+def estimate_context_from_transcript(transcript_path: str, max_tokens: int) -> tuple[float, int, int]:
+    """O(1) tail context estimator from EOF (128 KB -> 512 KB -> post-CHECKPOINT legacy fallback).
+    Never uses pre-compaction full file size.
+    """
+    if max_tokens <= 0:
+        max_tokens = 1_048_576
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return (0.0, 0, max_tokens)
+
+    try:
+        file_size = os.path.getsize(transcript_path)
+    except Exception:
+        return (0.0, 0, max_tokens)
+
+    if file_size <= 0:
+        return (0.0, 0, max_tokens)
+
+    try:
+        with open(transcript_path, "rb") as f:
+            for win_bytes in (131_072, 524_288):
+                offset = max(0, file_size - win_bytes)
+                f.seek(offset)
+                buf = f.read(file_size - offset)
+                res = _scan_transcript_window(buf, drop_first_partial=(offset > 0), max_tokens=max_tokens)
+                if res is not None:
+                    return res
+                if offset == 0:
+                    break
+
+            chunk_size = 1_048_576
+            pos = file_size
+            overlap = b""
+            markers = (b'"CHECKPOINT"', b'"CONTEXT_SUMMARY"', b'"COMPACTION"', b"# Resuming from a compaction", b"<CONTEXT_SUMMARY>")
+            while pos > 0:
+                read_start = max(0, pos - chunk_size)
+                f.seek(read_start)
+                chunk = f.read(pos - read_start)
+                search_buf = chunk + overlap
+                best_idx = -1
+                for mk in markers:
+                    idx = search_buf.rfind(mk)
+                    if idx > best_idx:
+                        best_idx = idx
+                if best_idx != -1:
+                    nl_idx = search_buf.rfind(b"\n", 0, best_idx)
+                    line_offset = read_start + (nl_idx + 1 if nl_idx != -1 else 0)
+                    bytes_after = max(0, file_size - line_offset)
+                    est = int(bytes_after / 4.0)
+                    frac = min(1.0, max(0.0, est / float(max_tokens)))
+                    return (frac, est, max_tokens)
+                overlap = chunk[:128]
+                pos = read_start
+    except Exception:
+        return (0.0, 0, max_tokens)
+
+    est = int(file_size / 4.0)
+    frac = min(1.0, max(0.0, est / float(max_tokens)))
+    return (frac, est, max_tokens)
+
+
+def _find_transcript_for_conv(conv_id: str, alias: str) -> str | None:
+    bases = [
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli"),
+        os.path.join(REAL_HOME, ".agyc_homes", alias, ".gemini", "antigravity-cli"),
+    ]
+    for base in bases:
+        log_dir = os.path.join(base, "brain", conv_id, ".system_generated", "logs")
+        for fname in ("transcript.jsonl", "transcript_full.jsonl"):
+            cand = os.path.join(log_dir, fname)
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+def _peek_model_from_transcript_or_settings(transcript_path: str | None, pane: dict, alias: str) -> str:
+    disp = pane.get("display_agent")
+    if isinstance(disp, str) and disp:
+        parts = disp.split("·")
+        if len(parts) >= 2:
+            cand = parts[1].strip()
+            if cand:
+                return cand
+
+    if transcript_path and os.path.isfile(transcript_path):
+        try:
+            fsize = os.path.getsize(transcript_path)
+            with open(transcript_path, "rb") as f:
+                off = max(0, fsize - 65_536)
+                f.seek(off)
+                lines = f.read(fsize - off).splitlines()
+                if off > 0 and lines:
+                    lines = lines[1:]
+            for raw_line in reversed(lines):
+                try:
+                    d = json.loads(raw_line.decode("utf-8", errors="ignore"))
+                    if isinstance(d, dict) and d.get("model"):
+                        return str(d["model"])
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    for sp in (
+        os.path.join(REAL_HOME, ".agyc_homes", alias, ".gemini", "antigravity-cli", "settings.json"),
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "settings.json"),
+    ):
+        if os.path.exists(sp):
+            try:
+                with open(sp, "r", encoding="utf-8") as f:
+                    m = json.load(f).get("model")
+                    if m:
+                        return str(m)
+            except Exception:
+                pass
+    return "Gemini 3.8 Flash"
+
+
+def _extract_conv_id_from_proc(pid: int) -> str | None:
+    fd_dir = f"/proc/{pid}/fd"
+    if not os.path.isdir(fd_dir):
+        return None
+    marker = "conversations/"
+    try:
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+                mi = target.find(marker)
+                if mi != -1 and target.endswith(".db"):
+                    cid = target[mi + len(marker) : -3]
+                    if len(cid) == 36 and cid.count("-") == 4:
+                        return cid.lower()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _extract_conv_id_from_pane(pane: dict) -> str | None:
+    session = pane.get("agent_session")
+    if isinstance(session, dict):
+        val = session.get("value")
+        if isinstance(val, str) and len(val) == 36 and val.count("-") == 4:
+            return val.lower()
+    for key in ("terminal_title_stripped", "terminal_title"):
+        raw = pane.get(key)
+        if isinstance(raw, str) and raw:
+            found = extract_uuid_from_text(raw)
+            if found:
+                return found
+    agy_pid = pane.get("_agy_pid")
+    if isinstance(agy_pid, int) and agy_pid > 1:
+        return _extract_conv_id_from_proc(agy_pid)
+    return None
+
+
+def load_pane_context(target_pane: dict | None, alias: str) -> dict | None:
+    """Resolves active panel context (ctx_pct, family, conv_id):
+    1) ~/.cache/agyc/pane_ctx_{safe_pane}.json (validating conv_id) or pane_ctx_{safe_conv}.json
+    2) target_pane["tokens"]["ctx_pct"] / target_pane["tokens"]["ctx"]
+    3) Fast <1ms O(1) estimate_context_from_transcript on brain/<conv_id>/.../transcript.jsonl
+    """
+    if not isinstance(target_pane, dict):
+        return None
+
+    ensure_cache_dir()
+    pane_id = target_pane.get("pane_id")
+    pane_conv_id = _extract_conv_id_from_pane(target_pane)
+    conv_mismatch_on_pane_cache = False
+
+    # 1a. Persisted pane_ctx_{safe_pane}.json (authoritative for this pane even after /resume inside agy)
+    if isinstance(pane_id, str) and pane_id:
+        pfile = os.path.join(CACHE_DIR, f"pane_ctx_{safe_cache_key(pane_id)}.json")
+        if os.path.isfile(pfile):
+            try:
+                with open(pfile, "r", encoding="utf-8") as f:
+                    pdata = json.load(f)
+                if isinstance(pdata, dict) and pdata.get("ctx_pct") is not None:
+                    cached_conv = pdata.get("conv_id")
+                    cached_acc = str(pdata.get("account") or "").lower()
+                    if not alias or not cached_acc or cached_acc == str(alias).lower():
+                        fam = pdata.get("family") or infer_model_family(pdata.get("model"))
+                        return {
+                            "ctx_pct": max(0, min(100, int(pdata["ctx_pct"]))),
+                            "family": "Claude" if str(fam).lower() == "claude" else "Gemini",
+                            "conv_id": cached_conv or pane_conv_id,
+                            "model": pdata.get("model"),
+                            "source": "pane_cache",
+                        }
+                    conv_mismatch_on_pane_cache = True
+            except Exception:
+                pass
+
+    # 1b. Persisted pane_ctx_{safe_conv}.json
+    if pane_conv_id:
+        cfile = os.path.join(CACHE_DIR, f"pane_ctx_{safe_cache_key(pane_conv_id)}.json")
+        if os.path.isfile(cfile):
+            try:
+                with open(cfile, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                if isinstance(cdata, dict) and cdata.get("ctx_pct") is not None:
+                    fam = cdata.get("family") or infer_model_family(cdata.get("model"))
+                    return {
+                        "ctx_pct": max(0, min(100, int(cdata["ctx_pct"]))),
+                        "family": "Claude" if str(fam).lower() == "claude" else "Gemini",
+                        "conv_id": pane_conv_id,
+                        "model": cdata.get("model"),
+                        "source": "conv_cache",
+                    }
+            except Exception:
+                pass
+
+    # 2. Herdr pane.tokens ("ctx_pct" or "ctx") when not stale from another conv_id
+    tokens = target_pane.get("tokens")
+    if not conv_mismatch_on_pane_cache and isinstance(tokens, dict):
+        raw_tok_ctx = tokens.get("ctx_pct")
+        if raw_tok_ctx is None:
+            raw_tok_ctx = tokens.get("ctx")
+        if raw_tok_ctx is not None:
+            try:
+                pct_num = int(str(raw_tok_ctx).strip().rstrip("%"))
+                if 0 <= pct_num <= 100:
+                    model_hint = _peek_model_from_transcript_or_settings(None, target_pane, alias)
+                    return {
+                        "ctx_pct": pct_num,
+                        "family": infer_model_family(model_hint),
+                        "conv_id": pane_conv_id,
+                        "model": model_hint,
+                        "source": "herdr_tokens",
+                    }
+            except Exception:
+                pass
+
+    # 3. Direct <1ms O(1) tail estimation on transcript.jsonl before statusline has fired
+    if pane_conv_id:
+        tpath = _find_transcript_for_conv(pane_conv_id, alias)
+        model_hint = _peek_model_from_transcript_or_settings(tpath, target_pane, alias)
+        family = infer_model_family(model_hint)
+        if tpath:
+            max_t = default_max_tokens_for_model(model_hint)
+            frac, _, _ = estimate_context_from_transcript(tpath, max_t)
+            return {
+                "ctx_pct": fmt_ctx_pct(frac),
+                "family": family,
+                "conv_id": pane_conv_id,
+                "model": model_hint,
+                "source": "transcript",
+            }
+        return {
+            "ctx_pct": 0,
+            "family": family,
+            "conv_id": pane_conv_id,
+            "model": model_hint,
+            "source": "new_session",
+        }
+
+    return None
+
+
 def spawn_statusline_refresh(alias: str) -> None:
-    """Triggers agyc-statusline --refresh-quota-bg <alias> throttled by 15s lock."""
-    lock_file = f"/tmp/agyc_quota_refreshing_{alias}.lock"
+    """Triggers agyc-statusline --refresh-quota-bg <alias> throttled by 15s lock in ~/.cache/agyc."""
+    ensure_cache_dir()
+    lock_file = os.path.join(CACHE_DIR, f"quota_refreshing_{safe_cache_key(alias)}.lock")
     now_ts = time.time()
     if os.path.exists(lock_file):
         try:
@@ -298,8 +789,8 @@ def spawn_statusline_refresh(alias: str) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, "agyc-statusline"),
-        f"{REAL_HOME}/.local/bin/agyc-statusline",
-        f"{REAL_HOME}/proyectos/agyc-antigravity-cli-switcher/bin/agyc-statusline",
+        os.path.join(REAL_HOME, ".local", "bin", "agyc-statusline"),
+        os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
     ]
     statusline_bin = next((c for c in candidates if os.path.exists(c)), None)
     if not statusline_bin:
@@ -309,6 +800,7 @@ def spawn_statusline_refresh(alias: str) -> None:
         import subprocess
         env = os.environ.copy()
         env["HOME"] = REAL_HOME
+        env["AGYC_REAL_HOME"] = REAL_HOME
         subprocess.Popen(
             [sys.executable, "-S", statusline_bin, "--refresh-quota-bg", alias],
             stdout=subprocess.DEVNULL,
@@ -321,27 +813,37 @@ def spawn_statusline_refresh(alias: str) -> None:
 
 
 def load_account_quota(alias: str) -> tuple[dict, str | None]:
-    """Reads /tmp/agyc_quota_cache_{alias}.json (spawning bg refresh if missing or >30s old)
-    with fallback to accounts/{alias}.json.
+    """Reads ~/.cache/agyc/quota_cache_{alias}.json (fallback /tmp + accounts/{alias}.json),
+    spawning bg refresh if missing or >30s old.
     """
-    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
-    acc_file = f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json"
+    ensure_cache_dir()
+    primary_cache = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
+    legacy_cache = f"/tmp/agyc_quota_cache_{alias}.json"
+    acc_file = os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", f"{alias}.json")
     now_ts = time.time()
 
     quota: dict | None = None
     plan_type: str | None = None
+    used_legacy = False
 
-    if os.path.exists(cache_file):
+    if os.path.exists(primary_cache):
         try:
-            with open(cache_file, "r", encoding="utf-8") as f:
+            with open(primary_cache, "r", encoding="utf-8") as f:
                 quota = json.load(f)
+        except Exception:
+            quota = None
+    elif os.path.exists(legacy_cache):
+        try:
+            with open(legacy_cache, "r", encoding="utf-8") as f:
+                quota = json.load(f)
+            used_legacy = True
         except Exception:
             quota = None
 
     if isinstance(quota, dict):
         plan_type = quota.get("plan_type")
         age = now_ts - float(quota.get("cached_at", 0) or 0)
-        if age > CACHE_STALE_SECONDS or "fetched_at" not in quota:
+        if used_legacy or age > CACHE_STALE_SECONDS or "fetched_at" not in quota:
             spawn_statusline_refresh(alias)
     else:
         spawn_statusline_refresh(alias)
@@ -371,17 +873,21 @@ def format_family_segment(
     cd_5h: str | None,
     pct_sem: int,
     cd_sem: str | None,
+    ctx_pct: int | None = None,
 ) -> str:
-    if pct_5h < 100 and cd_5h:
+    """Formats family quota segment in exact `5H -> Ctx -> Sem` order."""
+    if 0 <= pct_5h < 100 and cd_5h:
         s5 = f"5H: {pct_5h}% ({cd_5h})"
     else:
         s5 = f"5H: {pct_5h}%"
 
-    if pct_sem == 0 and cd_sem:
-        ss = f"Sem: 0% ({cd_sem})"
+    if 0 <= pct_sem < 100 and cd_sem:
+        ss = f"Sem: {pct_sem}% ({cd_sem})"
     else:
         ss = f"Sem: {pct_sem}%"
 
+    if ctx_pct is not None:
+        return f"{label} {s5} · Ctx: {ctx_pct}% · {ss}"
     return f"{label} {s5} · {ss}"
 
 
@@ -393,10 +899,9 @@ def main() -> None:
         if a == "--account" and i + 1 < len(args):
             forced_alias = args[i + 1].strip().lower()
 
-    if forced_alias:
-        alias, source, pane_id = forced_alias, "cli_arg", None
-    else:
-        alias, source, pane_id = detect_target_account()
+    alias, source, target_pane = detect_target_account(forced_alias=forced_alias)
+    pane_id = target_pane.get("pane_id") if isinstance(target_pane, dict) else None
+    ctx_info = load_pane_context(target_pane, alias)
 
     quota, plan_type = load_account_quota(alias)
     now_dt = datetime.now(timezone.utc)
@@ -420,9 +925,12 @@ def main() -> None:
     g5_cd, gw_cd = format_compact_countdown(g5_r), format_compact_countdown(gw_r)
     c5_cd, cw_cd = format_compact_countdown(c5_r), format_compact_countdown(cw_r)
 
+    gem_ctx = ctx_info["ctx_pct"] if (ctx_info and ctx_info.get("family") == "Gemini") else None
+    cld_ctx = ctx_info["ctx_pct"] if (ctx_info and ctx_info.get("family") == "Claude") else None
+
     head = f"⚡ {alias} [{plan_type}]" if plan_type else f"⚡ {alias}"
-    gem_seg = format_family_segment("Gemini", g5_pct, g5_cd, gw_pct, gw_cd)
-    cld_seg = format_family_segment("Claude", c5_pct, c5_cd, cw_pct, cw_cd)
+    gem_seg = format_family_segment("Gemini", g5_pct, g5_cd, gw_pct, gw_cd, ctx_pct=gem_ctx)
+    cld_seg = format_family_segment("Claude", c5_pct, c5_cd, cw_pct, cw_cd, ctx_pct=cld_ctx)
     text = f"{head} │ {gem_seg} │ {cld_seg}"
 
     if as_json:
@@ -431,8 +939,25 @@ def main() -> None:
             "plan_type": plan_type,
             "source": source,
             "pane_id": pane_id,
-            "gemini": {"pct_5h": g5_pct, "reset_5h": g5_r, "cd_5h": g5_cd, "pct_weekly": gw_pct, "reset_weekly": gw_r, "cd_weekly": gw_cd},
-            "claude": {"pct_5h": c5_pct, "reset_5h": c5_r, "cd_5h": c5_cd, "pct_weekly": cw_pct, "reset_weekly": cw_r, "cd_weekly": cw_cd},
+            "context": ctx_info,
+            "gemini": {
+                "pct_5h": g5_pct,
+                "reset_5h": g5_r,
+                "cd_5h": g5_cd,
+                "ctx_pct": gem_ctx,
+                "pct_weekly": gw_pct,
+                "reset_weekly": gw_r,
+                "cd_weekly": gw_cd,
+            },
+            "claude": {
+                "pct_5h": c5_pct,
+                "reset_5h": c5_r,
+                "cd_5h": c5_cd,
+                "ctx_pct": cld_ctx,
+                "pct_weekly": cw_pct,
+                "reset_weekly": cw_r,
+                "cd_weekly": cw_cd,
+            },
             "text": text,
         }
         print(json.dumps(out, ensure_ascii=False))

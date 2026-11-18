@@ -133,13 +133,25 @@ agyc auto ultra   # alias de 'carbon': rota únicamente entre cuentas Google AI 
 
 ## Visualización en Vivo: Pie (`statusLine`) y Barra Superior (`Top Bar`)
 
-`agyc v1.5` ofrece monitoreo de consumo en tiempo real en **tres superficies complementarias**:
+`agyc v1.5` ofrece monitoreo de consumo y ventana de contexto real (respetando compactaciones `CHECKPOINT` y `current_usage` en O(1)) con el **orden unificado `5H → Ctx → Sem` en las cuatro superficies**:
 
-### 1. Pie de terminal en `agy` y metadatos en Herdr (`agyc-statusline`)
-Muestra al pie del prompt de Antigravity la cuenta activa, plan (`ULTRA`/`PRO`), rama Git, modelo + nivel de esfuerzo, cuota en vivo (`5H` / `Sem`) del grupo activo y uso de ventana de contexto (`Ctx`), además de sincronizar metadatos dinámicos por panel en Herdr (`pane.report_metadata`).
+### 1. Pie de terminal en `agy` y borde superior de panel en Herdr (`agyc-statusline`)
+Muestra al pie del prompt de Antigravity la cuenta activa, plan (`ULTRA`/`PRO`), rama Git, modelo + nivel de esfuerzo y telemetría en vivo en orden **`5H → Ctx → Sem`**, además de sincronizar metadatos dinámicos por panel en Herdr (`pane.report_metadata`) usando caché privada segura en `~/.cache/agyc` (`0700`):
+
+```text
+# Pie de terminal (agyc-statusline):
+⚡ agy01·ULTRA │ 🌿 main │ 🤖 Gemini 4 Carbon (high) │ 5H: [███████░] 91% (⏳ 3h 15m) │ Ctx: [███░░░░░] 36% (376k/1M) │ Sem: [████████] 97% (6d 21h)
+
+# Borde superior del panel en Herdr (display_agent):
+⚡ agy01 [ULTRA] · Gemini 4 Carbon · 5H:91% Ctx:36% Sem:97%
+```
 
 ### 2. Barra Superior de `agy` (`agyc-titleline`)
-Mediante el symlink `agyc-titleline -> agyc-statusline` configurado en el bloque `"title"` de `~/.gemini/antigravity-cli/settings.json` (activable/desactivable en caliente con `/title on` o `/title off`), Antigravity `1.5.10` emite dinámicamente la línea OSC de título compacto (cuenta, plan, modelo y cuota) a la **Barra Superior de la ventana / pestaña**.
+Mediante el symlink `agyc-titleline -> agyc-statusline` configurado en el bloque `"title"` de `~/.gemini/antigravity-cli/settings.json` (activable/desactivable en caliente con `/title on` o `/title off`), Antigravity `1.5.10` emite dinámicamente la línea OSC de título compacto (`5H → Ctx → Sem`) a la **Barra Superior de la ventana / pestaña** y sincroniza también el borde del panel en Herdr:
+
+```text
+⚡ agy01 [ULTRA] · Gemini 4 Carbon (high) · 5H: 91% (3h 15m) · Ctx: 36% · Sem: 97% (6d 21h)
+```
 
 Configuración inyectada automáticamente por `install.sh` en `settings.json`:
 
@@ -159,7 +171,7 @@ Configuración inyectada automáticamente por `install.sh` en `settings.json`:
 ```
 
 ### 3. Barra Superior Global en Herdr (`agyc-topbar`)
-Para visualizar el pulso en vivo (<20ms, sin bloqueo) de la cuenta enfocada en el extremo derecho de la barra global de pestañas de **Herdr** (`ui.tab_bar_right`), añade en `~/.config/herdr/config.toml`:
+Para visualizar el pulso en vivo (<20ms, sin bloqueo) de la cuenta y conversación enfocada en el extremo derecho de la barra global de pestañas de **Herdr** (`ui.tab_bar_right`), añade en `~/.config/herdr/config.toml`:
 
 ```toml
 [[ui.tab_bar_right]]
@@ -169,9 +181,16 @@ interval_seconds = 5
 timeout_seconds = 2
 ```
 
+En la familia activa del panel (`Gemini` o `Claude`), `agyc-topbar` inserta `Ctx: XX%` justo después de `5H` y antes de `Sem`:
+
+```text
+⚡ agy01 [ULTRA] │ Gemini 5H: 91% (3h15m) · Ctx: 36% · Sem: 97% (6d21h) │ Claude 5H: 100% · Sem: 100%
+```
+
 Así dispones simultáneamente de:
-- **Metadatos dinámicos por panel** (qué `agyXX` + plan + saldo corre en cada panel dividido).
-- **Widget global superior derecho** (`agyc-topbar` en `ui.tab_bar_right`).
+- **Bordes dinámicos por panel en Herdr** (`⚡ agyXX [PLAN] · Modelo · 5H:..% Ctx:..% Sem:..%` en cada panel dividido).
+- **Widget global superior derecho** (`agyc-topbar` en `ui.tab_bar_right` con `% Ctx` del panel activo).
+- **Título OSC de ventana/pestaña** (`agyc-titleline` en `"title"`).
 - **Barra detallada inferior** (`agyc-statusline` dentro de cada TUI de `agy`).
 
 ---
@@ -270,7 +289,7 @@ Modo Gemini (Argon / Hydrogen / Orchestrator / 3.8 Flash):
 | **v1.2** | Oct 15, 2026 | `agyc renew`, `agyc wipe`, corrección de rutas de entorno en Snap |
 | **v1.3** | Oct 15, 2026 | Perfiles `HOME` aislados (`prepare_isolated_home()`), ejecución paralela sin colisiones |
 | **v1.4** | Oct 16, 2026 | Soporte preliminar para Gemini 4 Argon, wrapper `bin/agy` y actualizador `agyc update` |
-| **v1.5** | Nov 2026 | Esquema oficial **Antigravity 1.5.10**: soporte cuentas **`PRO` / `ULTRA`**, **2 grupos unificados de cuotas** (`Gemini` y `Claude & GPT`), tabla compacta de 6 columnas (`Disponible` al 100%), `agyc auto [gemini\|claude\|carbon\|ultra]`, **Top Bar en vivo** (`agyc-titleline` en `"title"` + metadatos Herdr + `agyc-topbar` en `ui.tab_bar_right`) |
+| **v1.5** | Nov 2026 | Esquema oficial **Antigravity 1.5.10**: soporte cuentas **`PRO` / `ULTRA`**, **2 grupos unificados de cuotas** (`Gemini` y `Claude & GPT`), tabla compacta de 6 columnas (`Disponible` al 100%), `agyc auto [gemini\|claude\|carbon\|ultra]`, **Top/Bottom Bar en vivo con `% Ctx` real y orden unificado `5H → Ctx → Sem`** (`agyc-statusline`, `agyc-titleline`, bordes Herdr y `agyc-topbar` con caché segura `~/.cache/agyc`) |
 
 ---
 

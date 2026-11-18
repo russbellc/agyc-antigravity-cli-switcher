@@ -24,10 +24,19 @@ RESET="\033[0m"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Resolver HOME real incluso si se ejecuta desde un panel con perfil aislado (~/.agyc_homes/agyXX)
-REAL_HOME="$HOME"
+# Resolver HOME real dinámicamente incluso si se ejecuta desde un panel con perfil aislado (~/.agyc_homes/agyXX)
+REAL_HOME="${AGYC_REAL_HOME:-$HOME}"
 if [[ "$REAL_HOME" == *"/.agyc_homes/"* ]]; then
     REAL_HOME="${REAL_HOME%%/.agyc_homes/*}"
+elif [[ "$REAL_HOME" == *"/.agyc_homes" ]]; then
+    REAL_HOME="${REAL_HOME%/.agyc_homes}"
+fi
+if [ -z "$REAL_HOME" ] || [ ! -d "$REAL_HOME" ]; then
+    PW_HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+    PW_HOME="${PW_HOME%%/.agyc_homes/*}"
+    if [ -n "$PW_HOME" ] && [ -d "$PW_HOME" ]; then
+        REAL_HOME="$PW_HOME"
+    fi
 fi
 
 AGY_BIN_DIR="$REAL_HOME/.gemini/antigravity-cli/bin"
@@ -56,7 +65,6 @@ echo -e "  ${DIM}Python: $PYTHON_VER${RESET}"
 AGY_REAL=""
 for path in \
     "$AGY_BIN_DIR/agy-real" \
-    "$LOCAL_BIN/agy" \
     /snap/antigravity-cli/current/bin/agy \
     /snap/antigravity-cli/23/bin/agy; do
     if [ -f "$path" ]; then
@@ -64,6 +72,9 @@ for path in \
         break
     fi
 done
+if [ -z "$AGY_REAL" ] && [ -f "$LOCAL_BIN/agy" ] && [ ! -L "$LOCAL_BIN/agy" ] && ! grep -q "agyc update" "$LOCAL_BIN/agy" 2>/dev/null; then
+    AGY_REAL="$LOCAL_BIN/agy"
+fi
 
 if [ -z "$AGY_REAL" ]; then
     echo -e "${YELLOW}⚠ Binario agy no encontrado en ~/.gemini/antigravity-cli/bin, ~/.local/bin ni snap.${RESET}"
@@ -76,11 +87,27 @@ fi
 echo -e "${GREEN}✓ Requisitos verificados${RESET}"
 echo ""
 
-# ── Paso 2: Crear directorios ─────────────────────────────────────────────────
-echo -e "${BOLD}[2/7] Creando directorios...${RESET}"
+# ── Paso 2: Crear directorios y endurecer permisos (0700 / 0600) ─────────────
+echo -e "${BOLD}[2/7] Creando directorios y asegurando permisos privados...${RESET}"
 mkdir -p "$AGY_BIN_DIR"
 mkdir -p "$LOCAL_BIN"
-mkdir -p "$REAL_HOME/.agyc_homes"
+mkdir -p -m 700 "$REAL_HOME/.agyc_homes"
+chmod 700 "$REAL_HOME/.agyc_homes"
+mkdir -p -m 700 "$REAL_HOME/.gemini/antigravity-cli/accounts"
+chmod 700 "$REAL_HOME/.gemini/antigravity-cli/accounts"
+mkdir -p -m 700 "$REAL_HOME/.cache/agyc" "$REAL_HOME/.cache/agyc/locks"
+chmod 700 "$REAL_HOME/.cache/agyc" "$REAL_HOME/.cache/agyc/locks"
+
+for iso_dir in "$REAL_HOME/.agyc_homes"/*; do
+    if [ -d "$iso_dir" ] && [ ! -L "$iso_dir" ]; then
+        chmod 700 "$iso_dir" 2>/dev/null || true
+    fi
+done
+for acc_file in "$REAL_HOME/.gemini/antigravity-cli/accounts"/*.json; do
+    if [ -f "$acc_file" ] && [ ! -L "$acc_file" ]; then
+        chmod 600 "$acc_file" 2>/dev/null || true
+    fi
+done
 if [ -d "$SNAP_BIN_DIR" ] || mkdir -p "$SNAP_BIN_DIR" 2>/dev/null; then
     echo -e "  ${DIM}$SNAP_BIN_DIR${RESET}"
 fi
@@ -189,16 +216,23 @@ if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
     fi
 fi
 
-# 6. Preconfigurar statusLine (agyc-statusline) y title (agyc-titleline) en settings.json
+# 6. Preconfigurar statusLine (agyc-statusline) y title (agyc-titleline) en settings.json (0600)
 REAL_HOME="$REAL_HOME" python3 -c '
 import json, os, glob
+
+def write_json_600(path, payload):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
 
 real_home = os.environ["REAL_HOME"]
 main_settings = os.path.join(real_home, ".gemini", "antigravity-cli", "settings.json")
 os.makedirs(os.path.dirname(main_settings), exist_ok=True)
 if not os.path.exists(main_settings):
-    with open(main_settings, "w", encoding="utf-8") as f:
-        json.dump({}, f, indent=2)
+    write_json_600(main_settings, {})
 
 configs = glob.glob(os.path.join(real_home, ".agyc_homes", "*", ".gemini", "antigravity-cli", "settings.json")) + [
     main_settings,
@@ -215,13 +249,14 @@ for p in configs:
     try:
         with open(rp, "r", encoding="utf-8") as f:
             d = json.load(f)
+        if not isinstance(d, dict):
+            d = {}
     except Exception:
         d = {}
     d["statusLine"] = {"type": "command", "command": "agyc-statusline", "enabled": True}
     d["title"] = {"type": "command", "command": "agyc-titleline", "enabled": True}
     try:
-        with open(rp, "w", encoding="utf-8") as f:
-            json.dump(d, f, indent=2)
+        write_json_600(rp, d)
     except Exception:
         pass
 ' 2>/dev/null || true
@@ -244,19 +279,25 @@ done
 echo -e "${GREEN}✓ Lanzadores agy01..agy15 creados en $AGY_BIN_DIR y $LOCAL_BIN${RESET}"
 echo ""
 
-# ── Paso 5: Configurar PATH ───────────────────────────────────────────────────
+# ── Paso 5: Configurar PATH (sin contaminar SSH_TTY global en el shell) ───────
 echo -e "${BOLD}[5/7] Configurando PATH...${RESET}"
 SHELL_RC="$REAL_HOME/.bashrc"
 [ -n "$ZSH_VERSION" ] && SHELL_RC="$REAL_HOME/.zshrc"
 
 PATH_LINE='export PATH="$HOME/.local/bin:$HOME/.gemini/antigravity-cli/bin:$PATH"'
-SSH_LINE='export SSH_TTY="${SSH_TTY:-/dev/pts/0}"'
+
+# Limpiar export SSH_TTY=/dev/pts/0 global heredado de versiones anteriores en ~/.bashrc y ~/.zshrc
+for rc_file in "$REAL_HOME/.bashrc" "$REAL_HOME/.zshrc"; do
+    if [ -f "$rc_file" ] && grep -qE '^[[:space:]]*export[[:space:]]+SSH_TTY=.*\/dev\/pts\/0' "$rc_file" 2>/dev/null; then
+        sed -i '/^[[:space:]]*export[[:space:]]\+SSH_TTY=.*\/dev\/pts\/0/d' "$rc_file"
+        echo -e "  ${DIM}Eliminado export SSH_TTY global heredado en $rc_file${RESET}"
+    fi
+done
 
 if ! grep -qF '.gemini/antigravity-cli/bin' "$SHELL_RC" 2>/dev/null; then
     echo "" >> "$SHELL_RC"
     echo "# agyc — multi-account switcher para Google Antigravity" >> "$SHELL_RC"
     echo "$PATH_LINE" >> "$SHELL_RC"
-    echo "$SSH_LINE" >> "$SHELL_RC"
     echo -e "  ${DIM}PATH añadido a $SHELL_RC${RESET}"
 else
     echo -e "  ${DIM}PATH ya configurado en $SHELL_RC${RESET}"
@@ -290,7 +331,6 @@ fi
 
 # Aplicar PATH en sesión actual
 export PATH="$REAL_HOME/.local/bin:$REAL_HOME/.gemini/antigravity-cli/bin:$PATH"
-export SSH_TTY="${SSH_TTY:-/dev/pts/0}"
 
 echo ""
 echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════════════╗${RESET}"

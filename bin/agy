@@ -6,21 +6,52 @@ if [ "$1" = "update" ] || [ "$1" = "upgrade" ]; then
   exec agyc update "${@:2}"
 fi
 
-REAL_AGY="$HOME/.gemini/antigravity-cli/bin/agy-real"
-if [ ! -x "$REAL_AGY" ]; then
-  REAL_AGY="/home/aidev/.gemini/antigravity-cli/bin/agy-real"
-  if [ ! -x "$REAL_AGY" ]; then
-    REAL_AGY="/home/aidev/.local/bin/agy"
-    if [ ! -x "$REAL_AGY" ]; then
-      REAL_AGY="/snap/antigravity-cli/current/bin/agy"
-      if [ ! -x "$REAL_AGY" ]; then
-        REAL_AGY="/snap/antigravity-cli/23/bin/agy"
-      fi
-    fi
+# Resolver REAL_HOME dinámicamente (inmune a perfiles aislados ~/.agyc_homes/<alias>)
+REAL_HOME="${AGYC_REAL_HOME:-${REAL_HOME:-$HOME}}"
+if [[ "$REAL_HOME" == *"/.agyc_homes/"* ]]; then
+  REAL_HOME="${REAL_HOME%%/.agyc_homes/*}"
+elif [[ "$REAL_HOME" == *"/.agyc_homes" ]]; then
+  REAL_HOME="${REAL_HOME%/.agyc_homes}"
+fi
+if [ -z "$REAL_HOME" ] || [ ! -d "$REAL_HOME" ]; then
+  PW_HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+  PW_HOME="${PW_HOME%%/.agyc_homes/*}"
+  if [ -n "$PW_HOME" ] && [ -d "$PW_HOME" ]; then
+    REAL_HOME="$PW_HOME"
   fi
 fi
 
-# Forzar almacenamiento basado en archivo para evitar prompts de keyring en desktop
+# Buscar únicamente binarios nativos reales (jamás ~/.local/bin/agy para evitar recursión infinita)
+REAL_AGY=""
+for cand in \
+  "$REAL_HOME/.gemini/antigravity-cli/bin/agy-real" \
+  "$HOME/.gemini/antigravity-cli/bin/agy-real" \
+  "/snap/antigravity-cli/current/bin/agy"; do
+  if [ -x "$cand" ] && [ ! -d "$cand" ]; then
+    REAL_AGY="$cand"
+    break
+  fi
+done
+
+if [ -z "$REAL_AGY" ]; then
+  for snap_cand in /snap/antigravity-cli/*/bin/agy; do
+    if [ -x "$snap_cand" ] && [ ! -d "$snap_cand" ]; then
+      REAL_AGY="$snap_cand"
+      break
+    fi
+  done
+fi
+
+if [ -z "$REAL_AGY" ]; then
+  echo "Error: No se encontró el motor nativo de Google Antigravity ('agy-real')." >&2
+  echo "Rutas verificadas:" >&2
+  echo "  - $REAL_HOME/.gemini/antigravity-cli/bin/agy-real" >&2
+  echo "  - /snap/antigravity-cli/current/bin/agy" >&2
+  echo "Ejecuta 'agyc update' para descargar e instalar el binario oficial." >&2
+  exit 1
+fi
+
+# Forzar almacenamiento basado en archivo solo para el proceso agy (evita prompts de keyring en desktop)
 if [ -z "$SSH_TTY" ] && [ -z "$SSH_CLIENT" ]; then
   export SSH_TTY="${TTY:-/dev/pts/0}"
 fi

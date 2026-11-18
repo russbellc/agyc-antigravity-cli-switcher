@@ -1,0 +1,445 @@
+#!/usr/bin/python3 -S
+"""
+agyc-topbar: Ultra-lightweight (<20ms) Global Top Bar widget for Herdr (ui.tab_bar_right).
+Detects the active/focused agy account in Herdr (focused pane -> same tab -> active_account)
+and renders live Gemini + Claude 5H & Weekly quota without blocking.
+"""
+
+import sys
+import os
+import json
+import math
+import time
+import _socket
+from datetime import datetime, timezone
+
+REAL_HOME = "/home/aidev"
+CACHE_STALE_SECONDS = 30
+REFRESH_LOCK_SECONDS = 15
+
+
+def extract_agy_alias(text: str) -> str | None:
+    """Finds word-bounded agy01..agy99 in text without regex import overhead."""
+    if not text:
+        return None
+    low = text.lower()
+    idx = 0
+    n = len(low)
+    while True:
+        pos = low.find("agy", idx)
+        if pos == -1:
+            return None
+        if pos > 0 and (low[pos - 1].isalnum() or low[pos - 1] == "_"):
+            idx = pos + 3
+            continue
+        end = pos + 3
+        while end < n and low[end].isdigit():
+            end += 1
+        digits_len = end - (pos + 3)
+        if 1 <= digits_len <= 2 and (end == n or not (low[end].isalnum() or low[end] == "_")):
+            return low[pos:end]
+        idx = pos + 3
+
+
+def has_agy_word(text: str) -> bool:
+    """Checks for word-bounded 'agy' without regex import overhead."""
+    if not text:
+        return False
+    low = text.lower()
+    idx = 0
+    n = len(low)
+    while True:
+        pos = low.find("agy", idx)
+        if pos == -1:
+            return False
+        before_ok = (pos == 0) or not (low[pos - 1].isalnum() or low[pos - 1] == "_")
+        after_ok = (pos + 3 == n) or not (low[pos + 3].isalnum() or low[pos + 3] == "_")
+        if before_ok and after_ok:
+            return True
+        idx = pos + 3
+
+
+def fmt_pct(frac: float | None) -> int:
+    """Exact percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
+    if frac is None:
+        return 100
+    f = max(0.0, min(1.0, float(frac)))
+    if f >= 0.9995:
+        return 100
+    if f <= 0.0:
+        return 0
+    return int(math.floor(f * 100.0))
+
+
+def parse_iso_utc(ts_str: str | None) -> datetime | None:
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        s = ts_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def normalize_slot(
+    frac: float | None,
+    reset_iso: str | None,
+    now_dt: datetime,
+    disabled: bool = False,
+) -> tuple[float, str | None]:
+    if reset_iso:
+        dt = parse_iso_utc(reset_iso)
+        if dt is not None and dt <= now_dt:
+            return 1.0, None
+    f = 1.0 if frac is None else max(0.0, min(1.0, float(frac)))
+    if disabled:
+        f = 0.0
+    if f >= 0.9995:
+        return 1.0, None
+    return f, reset_iso
+
+
+def format_compact_countdown(reset_iso: str | None) -> str | None:
+    """Compact countdown for topbar (e.g. '4h25m', '6d23h', '42m')."""
+    if not reset_iso:
+        return None
+    dt = parse_iso_utc(reset_iso)
+    if dt is None:
+        return None
+    total_sec = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if total_sec <= 0:
+        return None
+    hrs = total_sec // 3600
+    mins = (total_sec % 3600) // 60
+    if hrs >= 24:
+        days = hrs // 24
+        rem_hrs = hrs % 24
+        return f"{days}d{rem_hrs:02d}h" if rem_hrs else f"{days}d"
+    if hrs > 0:
+        return f"{hrs}h{mins:02d}m"
+    return f"{mins}m"
+
+
+def get_default_active_account() -> str:
+    config_paths = [
+        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/config.json",
+        "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
+    ]
+    for cp in config_paths:
+        if os.path.exists(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as f:
+                    act = json.load(f).get("active_account")
+                    if act:
+                        return str(act).lower()
+            except Exception:
+                pass
+    return "agy01"
+
+
+def scan_proc_agy_panes(default_active: str) -> dict[str, str]:
+    """Maps HERDR_PANE_ID -> agy alias for running agy-real processes via /proc/<pid>/comm."""
+    pane_to_alias: dict[str, str] = {}
+    try:
+        pids = sorted((int(p) for p in os.listdir("/proc") if p.isdigit()))
+    except Exception:
+        return pane_to_alias
+
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as cf:
+                comm = cf.read().strip()
+            if comm != b"agy-real":
+                continue
+            with open(f"/proc/{pid}/environ", "rb") as ef:
+                env_bytes = ef.read()
+            pane_id = None
+            alias = None
+            for item in env_bytes.split(b"\x00"):
+                if item.startswith(b"HERDR_PANE_ID="):
+                    pane_id = item[14:].decode("utf-8", errors="ignore").strip()
+                elif item.startswith(b"HOME=") or item.startswith(b"ANTIGRAVITY_APP_DATA_DIR="):
+                    val = item.split(b"=", 1)[1].decode("utf-8", errors="ignore")
+                    found = extract_agy_alias(val)
+                    if found:
+                        alias = found
+            if pane_id:
+                pane_to_alias[pane_id] = alias or default_active
+        except Exception:
+            continue
+
+    return pane_to_alias
+
+
+def query_herdr_panes() -> list[dict]:
+    """Queries Herdr socket for pane.list with 80ms timeout using C-level _socket."""
+    sock_path = os.environ.get("HERDR_SOCKET_PATH") or f"{REAL_HOME}/.config/herdr/herdr.sock"
+    if not os.path.exists(sock_path):
+        return []
+    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    s.settimeout(0.08)
+    try:
+        s.connect(sock_path)
+        s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
+        chunks: list[bytes] = []
+        while True:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+        raw = b"".join(chunks).split(b"\n", 1)[0]
+        if not raw:
+            return []
+        resp = json.loads(raw.decode("utf-8", errors="replace"))
+        return (resp.get("result") or {}).get("panes") or []
+    except Exception:
+        return []
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def extract_alias_from_pane(
+    pane: dict,
+    proc_map_holder: list[dict[str, str] | None],
+    default_active: str,
+) -> str | None:
+    """Returns agy alias if this pane runs agy, else None."""
+    for field in ("display_agent", "terminal_title_stripped", "terminal_title"):
+        val = pane.get(field)
+        if isinstance(val, str) and val:
+            found = extract_agy_alias(val)
+            if found:
+                return found
+
+    session = pane.get("agent_session") or {}
+    is_agy_hint = (
+        pane.get("agent") == "agy"
+        or session.get("agent") == "agy"
+        or has_agy_word(str(pane.get("terminal_title_stripped") or ""))
+    )
+
+    pane_id = pane.get("pane_id")
+    if proc_map_holder[0] is None:
+        proc_map_holder[0] = scan_proc_agy_panes(default_active)
+    proc_map = proc_map_holder[0] or {}
+
+    if pane_id and pane_id in proc_map:
+        return proc_map[pane_id]
+
+    if is_agy_hint:
+        return default_active
+
+    return None
+
+
+def detect_target_account() -> tuple[str, str, str | None]:
+    """Returns (alias, source, pane_id)."""
+    default_active = get_default_active_account()
+    panes = query_herdr_panes()
+    if not panes:
+        for env_k in ("HOME", "ANTIGRAVITY_APP_DATA_DIR"):
+            found = extract_agy_alias(os.environ.get(env_k, ""))
+            if found:
+                return found, "env", None
+        return default_active, "active_account", None
+
+    proc_map_holder: list[dict[str, str] | None] = [None]
+
+    focused_pane = next((p for p in panes if p.get("focused")), None)
+    if focused_pane:
+        alias = extract_alias_from_pane(focused_pane, proc_map_holder, default_active)
+        if alias:
+            return alias, "focused_pane", focused_pane.get("pane_id")
+
+        focused_tab = focused_pane.get("tab_id")
+        if focused_tab:
+            tab_panes = [
+                p for p in panes
+                if p.get("tab_id") == focused_tab and p.get("pane_id") != focused_pane.get("pane_id")
+            ]
+            tab_panes.sort(key=lambda p: 0 if "principal" in str(p.get("label") or "").lower() else 1)
+            for tp in tab_panes:
+                alias = extract_alias_from_pane(tp, proc_map_holder, default_active)
+                if alias:
+                    return alias, "tab_pane", tp.get("pane_id")
+
+    return default_active, "active_account", None
+
+
+def spawn_statusline_refresh(alias: str) -> None:
+    """Triggers agyc-statusline --refresh-quota-bg <alias> throttled by 15s lock."""
+    lock_file = f"/tmp/agyc_quota_refreshing_{alias}.lock"
+    now_ts = time.time()
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, "r", encoding="utf-8") as f:
+                if now_ts - float(f.read().strip()) < REFRESH_LOCK_SECONDS:
+                    return
+        except Exception:
+            pass
+
+    try:
+        fd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(now_ts))
+    except Exception:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "agyc-statusline"),
+        f"{REAL_HOME}/.local/bin/agyc-statusline",
+        f"{REAL_HOME}/proyectos/agyc-antigravity-cli-switcher/bin/agyc-statusline",
+    ]
+    statusline_bin = next((c for c in candidates if os.path.exists(c)), None)
+    if not statusline_bin:
+        return
+
+    try:
+        import subprocess
+        env = os.environ.copy()
+        env["HOME"] = REAL_HOME
+        subprocess.Popen(
+            [sys.executable, "-S", statusline_bin, "--refresh-quota-bg", alias],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except Exception:
+        pass
+
+
+def load_account_quota(alias: str) -> tuple[dict, str | None]:
+    """Reads /tmp/agyc_quota_cache_{alias}.json (spawning bg refresh if missing or >30s old)
+    with fallback to accounts/{alias}.json.
+    """
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    acc_file = f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json"
+    now_ts = time.time()
+
+    quota: dict | None = None
+    plan_type: str | None = None
+
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                quota = json.load(f)
+        except Exception:
+            quota = None
+
+    if isinstance(quota, dict):
+        plan_type = quota.get("plan_type")
+        age = now_ts - float(quota.get("cached_at", 0) or 0)
+        if age > CACHE_STALE_SECONDS or "fetched_at" not in quota:
+            spawn_statusline_refresh(alias)
+    else:
+        spawn_statusline_refresh(alias)
+
+    if not isinstance(quota, dict) or not plan_type:
+        if os.path.exists(acc_file):
+            try:
+                with open(acc_file, "r", encoding="utf-8") as f:
+                    acc_data = json.load(f)
+                if not isinstance(quota, dict):
+                    quota = acc_data.get("quota") or {}
+                if not plan_type:
+                    plan_type = (
+                        acc_data.get("plan_type")
+                        or (acc_data.get("quota") or {}).get("plan_type")
+                        or ("ULTRA" if acc_data.get("supports_carbon") else None)
+                    )
+            except Exception:
+                pass
+
+    return (quota or {}), (str(plan_type).upper() if plan_type else None)
+
+
+def format_family_segment(
+    label: str,
+    pct_5h: int,
+    cd_5h: str | None,
+    pct_sem: int,
+    cd_sem: str | None,
+) -> str:
+    if pct_5h < 100 and cd_5h:
+        s5 = f"5H: {pct_5h}% ({cd_5h})"
+    else:
+        s5 = f"5H: {pct_5h}%"
+
+    if pct_sem == 0 and cd_sem:
+        ss = f"Sem: 0% ({cd_sem})"
+    else:
+        ss = f"Sem: {pct_sem}%"
+
+    return f"{label} {s5} · {ss}"
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    forced_alias = None
+    for i, a in enumerate(args):
+        if a == "--account" and i + 1 < len(args):
+            forced_alias = args[i + 1].strip().lower()
+
+    if forced_alias:
+        alias, source, pane_id = forced_alias, "cli_arg", None
+    else:
+        alias, source, pane_id = detect_target_account()
+
+    quota, plan_type = load_account_quota(alias)
+    now_dt = datetime.now(timezone.utc)
+
+    g_dis = bool(quota.get("gemini_disabled", False))
+    c_dis = bool(quota.get("claude_disabled", False))
+
+    gw_f, gw_r = normalize_slot(quota.get("gemini_weekly_fraction", 1.0), quota.get("gemini_weekly_reset"), now_dt, g_dis)
+    g5_f, g5_r = normalize_slot(quota.get("gemini_5h_fraction", 1.0), quota.get("gemini_5h_reset"), now_dt, g_dis)
+    if gw_f <= 0.0005:
+        g5_f, g5_r = 0.0, (g5_r or gw_r)
+
+    cw_f, cw_r = normalize_slot(quota.get("claude_weekly_fraction", 1.0), quota.get("claude_weekly_reset"), now_dt, c_dis)
+    c5_f, c5_r = normalize_slot(quota.get("claude_5h_fraction", 1.0), quota.get("claude_5h_reset"), now_dt, c_dis)
+    if cw_f <= 0.0005:
+        c5_f, c5_r = 0.0, (c5_r or cw_r)
+
+    g5_pct, gw_pct = fmt_pct(g5_f), fmt_pct(gw_f)
+    c5_pct, cw_pct = fmt_pct(c5_f), fmt_pct(cw_f)
+
+    g5_cd, gw_cd = format_compact_countdown(g5_r), format_compact_countdown(gw_r)
+    c5_cd, cw_cd = format_compact_countdown(c5_r), format_compact_countdown(cw_r)
+
+    head = f"⚡ {alias} [{plan_type}]" if plan_type else f"⚡ {alias}"
+    gem_seg = format_family_segment("Gemini", g5_pct, g5_cd, gw_pct, gw_cd)
+    cld_seg = format_family_segment("Claude", c5_pct, c5_cd, cw_pct, cw_cd)
+    text = f"{head} │ {gem_seg} │ {cld_seg}"
+
+    if as_json:
+        out = {
+            "account": alias,
+            "plan_type": plan_type,
+            "source": source,
+            "pane_id": pane_id,
+            "gemini": {"pct_5h": g5_pct, "reset_5h": g5_r, "cd_5h": g5_cd, "pct_weekly": gw_pct, "reset_weekly": gw_r, "cd_weekly": gw_cd},
+            "claude": {"pct_5h": c5_pct, "reset_5h": c5_r, "cd_5h": c5_cd, "pct_weekly": cw_pct, "reset_weekly": cw_r, "cd_weekly": cw_cd},
+            "text": text,
+        }
+        print(json.dumps(out, ensure_ascii=False))
+        return
+
+    print(text)
+
+
+if __name__ == "__main__":
+    main()

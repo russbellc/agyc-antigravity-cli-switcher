@@ -1,24 +1,20 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -S
 """
-agyc-statusline: Custom Status Line Generator for Antigravity CLI (agy).
-Renders:
-  - Active agyc profile (agy01, agy02, agy03)
-  - Current git branch (with clean/dirty indicator)
-  - 5-Hour Gemini Quota (Online live remaining fraction, linebar, countdown to reset)
-  - Session Context Consumption (% used, linebar, token estimate)
+agyc-statusline: Ultra-fast Live Statusline, Titleline & Herdr Metadata Reporter
+for Antigravity CLI (agy 1.5.10+).
+
+Modes:
+  - Default (`agyc-statusline`): ANSI statusline + Herdr pane.report_metadata sync
+  - Title (`agyc-statusline --title` or symlink `agyc-titleline`): plain-text OSC title line
+  - Background worker (`agyc-statusline --refresh-quota-bg <alias>`): parallel unified 1.5.10 quota fetcher
 """
 
 import sys
 import os
-import re
 import json
+import math
 import time
 import select
-import subprocess
-import urllib.request
-import urllib.parse
-import urllib.error
-import base64
 from datetime import datetime, timezone, timedelta
 
 # ANSI Colors
@@ -31,7 +27,7 @@ C_BLUE    = "\033[38;5;75m"    # Soft blue
 C_YELLOW  = "\033[38;5;220m"   # Gold/Yellow
 C_ORANGE  = "\033[38;5;208m"   # Orange
 C_RED     = "\033[38;5;196m"   # Bright red
-C_MAGENTA = "\033[38;5;177m"   # Light purple/magenta
+C_MAGENTA = "\033[38;5;177m"   # Light purple/magenta (ULTRA badge)
 C_PURPLE  = "\033[38;5;147m"   # Soft lavender/purple for models
 C_GRAY    = "\033[38;5;244m"   # Muted gray
 
@@ -39,37 +35,140 @@ C_GRAY    = "\033[38;5;244m"   # Muted gray
 GOOGLE_CLIENT_ID     = "moc.tnetnocresuelgoog.sppa.pe304g4hjolotv532ercl12h2nisshmt-1950606001701"[::-1]
 GOOGLE_CLIENT_SECRET = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG"[::-1]
 
+# Unified Antigravity 1.5.10 User-Agent
+ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
+
 # Real home directory (not the agy-isolated one)
 REAL_HOME = "/home/aidev"
 
-def make_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
+# Live refresh & throttle parameters
+CACHE_TTL_SECONDS = 20
+REFRESH_LOCK_SECONDS = 15
+HERDR_META_THROTTLE_SECONDS = 8
+HORIZON_5H_SECONDS = 5 * 3600 + 5 * 60  # 5h + 5m
+
+
+def extract_agy_alias(text: str) -> str | None:
+    """Finds word-bounded agy01..agy99 in text without regex import overhead."""
+    if not text:
+        return None
+    low = text.lower()
+    idx = 0
+    n = len(low)
+    while True:
+        pos = low.find("agy", idx)
+        if pos == -1:
+            return None
+        if pos > 0 and (low[pos - 1].isalnum() or low[pos - 1] == "_"):
+            idx = pos + 3
+            continue
+        end = pos + 3
+        while end < n and low[end].isdigit():
+            end += 1
+        digits_len = end - (pos + 3)
+        if 1 <= digits_len <= 2 and (end == n or not (low[end].isalnum() or low[end] == "_")):
+            return low[pos:end]
+        idx = pos + 3
+
+
+def fmt_pct(frac: float | None) -> int:
+    """Exact percentage without false 100%: >=0.9995 -> 100, else floor(frac * 100)."""
+    if frac is None:
+        return 100
+    f = max(0.0, min(1.0, float(frac)))
+    if f >= 0.9995:
+        return 100
+    if f <= 0.0:
+        return 0
+    return int(math.floor(f * 100.0))
+
+
+def parse_iso_utc(ts_str: str | None) -> datetime | None:
+    """Parses ISO-8601 timestamp into UTC-aware datetime."""
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        s = ts_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def normalize_quota_value(
+    frac: float | None,
+    reset_iso: str | None,
+    now_dt: datetime | None = None,
+    disabled: bool = False,
+) -> tuple[float, str | None, bool]:
+    """Normalizes (fraction, resetTime, disabled):
+    - If resetTime <= now -> (1.0, None, False)
+    - If frac >= 0.9995 -> (1.0, None, False)
+    """
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    if reset_iso:
+        rst_dt = parse_iso_utc(reset_iso)
+        if rst_dt is not None and rst_dt <= now_dt:
+            return 1.0, None, False
+    f = 1.0 if frac is None else max(0.0, min(1.0, float(frac)))
+    if disabled:
+        f = 0.0
+    if f >= 0.9995:
+        return 1.0, None, False
+    return f, reset_iso, bool(disabled or f <= 0.0)
+
+
+def atomic_write_json(path: str, data: dict, mode: int = 0o600, indent: int | None = None) -> None:
+    """Atomically writes JSON with strict permissions via .tmp.{pid} + os.replace."""
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent)
+        os.chmod(tmp_path, mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+def make_linebar(fraction: float | None, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
     """Generates a colored text progress linebar."""
     if fraction is None:
         fraction = 1.0
     fraction = max(0.0, min(1.0, float(fraction)))
+    pct = fmt_pct(fraction)
     filled_len = int(round(fraction * length))
     empty_len = length - filled_len
-    
-    # Color coding based on fraction remaining
-    if fraction >= 0.50:
+
+    if pct >= 50:
         bar_color = C_GREEN
-    elif fraction >= 0.20:
+    elif pct >= 20:
         bar_color = C_YELLOW
     else:
         bar_color = C_RED
-        
+
     bar = f"{bar_color}{fill_char * filled_len}{C_GRAY}{empty_char * empty_len}{C_RESET}"
     return f"[{bar}]"
 
-def make_context_linebar(fraction: float, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
+
+def make_context_linebar(fraction: float | None, length: int = 8, fill_char: str = "█", empty_char: str = "░") -> str:
     """Generates a colored text progress linebar for context usage (inverse color coding)."""
     if fraction is None:
         fraction = 0.0
     fraction = max(0.0, min(1.0, float(fraction)))
     filled_len = int(round(fraction * length))
     empty_len = length - filled_len
-    
-    # Inverted color coding: low usage is green, high usage is red
+
     if fraction < 0.50:
         bar_color = C_GREEN
     elif fraction < 0.75:
@@ -78,73 +177,73 @@ def make_context_linebar(fraction: float, length: int = 8, fill_char: str = "█
         bar_color = C_ORANGE
     else:
         bar_color = C_RED
-        
+
     bar = f"{bar_color}{fill_char * filled_len}{C_GRAY}{empty_char * empty_len}{C_RESET}"
     return f"[{bar}]"
+
 
 def format_countdown(reset_iso: str | None, default_val: str = "5h 00m") -> str:
     if not reset_iso:
         return default_val
-    try:
-        if reset_iso.endswith("Z"):
-            reset_iso = reset_iso[:-1] + "+00:00"
-        dt = datetime.fromisoformat(reset_iso)
-        now = datetime.now(timezone.utc)
-        diff = dt - now
-        total_sec = int(diff.total_seconds())
-        if total_sec <= 0:
-            return "0m"
-        hrs = total_sec // 3600
-        mins = (total_sec % 3600) // 60
-        if hrs >= 24:
-            days = hrs // 24
-            rem_hrs = hrs % 24
-            return f"{days}d {rem_hrs:02d}h"
-        if hrs > 0:
-            return f"{hrs}h {mins:02d}m"
-        return f"{mins}m"
-    except Exception:
-        return "5h"
+    dt = parse_iso_utc(reset_iso)
+    if dt is None:
+        return default_val
+    now = datetime.now(timezone.utc)
+    total_sec = int((dt - now).total_seconds())
+    if total_sec <= 0:
+        return "0m"
+    hrs = total_sec // 3600
+    mins = (total_sec % 3600) // 60
+    if hrs >= 24:
+        days = hrs // 24
+        rem_hrs = hrs % 24
+        return f"{days}d {rem_hrs:02d}h"
+    if hrs > 0:
+        return f"{hrs}h {mins:02d}m"
+    return f"{mins}m"
+
+
+def get_account_file_path(alias: str) -> str | None:
+    """Returns the path to the account JSON file, searching REAL_HOME first."""
+    acc_paths = [
+        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json",
+        f"/home/aidev/.gemini/antigravity-cli/accounts/{alias}.json",
+        f"/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/{alias}.json",
+    ]
+    for ap in acc_paths:
+        if os.path.exists(ap):
+            return ap
+    return None
+
 
 def detect_active_account(stdin_data: dict | None = None) -> str:
-    """Detect the active agyc account alias.
-    
-    When running inside agy, HOME=/home/aidev/.agyc_homes/agy02.
-    We also check ANTIGRAVITY_APP_DATA_DIR which contains the alias,
-    or match email from stdin payload.
-    """
-    # 0. Check email in stdin_data
+    """Detects the active agyc account alias (agy01..agy15)."""
     if stdin_data and stdin_data.get("email"):
-        email = stdin_data.get("email", "").strip().lower()
+        email = str(stdin_data.get("email", "")).strip().lower()
         accounts_dir = f"{REAL_HOME}/.gemini/antigravity-cli/accounts"
-        if os.path.isdir(accounts_dir):
+        if email and os.path.isdir(accounts_dir):
             try:
                 for fname in os.listdir(accounts_dir):
                     if fname.startswith("agy") and fname.endswith(".json"):
                         alias = fname[:-5]
                         try:
-                            with open(os.path.join(accounts_dir, fname), "r") as af:
+                            with open(os.path.join(accounts_dir, fname), "r", encoding="utf-8") as af:
                                 d = json.load(af)
-                                if d.get("email", "").strip().lower() == email:
+                                if str(d.get("email", "")).strip().lower() == email:
                                     return alias
                         except Exception:
                             pass
             except Exception:
                 pass
 
-    # 1. Check HOME path (e.g., /home/aidev/.agyc_homes/agy02)
-    home = os.environ.get("HOME", "")
-    m = re.search(r"agy\d+", home)
-    if m:
-        return m.group(0)
-    
-    # 2. Check ANTIGRAVITY_APP_DATA_DIR (e.g., /home/aidev/.agyc_homes/agy02/.gemini/...)
-    app_dir = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
-    m = re.search(r"agy\d+", app_dir)
-    if m:
-        return m.group(0)
-        
-    # 3. Check config.json in REAL_HOME accounts (not the isolated home)
+    alias = extract_agy_alias(os.environ.get("HOME", ""))
+    if alias:
+        return alias
+
+    alias = extract_agy_alias(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", ""))
+    if alias:
+        return alias
+
     config_paths = [
         f"{REAL_HOME}/.gemini/antigravity-cli/accounts/config.json",
         "/home/aidev/.gemini/antigravity-cli/accounts/config.json",
@@ -157,15 +256,16 @@ def detect_active_account(stdin_data: dict | None = None) -> str:
                     data = json.load(f)
                     act = data.get("active_account")
                     if act:
-                        return act
+                        return str(act)
             except Exception:
                 pass
     return "agy01"
 
-def get_git_branch() -> str | None:
+
+def get_git_branch(start_dir: str | None = None) -> str | None:
     """Ultra-fast zero-subprocess branch reader directly from .git/HEAD."""
     try:
-        cwd = os.getcwd()
+        cwd = start_dir if (start_dir and os.path.isdir(start_dir)) else os.getcwd()
         for _ in range(6):
             git_path = os.path.join(cwd, ".git")
             if os.path.exists(git_path):
@@ -189,20 +289,34 @@ def get_git_branch() -> str | None:
         pass
     return None
 
-def get_account_file_path(alias: str) -> str | None:
-    """Returns the path to the account JSON file, searching REAL_HOME first."""
-    acc_paths = [
-        f"{REAL_HOME}/.gemini/antigravity-cli/accounts/{alias}.json",
-        f"/home/aidev/.gemini/antigravity-cli/accounts/{alias}.json",
-        f"/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/accounts/{alias}.json",
-    ]
-    for ap in acc_paths:
-        if os.path.exists(ap):
-            return ap
-    return None
+
+def get_vcs_info(stdin_data: dict | None) -> tuple[str | None, bool]:
+    """Extracts (branch, is_dirty) from stdin_data.vcs with fallback to .git/HEAD."""
+    if stdin_data and isinstance(stdin_data.get("vcs"), dict):
+        vcs = stdin_data["vcs"]
+        branch = vcs.get("branch") or vcs.get("head") or vcs.get("ref")
+        dirty = bool(vcs.get("dirty") or vcs.get("is_dirty") or vcs.get("has_changes"))
+        if isinstance(branch, str) and branch.strip():
+            return branch.strip(), dirty
+
+    if stdin_data and isinstance(stdin_data.get("git_branch"), str) and stdin_data["git_branch"].strip():
+        return stdin_data["git_branch"].strip(), bool(stdin_data.get("git_dirty", False))
+
+    start_dir = None
+    if stdin_data:
+        ws = stdin_data.get("workspace")
+        if isinstance(ws, dict):
+            start_dir = ws.get("current_dir") or ws.get("project_dir") or ws.get("cwd")
+        elif isinstance(stdin_data.get("cwd"), str):
+            start_dir = stdin_data["cwd"]
+    return get_git_branch(start_dir), False
+
 
 def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
     """Refresh OAuth access token if expired or expiring within 5 minutes."""
+    import urllib.request
+    import urllib.parse
+
     token_obj = token_data.get("token", {})
     refresh_token = token_obj.get("refresh_token")
     expiry_str = token_obj.get("expiry")
@@ -211,21 +325,11 @@ def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
     if not token_obj.get("access_token") or not expiry_str:
         needs_refresh = True
     else:
-        try:
-            if expiry_str.endswith("Z"):
-                expiry_str_fixed = expiry_str[:-1] + "+00:00"
-            else:
-                expiry_str_fixed = expiry_str
-            exp_dt = datetime.fromisoformat(expiry_str_fixed)
-            if (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300:
-                needs_refresh = True
-        except Exception:
+        exp_dt = parse_iso_utc(expiry_str)
+        if exp_dt is None or (exp_dt - datetime.now(timezone.utc)).total_seconds() < 300:
             needs_refresh = True
 
-    if not needs_refresh:
-        return token_data, False
-
-    if not refresh_token:
+    if not needs_refresh or not refresh_token:
         return token_data, False
 
     payload = urllib.parse.urlencode({
@@ -238,7 +342,7 @@ def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
     req = urllib.request.Request(
         "https://oauth2.googleapis.com/token",
         data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -248,358 +352,539 @@ def refresh_token_if_needed(token_data: dict) -> tuple[dict, bool]:
             token_obj["refresh_token"] = res["refresh_token"]
         expires_in = res.get("expires_in", 3600)
         token_obj["expiry"] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat()
+        if "id_token" in res:
+            token_data["id_token"] = res["id_token"]
         token_data["token"] = token_obj
         return token_data, True
     except Exception:
         return token_data, False
 
+
+def _merge_slot(
+    slot: dict,
+    raw_frac: float | None,
+    raw_reset: str | None,
+    now_dt: datetime,
+    disabled: bool = False,
+) -> None:
+    """Merges a candidate quota measurement into slot using min(remainingFraction)."""
+    frac, rst, dis = normalize_quota_value(raw_frac, raw_reset, now_dt=now_dt, disabled=disabled)
+    if dis:
+        slot["disabled"] = True
+    if frac < slot["frac"] - 1e-6:
+        slot["frac"] = frac
+        slot["reset"] = rst or slot["reset"]
+    elif abs(frac - slot["frac"]) <= 1e-6 and frac < 0.9995:
+        if slot["reset"] is None and rst is not None:
+            slot["reset"] = rst
+
+
 def do_fetch_and_save_quota(alias: str) -> dict | None:
-    """Synchronously queries Google CloudCode PA API and saves cache.
-    
-    IMPORTANT: Account file is always read from REAL_HOME (/home/aidev),
-    not from the agy-isolated home, because that's where agyc stores tokens.
+    """Unified 1.5.10 quota engine (--refresh-quota-bg <alias>).
+    Queries loadCodeAssist, retrieveUserQuotaSummary, and retrieveUserQuota in parallel
+    across daily-cloudcode-pa.googleapis.com and cloudcode-pa.googleapis.com.
     """
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+
     cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
     now_ts = time.time()
-    
+    now_dt = datetime.now(timezone.utc)
+
     acc_path = get_account_file_path(alias)
     if not acc_path:
         return None
 
     try:
-        with open(acc_path, "r") as f:
+        with open(acc_path, "r", encoding="utf-8") as f:
             acc_data = json.load(f)
     except Exception:
         return None
-                
+
     if not acc_data:
         return None
 
-    fallback_quota = acc_data.get("quota", {})
-    token_data = acc_data.get("token_data", {})
-    
-    # Refresh token if needed before calling API
+    fallback_quota = acc_data.get("quota") or {}
+    token_data = acc_data.get("token_data") or {}
+
     token_data, refreshed = refresh_token_if_needed(token_data)
     if refreshed:
-        # Persist the refreshed token back to the file
         try:
             acc_data["token_data"] = token_data
-            with open(acc_path, "w") as f:
-                json.dump(acc_data, f, indent=2)
+            acc_data["is_revoked"] = False
+            atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
         except Exception:
             pass
-    
-    token = token_data.get("token", {}).get("access_token")
-    fallback_res = {
-        "gemini_5h_fraction": fallback_quota.get("gemini_5h_fraction", 1.0),
-        "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
-        "gemini_weekly_fraction": fallback_quota.get("gemini_weekly_fraction", 1.0),
-        "gemini_weekly_reset": fallback_quota.get("gemini_weekly_reset"),
-        "claude_5h_fraction": fallback_quota.get("claude_5h_fraction", 1.0),
-        "claude_5h_reset": fallback_quota.get("claude_5h_reset"),
-        "claude_weekly_fraction": fallback_quota.get("claude_weekly_fraction", 1.0),
-        "claude_weekly_reset": fallback_quota.get("claude_weekly_reset"),
-        "claude_disabled": False,
-        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction"),
-        "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
-        "has_gemini4": acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False),
-        "cached_at": now_ts
-    }
 
+    token = (token_data.get("token") or {}).get("access_token")
     if not token:
-        if fallback_quota:
+        if os.path.exists(cache_file):
             try:
-                with open(cache_file, "w") as f:
-                    json.dump(fallback_res, f)
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
             except Exception:
                 pass
-            return fallback_res
-        return None
+        return fallback_quota if fallback_quota else None
 
-    has_g4 = acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False)
-    metrics = {
-        "gemini_5h_fraction": 1.0,
-        "gemini_5h_reset": fallback_quota.get("gemini_5h_reset"),
-        "gemini_weekly_fraction": fallback_quota.get("gemini_weekly_fraction", 1.0),
-        "gemini_weekly_reset": fallback_quota.get("gemini_weekly_reset"),
-        "claude_5h_fraction": 1.0,
-        "claude_5h_reset": fallback_quota.get("claude_5h_reset"),
-        "claude_weekly_fraction": fallback_quota.get("claude_weekly_fraction", 1.0),
-        "claude_weekly_reset": fallback_quota.get("claude_weekly_reset"),
-        "claude_disabled": fallback_quota.get("claude_disabled", False),
-        "argon_weekly_fraction": fallback_quota.get("argon_weekly_fraction"),
-        "argon_weekly_reset": fallback_quota.get("argon_weekly_reset"),
-        "has_gemini4": has_g4,
-        "cached_at": now_ts
+    hosts = ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": ANTIGRAVITY_UA,
+    }
+    lca_payload = json.dumps({
+        "metadata": {
+            "ideType": "ANTIGRAVITY",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    }).encode("utf-8")
+    empty_payload = b"{}"
+
+    def _call_api(endpoint: str, host: str, body: bytes) -> dict | None:
+        url = f"https://{host}/v1internal:{endpoint}"
+        req = urllib.request.Request(url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    tasks = [
+        ("lca_daily", "loadCodeAssist", hosts[0], lca_payload),
+        ("lca_prod", "loadCodeAssist", hosts[1], lca_payload),
+        ("sum_daily", "retrieveUserQuotaSummary", hosts[0], empty_payload),
+        ("sum_prod", "retrieveUserQuotaSummary", hosts[1], empty_payload),
+        ("mod_daily", "retrieveUserQuota", hosts[0], empty_payload),
+        ("mod_prod", "retrieveUserQuota", hosts[1], empty_payload),
+    ]
+
+    results: dict[str, dict | None] = {}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = {
+            key: pool.submit(_call_api, ep, host, body)
+            for key, ep, host, body in tasks
+        }
+        for key, fut in futs.items():
+            try:
+                results[key] = fut.result()
+            except Exception:
+                results[key] = None
+
+    plan_type = acc_data.get("plan_type") or fallback_quota.get("plan_type")
+    supports_carbon = bool(acc_data.get("supports_carbon") or fallback_quota.get("supports_carbon", False))
+    has_gemini4 = bool(acc_data.get("has_gemini4") or fallback_quota.get("has_gemini4", False))
+
+    for lca_key in ("lca_daily", "lca_prod"):
+        lca = results.get(lca_key)
+        if not isinstance(lca, dict):
+            continue
+        paid_tier = lca.get("paidTier") or {}
+        curr_tier = lca.get("currentTier") or {}
+        paid_str = f"{paid_tier.get('id', '')} {paid_tier.get('name', '')} {paid_tier.get('description', '')}".lower()
+        curr_str = f"{curr_tier.get('id', '')} {curr_tier.get('name', '')}".lower()
+        if "ultra" in paid_str or "ultra" in curr_str:
+            plan_type = "ULTRA"
+            supports_carbon = True
+            has_gemini4 = True
+            break
+        elif "pro" in paid_str or "standard" in paid_str or "pro" in curr_str:
+            plan_type = "PRO"
+            break
+        elif not paid_tier and "free" in curr_str:
+            plan_type = "FREE"
+
+    slots = {
+        ("gemini", "5h"): {"frac": 1.0, "reset": None, "disabled": False},
+        ("gemini", "weekly"): {"frac": 1.0, "reset": None, "disabled": False},
+        ("claude", "5h"): {"frac": 1.0, "reset": None, "disabled": False},
+        ("claude", "weekly"): {"frac": 1.0, "reset": None, "disabled": False},
     }
 
-    # 1. Fetch live per-model quota from retrieveUserQuota (daily first, then prod)
-    models_data = None
-    for host in ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]:
-        try:
-            url = f"https://{host}/v1internal:retrieveUserQuota"
-            req = urllib.request.Request(
-                url,
-                data=b"{}",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.4.0 linux/amd64"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                models_data = json.loads(resp.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                break
-            continue
-        except Exception:
-            continue
+    any_quota_ok = False
 
-    if models_data and "buckets" in models_data:
-        for b in models_data.get("buckets", []):
-            mid = b.get("modelId", "").lower()
-            frac = b.get("remainingFraction", 1.0)
-            rst = b.get("resetTime")
-            if "gemini-3.8" in mid or "gemini-2.5-flash" in mid:
-                metrics["gemini_5h_fraction"] = frac
-                metrics["gemini_5h_reset"] = rst
-            elif "claude-sonnet" in mid or "claude-opus" in mid:
-                metrics["claude_5h_fraction"] = frac
-                metrics["claude_5h_reset"] = rst
-                if frac == 0:
-                    metrics["claude_disabled"] = True
-            elif "argon" in mid or "gemini-4" in mid:
-                metrics["argon_weekly_fraction"] = frac
-                metrics["argon_weekly_reset"] = rst
-                metrics["has_gemini4"] = True
-
-    # 2. Fetch weekly group quota from retrieveUserQuotaSummary (merge groups from daily & prod)
-    summary_data = {"groups": []}
-    for host in ["daily-cloudcode-pa.googleapis.com", "cloudcode-pa.googleapis.com"]:
-        try:
-            url = f"https://{host}/v1internal:retrieveUserQuotaSummary"
-            req = urllib.request.Request(
-                url,
-                data=b"{}",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.4.0 linux/amd64"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for g in data.get("groups", []):
-                    gn = g.get("displayName", "")
-                    if not any(x.get("displayName") == gn for x in summary_data["groups"]):
-                        summary_data["groups"].append(g)
-        except urllib.error.HTTPError as e:
-            if e.code in (401, 403):
-                break
+    for sum_key in ("sum_daily", "sum_prod"):
+        sdata = results.get(sum_key)
+        if not isinstance(sdata, dict) or "groups" not in sdata:
             continue
-        except Exception:
-            continue
+        any_quota_ok = True
+        for grp in sdata.get("groups") or []:
+            gname = str(grp.get("displayName") or "").lower()
+            gdesc = str(grp.get("description") or "").lower()
+            if "carbon" in gdesc or "carbon" in gname:
+                supports_carbon = True
+                has_gemini4 = True
+            if any(k in gdesc or k in gname for k in ("gemini 4", "argon", "hydrogen")):
+                has_gemini4 = True
 
-    if summary_data and "groups" in summary_data:
-        for grp in summary_data.get("groups", []):
-            gn = grp.get("displayName", "").lower()
-            for b in grp.get("buckets", []):
-                bid = b.get("bucketId", "").lower()
-                frac = b.get("remainingFraction", 1.0)
+            for b in grp.get("buckets") or []:
+                bid = str(b.get("bucketId") or "").lower()
+                win = str(b.get("window") or "").lower()
+                frac = b.get("remainingFraction")
                 rst = b.get("resetTime")
-                if "gemini" in gn and "weekly" in bid:
-                    metrics["gemini_weekly_fraction"] = frac
-                    metrics["gemini_weekly_reset"] = rst
-                elif any(k in gn for k in ("claude", "gpt", "3p")) and "weekly" in bid:
-                    metrics["claude_weekly_fraction"] = frac
-                    metrics["claude_weekly_reset"] = rst
-                    if frac == 0 or b.get("disabled", False):
-                        metrics["claude_disabled"] = True
-                elif "argon" in bid or "argon" in gn:
-                    metrics["argon_weekly_fraction"] = frac
-                    metrics["argon_weekly_reset"] = rst
-                    metrics["has_gemini4"] = True
+                dis = bool(b.get("disabled", False))
 
-    # Consistency rule: if weekly Claude is 0 or disabled, 5H is locked to 0
-    if (metrics.get("claude_weekly_fraction") is not None and metrics["claude_weekly_fraction"] <= 0.001) or metrics.get("claude_disabled"):
-        metrics["claude_5h_fraction"] = 0.0
-        metrics["claude_disabled"] = True
+                if "carbon" in bid:
+                    supports_carbon = True
+                    has_gemini4 = True
+                if any(k in bid for k in ("argon", "hydrogen", "gemini-4")):
+                    has_gemini4 = True
 
-    if acc_data.get("has_gemini4") or metrics.get("has_gemini4"):
-        metrics["has_gemini4"] = True
-        if metrics.get("argon_weekly_fraction") is None:
-            metrics["argon_weekly_fraction"] = metrics.get("gemini_weekly_fraction", 1.0)
-        if metrics.get("argon_weekly_reset") is None:
-            metrics["argon_weekly_reset"] = metrics.get("gemini_weekly_reset")
+                family = None
+                if bid.startswith("gemini") or "gemini" in gname or "argon" in gname or "argon" in bid:
+                    family = "gemini"
+                elif bid.startswith("3p") or any(k in gname for k in ("claude", "gpt", "3p")):
+                    family = "claude"
 
-    if models_data or summary_data:
-        try:
-            tmp_cache = cache_file + ".tmp"
-            with open(tmp_cache, "w") as f:
-                json.dump(metrics, f)
-            os.replace(tmp_cache, cache_file)
-            # Persist to accounts JSON so future fallback is also accurate
-            acc_data["quota"] = metrics
-            tmp_acc = acc_path + ".tmp"
-            with open(tmp_acc, "w") as f:
-                json.dump(acc_data, f, indent=2)
-            os.replace(tmp_acc, acc_path)
-        except Exception:
-            pass
-        return metrics
+                window = None
+                if win == "5h" or "5h" in bid:
+                    window = "5h"
+                elif win == "weekly" or "weekly" in bid or "month" in bid:
+                    window = "weekly"
 
-    # All endpoints failed - return existing disk cache if present, else fallback without poisoning
-    if os.path.exists(cache_file):
-        try:
-            with open(cache_file, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return fallback_res if fallback_quota else None
+                if family and window:
+                    _merge_slot(slots[(family, window)], frac, rst, now_dt=now_dt, disabled=dis)
 
-def extract_quota_from_stdin(stdin_quota: dict, account: str) -> dict:
-    """Parses real-time quota payload delivered directly by agy CLI on stdin.
-    
-    This matches agy /usage exactly, updating both disk cache and account JSON.
-    """
-    now_ts = time.time()
-    g5 = stdin_quota.get("gemini-5h") or {}
-    gw = stdin_quota.get("gemini-weekly") or {}
-    c5 = stdin_quota.get("3p-5h") or stdin_quota.get("claude-5h") or {}
-    cw = stdin_quota.get("3p-weekly") or stdin_quota.get("claude-weekly") or {}
-    ar = stdin_quota.get("argon-weekly") or stdin_quota.get("gemini-4-weekly") or {}
+    for mod_key in ("mod_daily", "mod_prod"):
+        mdata = results.get(mod_key)
+        if not isinstance(mdata, dict) or "buckets" not in mdata:
+            continue
+        any_quota_ok = True
+        for b in mdata.get("buckets") or []:
+            mid = str(b.get("modelId") or "").lower()
+            if not mid or mid.startswith("chat_") or mid.startswith("tab_") or "tab_" in mid:
+                continue
 
-    c_dis = bool(
-        c5.get("disabled") or 
-        cw.get("disabled") or 
-        (cw.get("remaining_fraction") is not None and float(cw.get("remaining_fraction")) <= 0.001)
-    )
-    c5_frac = 0.0 if c_dis else float(c5.get("remaining_fraction", 1.0))
-    cw_frac = float(cw.get("remaining_fraction", 0.0)) if "remaining_fraction" in cw else 0.0
+            if "carbon" in mid:
+                supports_carbon = True
+                has_gemini4 = True
+            elif any(k in mid for k in ("gemini-4", "argon", "hydrogen")):
+                has_gemini4 = True
+
+            family = None
+            if any(k in mid for k in ("claude", "sonnet", "opus", "haiku", "gpt")):
+                family = "claude"
+            elif ("gemini" in mid or any(k in mid for k in ("argon", "carbon", "hydrogen"))) and "image" not in mid:
+                family = "gemini"
+
+            if not family:
+                continue
+
+            frac = b.get("remainingFraction")
+            rst = b.get("resetTime")
+            dis = bool(b.get("disabled", False))
+
+            rst_dt = parse_iso_utc(rst)
+            if rst_dt is not None:
+                delta_sec = (rst_dt - now_dt).total_seconds()
+                if delta_sec <= 0:
+                    continue
+                window = "5h" if delta_sec <= HORIZON_5H_SECONDS else "weekly"
+            else:
+                window = "5h"
+
+            _merge_slot(slots[(family, window)], frac, rst, now_dt=now_dt, disabled=dis)
+
+    if not any_quota_ok:
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return fallback_quota if fallback_quota else None
+
+    g5 = slots[("gemini", "5h")]
+    gw = slots[("gemini", "weekly")]
+    c5 = slots[("claude", "5h")]
+    cw = slots[("claude", "weekly")]
+
+    g_dis = bool(gw["disabled"] or gw["frac"] <= 0.0005)
+    if g_dis:
+        gw["frac"] = 0.0
+        g5["frac"] = 0.0
+        g5["reset"] = g5["reset"] or gw["reset"]
+
+    c_dis = bool(cw["disabled"] or cw["frac"] <= 0.0005)
+    if c_dis:
+        cw["frac"] = 0.0
+        c5["frac"] = 0.0
+        c5["reset"] = c5["reset"] or cw["reset"]
+
+    g5_frac, g5_rst, _ = normalize_quota_value(g5["frac"], g5["reset"], now_dt=now_dt, disabled=g_dis)
+    gw_frac, gw_rst, _ = normalize_quota_value(gw["frac"], gw["reset"], now_dt=now_dt, disabled=g_dis)
+    c5_frac, c5_rst, _ = normalize_quota_value(c5["frac"], c5["reset"], now_dt=now_dt, disabled=c_dis)
+    cw_frac, cw_rst, _ = normalize_quota_value(cw["frac"], cw["reset"], now_dt=now_dt, disabled=c_dis)
 
     metrics = {
-        "gemini_5h_fraction": float(g5.get("remaining_fraction", 1.0)) if "remaining_fraction" in g5 else 1.0,
-        "gemini_5h_reset": g5.get("reset_time"),
-        "gemini_weekly_fraction": float(gw.get("remaining_fraction", 1.0)) if "remaining_fraction" in gw else 1.0,
-        "gemini_weekly_reset": gw.get("reset_time"),
+        "plan_type": plan_type,
+        "supports_carbon": bool(supports_carbon),
+        "has_gemini4": bool(has_gemini4),
+        "gemini_5h_fraction": g5_frac,
+        "gemini_5h_reset": g5_rst,
+        "gemini_weekly_fraction": gw_frac,
+        "gemini_weekly_reset": gw_rst,
+        "gemini_disabled": g_dis,
         "claude_5h_fraction": c5_frac,
-        "claude_5h_reset": c5.get("reset_time") or cw.get("reset_time"),
+        "claude_5h_reset": c5_rst,
         "claude_weekly_fraction": cw_frac,
-        "claude_weekly_reset": cw.get("reset_time"),
+        "claude_weekly_reset": cw_rst,
         "claude_disabled": c_dis,
-        "argon_weekly_fraction": float(ar.get("remaining_fraction")) if "remaining_fraction" in ar else None,
-        "argon_weekly_reset": ar.get("reset_time"),
-        "has_gemini4": ("remaining_fraction" in ar and ar.get("remaining_fraction") is not None),
+        "argon_weekly_fraction": gw_frac if has_gemini4 else None,
+        "argon_weekly_reset": gw_rst if has_gemini4 else None,
+        "fetched_at": now_dt.isoformat(),
         "cached_at": now_ts,
     }
 
-    # Persist live metrics to disk cache so agyc CLI / list commands stay 100% in sync
     try:
-        cache_file = f"/tmp/agyc_quota_cache_{account}.json"
-        tmp_cache = cache_file + f".tmp.{os.getpid()}"
-        with open(tmp_cache, "w") as f:
-            json.dump(metrics, f)
-        os.replace(tmp_cache, cache_file)
+        atomic_write_json(cache_file, metrics, mode=0o600)
+    except Exception:
+        pass
+
+    try:
+        with open(acc_path, "r", encoding="utf-8") as f:
+            latest_acc = json.load(f)
+        latest_acc["quota"] = metrics
+        if plan_type:
+            latest_acc["plan_type"] = plan_type
+        latest_acc["supports_carbon"] = bool(supports_carbon)
+        latest_acc["has_gemini4"] = bool(has_gemini4)
+        latest_acc["updated_at"] = metrics["fetched_at"]
+        atomic_write_json(acc_path, latest_acc, mode=0o600, indent=2)
     except Exception:
         pass
 
     return metrics
 
-def spawn_background_refresh(alias: str):
-    """Spawns background refresh throttled by lock file (max 1 refresh per 30s)."""
+
+def spawn_background_refresh(alias: str) -> None:
+    """Spawns background refresh throttled by lock file (max 1 refresh per 15s)."""
     lock_file = f"/tmp/agyc_quota_refreshing_{alias}.lock"
     now_ts = time.time()
     if os.path.exists(lock_file):
         try:
-            with open(lock_file, "r") as f:
+            with open(lock_file, "r", encoding="utf-8") as f:
                 lock_ts = float(f.read().strip())
-            if now_ts - lock_ts < 30:
-                return  # Another refresh was already spawned in the last 30s
+            if now_ts - lock_ts < REFRESH_LOCK_SECONDS:
+                return
         except Exception:
             pass
 
     try:
-        with open(lock_file, "w") as f:
+        fd = os.open(lock_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(now_ts))
     except Exception:
         pass
 
     try:
+        import subprocess
         env = os.environ.copy()
         env["HOME"] = REAL_HOME
         subprocess.Popen(
-            [sys.executable, __file__, "--refresh-quota-bg", alias],
+            [sys.executable, "-S", os.path.abspath(__file__), "--refresh-quota-bg", alias],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
-            env=env
+            env=env,
         )
     except Exception:
         pass
 
+
 def fetch_online_quota(alias: str) -> dict | None:
-    """Non-blocking quota fetcher. NEVER executes network calls in the foreground!
-    
-    1. If cache exists and is fresh (< 60s): return cache immediately.
-    2. If cache exists and is stale (>= 60s): return cache immediately + spawn background refresh.
-    3. If cache does not exist: read accounts/{alias}.json fallback + spawn background refresh.
-    Execution time is always < 5ms.
-    """
+    """Non-blocking quota reader with 20s background refresh TTL (<2ms foreground)."""
     cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
     now_ts = time.time()
     cached = None
-    
+
     if os.path.exists(cache_file):
         try:
-            with open(cache_file, "r") as f:
+            with open(cache_file, "r", encoding="utf-8") as f:
                 cached = json.load(f)
         except Exception:
             pass
 
-    if cached:
-        cache_age = now_ts - cached.get("cached_at", 0)
-        if cache_age >= 60:
+    if isinstance(cached, dict):
+        cache_age = now_ts - float(cached.get("cached_at", 0) or 0)
+        if cache_age >= CACHE_TTL_SECONDS or "fetched_at" not in cached:
             spawn_background_refresh(alias)
         return cached
 
-    # If no cache exists, read from account JSON as immediate fallback and spawn background
     spawn_background_refresh(alias)
     acc_path = get_account_file_path(alias)
     if acc_path and os.path.exists(acc_path):
         try:
-            with open(acc_path, "r") as f:
+            with open(acc_path, "r", encoding="utf-8") as f:
                 acc_data = json.load(f)
-                q = acc_data.get("quota")
-                if q:
-                    return q
+            q = dict(acc_data.get("quota") or {})
+            if acc_data.get("plan_type") and not q.get("plan_type"):
+                q["plan_type"] = acc_data["plan_type"]
+            if q:
+                return q
         except Exception:
             pass
 
     return None
 
-def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
+
+def merge_cached_and_stdin_quota(cached: dict | None, stdin_quota: dict | None) -> dict | None:
+    """Combines cached online quota with agy's stdin_quota IN MEMORY ONLY.
+    NEVER writes stdin_quota to disk cache (eliminates the 12-min stale overwrite).
+    """
+    if not cached and not stdin_quota:
+        return None
+
+    now_dt = datetime.now(timezone.utc)
+    base = dict(cached or {})
+
+    g5_f, g5_r, g5_d = normalize_quota_value(
+        base.get("gemini_5h_fraction", 1.0),
+        base.get("gemini_5h_reset"),
+        now_dt=now_dt,
+        disabled=bool(base.get("gemini_disabled", False)),
+    )
+    gw_f, gw_r, gw_d = normalize_quota_value(
+        base.get("gemini_weekly_fraction", 1.0),
+        base.get("gemini_weekly_reset"),
+        now_dt=now_dt,
+        disabled=bool(base.get("gemini_disabled", False)),
+    )
+    c5_f, c5_r, c5_d = normalize_quota_value(
+        base.get("claude_5h_fraction", 1.0),
+        base.get("claude_5h_reset"),
+        now_dt=now_dt,
+        disabled=bool(base.get("claude_disabled", False)),
+    )
+    cw_f, cw_r, cw_d = normalize_quota_value(
+        base.get("claude_weekly_fraction", 1.0),
+        base.get("claude_weekly_reset"),
+        now_dt=now_dt,
+        disabled=bool(base.get("claude_disabled", False)),
+    )
+
+    slots = {
+        ("gemini", "5h"): {"frac": g5_f, "reset": g5_r, "disabled": g5_d},
+        ("gemini", "weekly"): {"frac": gw_f, "reset": gw_r, "disabled": gw_d},
+        ("claude", "5h"): {"frac": c5_f, "reset": c5_r, "disabled": c5_d},
+        ("claude", "weekly"): {"frac": cw_f, "reset": cw_r, "disabled": cw_d},
+    }
+
+    if isinstance(stdin_quota, dict):
+        mapping = [
+            (("gemini", "5h"), stdin_quota.get("gemini-5h") or stdin_quota.get("gemini_5h")),
+            (("gemini", "weekly"), stdin_quota.get("gemini-weekly") or stdin_quota.get("gemini_weekly")),
+            (("claude", "5h"), stdin_quota.get("3p-5h") or stdin_quota.get("claude-5h") or stdin_quota.get("3p_5h")),
+            (("claude", "weekly"), stdin_quota.get("3p-weekly") or stdin_quota.get("claude-weekly") or stdin_quota.get("3p_weekly")),
+        ]
+        for key, sb in mapping:
+            if not isinstance(sb, dict):
+                continue
+            raw_f = sb.get("remaining_fraction")
+            if raw_f is None:
+                raw_f = sb.get("remainingFraction")
+            raw_r = sb.get("reset_time") or sb.get("resetTime")
+            raw_d = bool(sb.get("disabled", False))
+            if raw_f is None and not raw_d:
+                continue
+            if raw_r:
+                s_dt = parse_iso_utc(raw_r)
+                if s_dt is not None and s_dt <= now_dt:
+                    continue
+            _merge_slot(slots[key], raw_f, raw_r, now_dt=now_dt, disabled=raw_d)
+
+    g_dis = bool(slots[("gemini", "weekly")]["disabled"] or slots[("gemini", "weekly")]["frac"] <= 0.0005)
+    if g_dis:
+        slots[("gemini", "weekly")]["frac"] = 0.0
+        slots[("gemini", "5h")]["frac"] = 0.0
+        slots[("gemini", "5h")]["reset"] = slots[("gemini", "5h")]["reset"] or slots[("gemini", "weekly")]["reset"]
+
+    c_dis = bool(slots[("claude", "weekly")]["disabled"] or slots[("claude", "weekly")]["frac"] <= 0.0005)
+    if c_dis:
+        slots[("claude", "weekly")]["frac"] = 0.0
+        slots[("claude", "5h")]["frac"] = 0.0
+        slots[("claude", "5h")]["reset"] = slots[("claude", "5h")]["reset"] or slots[("claude", "weekly")]["reset"]
+
+    base["gemini_5h_fraction"] = slots[("gemini", "5h")]["frac"]
+    base["gemini_5h_reset"] = slots[("gemini", "5h")]["reset"]
+    base["gemini_weekly_fraction"] = slots[("gemini", "weekly")]["frac"]
+    base["gemini_weekly_reset"] = slots[("gemini", "weekly")]["reset"]
+    base["gemini_disabled"] = g_dis
+    base["claude_5h_fraction"] = slots[("claude", "5h")]["frac"]
+    base["claude_5h_reset"] = slots[("claude", "5h")]["reset"]
+    base["claude_weekly_fraction"] = slots[("claude", "weekly")]["frac"]
+    base["claude_weekly_reset"] = slots[("claude", "weekly")]["reset"]
+    base["claude_disabled"] = c_dis
+    return base
+
+
+def resolve_plan_type(quota: dict | None, account: str) -> str | None:
+    """Resolves account plan_type ('ULTRA', 'PRO', 'FREE') from cache or account file."""
+    if quota and quota.get("plan_type"):
+        return str(quota["plan_type"]).upper()
+    acc_path = get_account_file_path(account)
+    if acc_path:
+        try:
+            with open(acc_path, "r", encoding="utf-8") as f:
+                acc_data = json.load(f)
+            pt = acc_data.get("plan_type") or (acc_data.get("quota") or {}).get("plan_type")
+            if pt:
+                return str(pt).upper()
+            if acc_data.get("supports_carbon") or (acc_data.get("quota") or {}).get("supports_carbon"):
+                return "ULTRA"
+        except Exception:
+            pass
+    return None
+
+
+def _prettify_model_slug(raw: str) -> tuple[str, str | None]:
+    """Converts CLI model slugs (e.g. 'gemini-4-carbon-high') into clean display names."""
+    s = raw.strip()
+    if " " in s or "-" not in s:
+        return s, None
+    low = s.lower()
+    extracted_effort = None
+    for eff in ("xhigh", "high", "medium", "low", "max"):
+        if low.endswith(f"-{eff}"):
+            extracted_effort = eff
+            low = low[: -(len(eff) + 1)]
+            break
+    if low.endswith("-tiered"):
+        low = low[:-7]
+    if "gemini-4-carbon" in low:
+        return "Gemini 4 Carbon", extracted_effort
+    if "gemini-4-argon" in low:
+        return "Gemini 4 Argon", extracted_effort
+    if "gemini-4-hydrogen" in low:
+        return "Gemini 4 Hydrogen", extracted_effort
+    if "gemini-3.8-flash" in low:
+        return "Gemini 3.8 Flash", extracted_effort
+    if "claude-opus-4-6" in low:
+        return "Claude Opus 4.6", extracted_effort
+    if "claude-sonnet-4-6" in low:
+        return "Claude Sonnet 4.6", extracted_effort
+    return s, extracted_effort
+
+
+def get_model_and_effort(stdin_data: dict | None, account: str) -> tuple[str, str, str]:
     """Detects active model name and reasoning effort level."""
     model_name = None
     effort = None
 
-    # 1. From stdin_data (if agy provides structured status payload)
     if stdin_data:
         m = stdin_data.get("model")
         if isinstance(m, dict):
             model_name = m.get("display_name") or m.get("name") or m.get("id")
-            effort = m.get("effort") or stdin_data.get("effort")
+            effort = m.get("effort") or m.get("reasoning_effort") or stdin_data.get("effort")
         elif isinstance(m, str):
             model_name = m
-        if not effort and "effort" in stdin_data:
-            effort = stdin_data.get("effort")
+        if not effort:
+            effort = stdin_data.get("effort") or stdin_data.get("reasoning_effort")
 
-    # 2. Check parent process cmdline for --model or --effort
     if not model_name or not effort:
         try:
             pid = os.getppid()
-            for _ in range(4):
+            for _ in range(5):
                 if pid <= 1:
                     break
                 cmd_file = f"/proc/{pid}/cmdline"
@@ -609,19 +894,21 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
                     for i, arg in enumerate(parts):
                         if arg == "--model" and i + 1 < len(parts) and not model_name:
                             model_name = parts[i + 1]
-                        elif arg == "--effort" and i + 1 < len(parts) and not effort:
+                        elif arg in ("--effort", "--reasoning-effort") and i + 1 < len(parts) and not effort:
                             effort = parts[i + 1]
-                with open(f"/proc/{pid}/status") as sf:
+                with open(f"/proc/{pid}/status", "r", encoding="utf-8") as sf:
+                    ppid = 0
                     for line in sf:
                         if line.startswith("PPid:"):
-                            pid = int(line.split()[1])
+                            ppid = int(line.split()[1])
                             break
+                    if ppid <= 1 or ppid == pid:
+                        break
+                    pid = ppid
         except Exception:
             pass
 
-    # 3. Check settings.json
     if not model_name:
-        # ANTIGRAVITY_APP_DATA_DIR is set correctly even inside agy
         app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "")
         candidate_paths = [
             os.path.join(app_data, "settings.json") if app_data else "",
@@ -636,9 +923,9 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
                         s = json.load(f)
                         raw_model = s.get("model")
                         if raw_model:
-                            model_name = raw_model
+                            model_name = str(raw_model)
                         if not effort and s.get("effort"):
-                            effort = s.get("effort")
+                            effort = str(s.get("effort"))
                         if model_name:
                             break
                 except Exception:
@@ -647,22 +934,27 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     if not model_name:
         model_name = "Gemini 3.8 Flash (High)"
 
-    # Extract effort if embedded in parentheses like "Gemini 3.8 Flash (High)"
-    match = re.match(r"^(.*?)(?:\s*\((.*?)\))?$", model_name)
-    if match:
-        clean_name = match.group(1).strip()
-        embedded_effort = match.group(2)
-        if embedded_effort and not effort:
-            effort = embedded_effort
-        model_name = clean_name
+    model_name, slug_effort = _prettify_model_slug(str(model_name))
+    if slug_effort and not effort:
+        effort = slug_effort
+
+    if model_name.endswith(")") and "(" in model_name:
+        lp = model_name.rfind("(")
+        embedded_effort = model_name[lp + 1 : -1].strip()
+        if embedded_effort.lower() in (
+            "low", "medium", "med", "high", "xhigh", "max", "ultra", "minimal"
+        ):
+            if not effort:
+                effort = embedded_effort
+            model_name = model_name[:lp].strip()
 
     if not effort:
         effort = "high"
 
-    effort_lower = effort.lower()
+    effort_lower = str(effort).strip().lower()
     if effort_lower in ("high", "h"):
         effort_color = C_YELLOW
-    elif effort_lower in ("max", "ultra"):
+    elif effort_lower in ("max", "ultra", "xhigh"):
         effort_color = C_RED
     elif effort_lower in ("medium", "med", "m"):
         effort_color = C_BLUE
@@ -672,56 +964,47 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> str:
     badge = f"{C_PURPLE}🤖 {model_name}{C_RESET} {effort_color}({effort_lower}){C_RESET}"
     return badge, model_name, effort_lower
 
-def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, float | None, str | None, str]:
-    """Returns (frac_5h, reset_5h, frac_sem, reset_sem, label) based on active model family."""
+
+def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str | None, float, str | None, str]:
+    """Returns (frac_5h, reset_5h, frac_sem, reset_sem, label) based on active model family.
+    - Claude/GPT models -> (claude_5h, claude_5h_reset, claude_weekly, claude_weekly_reset, "Claude")
+    - ALL Gemini models (including Carbon, Argon, Hydrogen, Orchestrator, 3.8 Flash)
+      -> BOTH (gemini_5h, gemini_5h_reset, gemini_weekly, gemini_weekly_reset, "Gemini")!
+    """
     if not quota:
-        return 1.0, None, 1.0, None, "5H"
+        return 1.0, None, 1.0, None, "Gemini"
 
     m = (model_name or "").lower()
-    
-    # 1. Claude & GPT Models
-    if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
+
+    if any(k in m for k in ("claude", "sonnet", "opus", "haiku", "gpt")):
         frac_5h = quota.get("claude_5h_fraction")
         if frac_5h is None:
             frac_5h = 1.0
         reset_5h = quota.get("claude_5h_reset")
-        frac_sem = quota.get("claude_weekly_fraction", 1.0)
-        reset_sem = quota.get("claude_weekly_reset")
-        is_disabled = quota.get("claude_disabled", False)
-        
-        # If weekly limit is 0 or disabled, 5H is locked to 0
-        if (frac_sem is not None and frac_sem <= 0.001) or is_disabled:
-            reset_5h = reset_sem or reset_5h
-            frac_5h = 0.0
-            frac_sem = 0.0
-            return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
-        return frac_5h, reset_5h, frac_sem, reset_sem, "Claude"
-
-    # 2. Gemini 4 Models (Argon, Hydrogen, Carbon)
-    elif "argon" in m or "hydrogen" in m or "carbon" in m or "gemini-4" in m or "gemini 4" in m:
-        fam_name = "Hydrogen" if "hydrogen" in m else ("Carbon" if "carbon" in m else "Argon")
-        frac_sem = quota.get("argon_weekly_fraction")
+        frac_sem = quota.get("claude_weekly_fraction")
         if frac_sem is None:
-            frac_sem = quota.get("gemini_weekly_fraction", 1.0)
-        reset_sem = quota.get("argon_weekly_reset") or quota.get("gemini_weekly_reset")
-        # Gemini 4 tiene recarga semanal
-        frac_5h = None
-        reset_5h = None
-        if frac_sem is not None and frac_sem <= 0.001:
-            frac_sem = 0.0
-        return frac_5h, reset_5h, frac_sem, reset_sem, fam_name
+            frac_sem = 1.0
+        reset_sem = quota.get("claude_weekly_reset")
+        is_disabled = bool(quota.get("claude_disabled", False))
 
-    # 3. Standard Gemini Models (Flash, Pro)
-    else:
-        frac_sem = quota.get("gemini_weekly_fraction", 1.0)
-        reset_sem = quota.get("gemini_weekly_reset")
-        is_disabled = quota.get("gemini_disabled", False)
-        if (frac_sem is not None and frac_sem <= 0.001) or is_disabled:
-            reset_5h = reset_sem or quota.get("gemini_5h_reset")
-            return 0.0, reset_5h, 0.0, reset_sem, "5H"
-        frac_5h = quota.get("gemini_5h_fraction", 1.0)
-        reset_5h = quota.get("gemini_5h_reset")
-        return frac_5h, reset_5h, frac_sem, reset_sem, "5H"
+        if frac_sem <= 0.0005 or is_disabled:
+            return 0.0, (reset_5h or reset_sem), 0.0, reset_sem, "Claude"
+        return float(frac_5h), reset_5h, float(frac_sem), reset_sem, "Claude"
+
+    frac_5h = quota.get("gemini_5h_fraction")
+    if frac_5h is None:
+        frac_5h = 1.0
+    reset_5h = quota.get("gemini_5h_reset")
+    frac_sem = quota.get("gemini_weekly_fraction")
+    if frac_sem is None:
+        frac_sem = 1.0
+    reset_sem = quota.get("gemini_weekly_reset")
+    is_disabled = bool(quota.get("gemini_disabled", False))
+
+    if frac_sem <= 0.0005 or is_disabled:
+        return 0.0, (reset_5h or reset_sem), 0.0, reset_sem, "Gemini"
+    return float(frac_5h), reset_5h, float(frac_sem), reset_sem, "Gemini"
+
 
 def find_parent_agy_pid() -> int | None:
     """Climbs the process tree to find the parent agy CLI process (max 8 hops)."""
@@ -735,73 +1018,183 @@ def find_parent_agy_pid() -> int | None:
                 try:
                     with open(cmd_file, "rb") as f:
                         cmd = f.read().decode("utf-8", errors="ignore")
-                        if "agy" in cmd and "statusline" not in cmd:
-                            return pid
+                    if "agy" in cmd and "statusline" not in cmd and "titleline" not in cmd:
+                        return pid
                 except Exception:
                     pass
             status_file = f"/proc/{pid}/status"
             if not os.path.exists(status_file):
                 break
             ppid = None
-            with open(status_file, "r") as sf:
+            with open(status_file, "r", encoding="utf-8") as sf:
                 for line in sf:
                     if line.startswith("PPid:"):
                         ppid = int(line.split()[1])
                         break
-            if not ppid or ppid == pid:
+            if not ppid or ppid <= 1 or ppid == pid:
                 break
             pid = ppid
     except Exception:
         pass
     return None
 
+
+def get_herdr_env() -> tuple[str | None, str | None]:
+    """Detects (HERDR_SOCKET_PATH, HERDR_PANE_ID) from os.environ or parent /proc/<pid>/environ."""
+    sock_path = os.environ.get("HERDR_SOCKET_PATH")
+    pane_id = os.environ.get("HERDR_PANE_ID")
+
+    if not sock_path or not pane_id:
+        pid = find_parent_agy_pid() or os.getppid()
+        cur = pid
+        for _ in range(4):
+            if not cur or cur <= 1:
+                break
+            env_file = f"/proc/{cur}/environ"
+            if os.path.exists(env_file):
+                try:
+                    with open(env_file, "rb") as ef:
+                        for entry in ef.read().split(b"\x00"):
+                            if entry.startswith(b"HERDR_PANE_ID=") and not pane_id:
+                                pane_id = entry[14:].decode("utf-8", errors="ignore").strip()
+                            elif entry.startswith(b"HERDR_SOCKET_PATH=") and not sock_path:
+                                sock_path = entry[18:].decode("utf-8", errors="ignore").strip()
+                except Exception:
+                    pass
+            if sock_path and pane_id:
+                break
+            status_file = f"/proc/{cur}/status"
+            if not os.path.exists(status_file):
+                break
+            nxt = 0
+            try:
+                with open(status_file, "r", encoding="utf-8") as sf:
+                    for line in sf:
+                        if line.startswith("PPid:"):
+                            nxt = int(line.split()[1])
+                            break
+            except Exception:
+                break
+            if nxt <= 1 or nxt == cur:
+                break
+            cur = nxt
+
+    if pane_id and not sock_path:
+        default_sock = f"{REAL_HOME}/.config/herdr/herdr.sock"
+        if os.path.exists(default_sock):
+            sock_path = default_sock
+
+    return sock_path, pane_id
+
+
+def report_herdr_pane_metadata(
+    account: str,
+    plan_type: str | None,
+    model_name: str,
+    p5: int,
+    ps: int,
+) -> None:
+    """Reports live account, plan, model and quota to Herdr pane header via UNIX socket (8s throttle)."""
+    sock_path, pane_id = get_herdr_env()
+    if not sock_path or not pane_id or not os.path.exists(sock_path):
+        return
+
+    safe_pane = "".join(ch if (ch.isalnum() or ch in "_.-") else "_" for ch in pane_id)
+    ts_file = f"/tmp/agyc_herdr_meta_{safe_pane}.ts"
+    now_ts = time.time()
+
+    if os.path.exists(ts_file):
+        try:
+            with open(ts_file, "r", encoding="utf-8") as f:
+                last_ts = float(f.read().strip())
+            if now_ts - last_ts < HERDR_META_THROTTLE_SECONDS:
+                return
+        except Exception:
+            pass
+
+    try:
+        fd = os.open(ts_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(str(now_ts))
+    except Exception:
+        pass
+
+    plan_tag = (plan_type or "PRO").upper()
+    short_model = model_name.strip()
+    seq = int(now_ts * 1000)
+
+    payload = {
+        "id": f"agyc:{seq}",
+        "method": "pane.report_metadata",
+        "params": {
+            "pane_id": pane_id,
+            "source": "agyc",
+            "display_agent": f"⚡ {account} [{plan_tag}] · {short_model} · 5H:{p5}% Sem:{ps}%",
+            "tokens": {"quota": f"5H:{p5}% Sem:{ps}%", "plan": plan_tag},
+            "seq": seq,
+        },
+    }
+
+    try:
+        import _socket
+        raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.settimeout(0.05)
+        try:
+            s.connect(sock_path)
+            s.sendall(raw)
+            s.recv(4096)
+        finally:
+            s.close()
+    except Exception:
+        pass
+
+
 def get_session_conv_id() -> str | None:
     """Detects conversation ID specific to THIS terminal instance of agy."""
-    # 1. From environment variable (if passed by agy / subagents)
     env_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
     if env_conv:
         return env_conv
 
-    # 2. From the calling agy process open file descriptors
     agy_pid = find_parent_agy_pid()
     if not agy_pid:
         return None
-    
+
     fd_dir = f"/proc/{agy_pid}/fd"
     if not os.path.isdir(fd_dir):
         return None
 
+    marker = "conversations/"
     try:
         for fd in os.listdir(fd_dir):
             try:
                 target = os.readlink(os.path.join(fd_dir, fd))
-                m = re.search(r"conversations/([a-f0-9\-]{36})\.db", target)
-                if m:
-                    return m.group(1)
+                mi = target.find(marker)
+                if mi != -1 and target.endswith(".db"):
+                    cid = target[mi + len(marker) : -3]
+                    if len(cid) == 36 and cid.count("-") == 4:
+                        return cid
             except Exception:
                 pass
     except Exception:
         pass
     return None
 
-def find_active_transcript(conv_id: str | None = None) -> str | None:
+
+def find_active_transcript(conv_id: str | None = None, account: str = "agy01") -> str | None:
     """Finds the conversation transcript file for THIS specific terminal session."""
     if not conv_id:
         conv_id = get_session_conv_id()
-
-    # If this specific terminal session has no active conversation yet, it is a brand new session!
     if not conv_id:
         return None
 
     candidate_bases = [
         os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
+        f"{REAL_HOME}/.agyc_homes/{account}/.gemini/antigravity-cli",
         os.path.expanduser("~/.gemini/antigravity-cli"),
         f"{REAL_HOME}/.gemini/antigravity-cli",
-        f"{REAL_HOME}/.agyc_homes/agy01/.gemini/antigravity-cli",
-        f"{REAL_HOME}/.agyc_homes/agy02/.gemini/antigravity-cli",
-        f"{REAL_HOME}/.agyc_homes/agy03/.gemini/antigravity-cli",
     ]
-    
+
     for base in candidate_bases:
         if not base or not os.path.isdir(base):
             continue
@@ -810,45 +1203,38 @@ def find_active_transcript(conv_id: str | None = None) -> str | None:
             cand = os.path.join(log_dir, fname)
             if os.path.isfile(cand):
                 return cand
-
     return None
 
-def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[float, int, int]:
-    """Returns (fraction, estimated_tokens, max_tokens).
-    
-    Adapts max_tokens based on active model:
-    - Claude / GPT models: 200,000 tokens
-    - Gemini models: 1,000,000 tokens
-    """
+
+def get_context_usage(stdin_data: dict | None, model_name: str = "", account: str = "agy01") -> tuple[float, int, int]:
+    """Returns (fraction, estimated_tokens, max_tokens)."""
     m = (model_name or "").lower()
     if any(k in m for k in ("claude", "gpt", "sonnet", "opus", "haiku")):
         max_tokens = 200_000
     else:
         max_tokens = 1_000_000
-    
-    # 1. Parse structured context_window from stdin_data
+
     if stdin_data:
         try:
-            ctx = stdin_data.get("context_window", {}) or stdin_data.get("context", {})
-            if ctx:
+            ctx = stdin_data.get("context_window") or stdin_data.get("context") or {}
+            if isinstance(ctx, dict) and ctx:
                 max_t = ctx.get("context_window_size") or ctx.get("max_tokens") or max_tokens
                 used_pct = ctx.get("used_percentage")
                 used = (
-                    ctx.get("total_input_tokens") or 
-                    ctx.get("used_tokens") or 
-                    ctx.get("total_tokens")
+                    ctx.get("total_input_tokens")
+                    or ctx.get("used_tokens")
+                    or ctx.get("total_tokens")
                 )
                 if used is not None and max_t:
                     frac = min(1.0, float(used) / float(max_t))
                     return (frac, int(used), int(max_t))
                 elif used_pct is not None and max_t:
                     frac = min(1.0, float(used_pct) / 100.0)
-                    used_t = int(round(frac * max_t))
+                    used_t = int(round(frac * float(max_t)))
                     return (frac, used_t, int(max_t))
         except Exception:
             pass
 
-    # 2. Fallback: Parse active transcript file
     conv_id = None
     if stdin_data:
         conv_id = stdin_data.get("conversation_id") or stdin_data.get("session_id")
@@ -857,105 +1243,165 @@ def get_context_usage(stdin_data: dict | None, model_name: str = "") -> tuple[fl
 
     transcript_path = None
     if stdin_data and stdin_data.get("transcript_path"):
-        tp = stdin_data.get("transcript_path")
+        tp = str(stdin_data.get("transcript_path"))
         if os.path.exists(tp):
             transcript_path = tp
 
     if not transcript_path:
-        transcript_path = find_active_transcript(conv_id)
+        transcript_path = find_active_transcript(conv_id, account=account)
 
     if transcript_path and os.path.exists(transcript_path):
         size_bytes = os.path.getsize(transcript_path)
-        # Approximate ~4 bytes per token for typical JSON transcript content
         estimated_tokens = int(size_bytes / 4.0)
         fraction = min(1.0, estimated_tokens / float(max_tokens))
         return (fraction, estimated_tokens, max_tokens)
 
     return (0.0, 0, max_tokens)
 
-def main():
-    # Read stdin non-blocking with minimal select timeout (5ms) without waiting for EOF
-    stdin_data = None
+
+def read_stdin_json(max_wait_sec: float = 0.020) -> dict | None:
+    """Reads JSON from stdin using select.select + os.read(0, 65536) loop up to 20ms total."""
     try:
-        if not sys.stdin.isatty():
-            r, _, _ = select.select([sys.stdin], [], [], 0.005)
-            if r:
-                os.set_blocking(sys.stdin.fileno(), False)
-                raw = sys.stdin.read()
-                if raw and raw.strip().startswith("{"):
-                    stdin_data = json.loads(raw)
+        if sys.stdin.isatty():
+            return None
+        fd = sys.stdin.fileno()
+        os.set_blocking(fd, False)
+        deadline = time.monotonic() + max_wait_sec
+        chunks: list[bytes] = []
+
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
+            r, _, _ = select.select([fd], [], [], min(rem, 0.005))
+            if not r:
+                if chunks:
+                    raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
+                    if raw_str.startswith("{"):
+                        try:
+                            return json.loads(raw_str)
+                        except Exception:
+                            pass
+                continue
+
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                continue
+            except Exception:
+                break
+
+            if not chunk:
+                break
+
+            chunks.append(chunk)
+            raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
+            if raw_str.startswith("{") and raw_str.endswith("}"):
+                try:
+                    return json.loads(raw_str)
+                except Exception:
+                    pass
+
+        if chunks:
+            raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
+            if raw_str.startswith("{"):
+                return json.loads(raw_str)
     except Exception:
         pass
+    return None
+
+
+def build_account_badge(account: str, plan_type: str | None) -> str:
+    """Renders ⚡ agy10·ULTRA (magenta) or ⚡ agy02·PRO (soft cyan/blue)."""
+    pt = (plan_type or "").upper()
+    if pt == "ULTRA":
+        return f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}{C_GRAY}·{C_RESET}{C_BOLD}{C_MAGENTA}ULTRA{C_RESET}"
+    if pt == "PRO":
+        return f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}{C_GRAY}·{C_RESET}{C_BLUE}PRO{C_RESET}"
+    if pt:
+        return f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}{C_GRAY}·{C_RESET}{C_DIM}{pt}{C_RESET}"
+    return f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}"
+
+
+def main() -> None:
+    is_title_mode = ("--title" in sys.argv[1:]) or (os.path.basename(sys.argv[0]) == "agyc-titleline")
+    stdin_data = read_stdin_json(0.020)
 
     # 1. Active Account
     account = detect_active_account(stdin_data)
-    acc_badge = f"{C_BOLD}{C_CYAN}⚡ {account}{C_RESET}"
 
-    # 2. Git Branch
-    branch = get_git_branch()
-    branch_badge = f"{C_BOLD}{C_GREEN}🌿 {branch}{C_RESET}" if branch else None
-
-    # 3. Model & Effort (placed before 5h quota)
+    # 2. Model & Effort
     model_badge, model_name, effort = get_model_and_effort(stdin_data, account)
 
-    # 4. Quota (live from stdin_data if present, else cached / online API)
-    stdin_quota = stdin_data.get("quota") if stdin_data else None
-    if stdin_quota:
-        quota = extract_quota_from_stdin(stdin_quota, account)
-    else:
-        quota = fetch_online_quota(account)
-    f5, r5, fs, rs, q_label = get_quota_for_model(quota, model_name)
+    # 3. Quota (always read cached 20s TTL + merge stdin_quota in memory only, NEVER overwriting disk!)
+    cached_quota = fetch_online_quota(account)
+    stdin_quota = stdin_data.get("quota") if isinstance(stdin_data, dict) else None
+    quota = merge_cached_and_stdin_quota(cached_quota, stdin_quota)
 
-    # 5. Context Usage (adjusted for model max context window)
-    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name)
+    plan_type = resolve_plan_type(quota, account)
+    f5, r5, fs, rs, _ = get_quota_for_model(quota, model_name)
+    p5 = fmt_pct(f5)
+    ps = fmt_pct(fs)
+
+    # 4. Context Usage
+    ctx_frac, ctx_tokens, ctx_max = get_context_usage(stdin_data, model_name, account=account)
     ctx_percent = int(round(ctx_frac * 100))
+
+    # 5. Titleline Mode (--title or agyc-titleline): plain text without ANSI codes
+    if is_title_mode:
+        acc_part = f"⚡ {account} [{plan_type}]" if plan_type else f"⚡ {account}"
+        model_part = f"{model_name} ({effort})"
+        part_5h = f"5H: {p5}%" if (p5 >= 100 or not r5) else f"5H: {p5}% ({format_countdown(r5)})"
+        part_sem = f"Sem: {ps}%" if (ps >= 100 or not rs) else f"Sem: {ps}% ({format_countdown(rs, default_val='7d 00h')})"
+        ctx_part = f"Ctx: {ctx_percent}%"
+        print(" · ".join([acc_part, model_part, part_5h, part_sem, ctx_part]))
+        sys.exit(0)
+
+    # 6. Normal ANSI Statusline Mode
+    acc_badge = build_account_badge(account, plan_type)
+
+    branch, is_dirty = get_vcs_info(stdin_data)
+    if branch:
+        dirty_mark = f"{C_YELLOW}*{C_RESET}" if is_dirty else ""
+        branch_badge = f"{C_BOLD}{C_GREEN}🌿 {branch}{C_RESET}{dirty_mark}"
+    else:
+        branch_badge = None
+
+    c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
+    bar_5 = make_linebar(f5, length=8)
+    if p5 >= 100 or not r5:
+        str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET}"
+    else:
+        str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
+
+    cs = C_GREEN if ps >= 50 else (C_YELLOW if ps >= 20 else C_RED)
+    bar_s = make_linebar(fs, length=8)
+    if ps >= 100 or not rs:
+        str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET}"
+    else:
+        cd_s = format_countdown(rs, default_val="7d 00h")
+        str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET} {C_DIM}({cd_s}){C_RESET}"
+
     ctx_bar = make_context_linebar(ctx_frac, length=8)
     tokens_k = f"{ctx_tokens // 1000}k" if ctx_tokens >= 1000 else str(ctx_tokens)
     max_k = f"{ctx_max // 1_000_000}M" if ctx_max >= 1_000_000 else f"{ctx_max // 1000}k"
     ctx_badge = f"{C_BLUE}Ctx:{C_RESET} {ctx_bar} {C_BOLD}{ctx_percent}%{C_RESET} {C_DIM}({tokens_k}/{max_k}){C_RESET}"
 
-    # Separator
     sep = f" {C_GRAY}│{C_RESET} "
-    
-    # Build complete statusline
     parts = [acc_badge]
     if branch_badge:
         parts.append(branch_badge)
-    parts.append(model_badge)
+    parts.extend([model_badge, str_5h, str_sem, ctx_badge])
 
-    if q_label.startswith("Argon: No cuenta"):
-        parts.append(f"{C_YELLOW}Argon:{C_RESET} {C_DIM}[────────] No cuenta{C_RESET}")
-    else:
-        if f5 is not None:
-            p5 = int(round(f5 * 100))
-            c5 = C_GREEN if p5 >= 50 else (C_YELLOW if p5 >= 20 else C_RED)
-            bar_5 = make_linebar(f5, length=8)
-            if p5 >= 100:
-                str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}100%{C_RESET}"
-            else:
-                str_5h = f"{C_YELLOW}5H:{C_RESET} {bar_5} {c5}{C_BOLD}{p5}%{C_RESET} {C_DIM}(⏳ {format_countdown(r5)}){C_RESET}"
-            parts.append(str_5h)
+    print(sep.join(parts))
 
-        if fs is not None:
-            ps = int(round(fs * 100))
-            bar_s = make_linebar(fs, length=8)
-            cd_s = format_countdown(rs, default_val="7d 0h")
-            cs = C_GREEN if ps >= 50 else (C_YELLOW if ps >= 20 else C_RED)
-            if ps >= 100:
-                str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET}"
-            else:
-                str_sem = f"{C_YELLOW}Sem:{C_RESET} {bar_s} {cs}{C_BOLD}{ps}%{C_RESET} {C_DIM}({cd_s}){C_RESET}"
-            parts.append(str_sem)
+    # 7. Sync metadata with Herdr pane top bar (zero subprocesses, 8s throttle, 50ms socket timeout)
+    report_herdr_pane_metadata(account, plan_type, model_name, p5, ps)
 
-    parts.append(ctx_badge)
-
-    line = sep.join(parts)
-    print(line)
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--refresh-quota-bg":
         alias = sys.argv[2]
-        # When running in background, ensure HOME points to real home for token lookup
         os.environ["HOME"] = REAL_HOME
         do_fetch_and_save_quota(alias)
         sys.exit(0)

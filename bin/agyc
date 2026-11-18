@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-agyc: Administrador de múltiples cuentas de Google AI Pro para Antigravity (agy).
-
-Origen de Desarrollo:
-  - Creado en sesión: 328759be-6f6e-439e-a6c5-e98f6d138850
-  - Entorno: Google Antigravity CLI 1.2.11 (Linux x86_64)
-  - Fecha: Octubre 2026 | Workspace: /home/aidev/proyectos
+agyc: Administrador multi-cuenta de Google Antigravity (Pro / Ultra — v1.5).
 
 Características:
   - Nombre corto y rápido: agyc
-  - Switch y entrada directa: escribir 'agy02' entra directo a la cuenta agy02 en agy.
+  - Switch y entrada directa: escribir 'agy02' entra directo a la cuenta agy02 en agy con HOME aislado.
   - Modo por defecto: inicia siempre con --dangerously-skip-permissions.
   - Registro automático correlativo: 'agyc add' asigna automáticamente agy02, agy03, etc.
-  - Tabla visual con barras de progreso (linebars) de Gemini (5h y semanal) y Claude/GPT (5h y semanal).
-  - Rotación inteligente según cuota disponible: 'agyc auto'.
-  - Guardián de seguridad: alerta y pide confirmación si se abre una cuenta no activa.
+  - Motor de cuotas CloudCode PA v1.5.10 (daily + prod fusionados con min remainingFraction).
+  - Detección automática de plan (ULTRA / PRO / ENT / FREE) y soporte Gemini 4 Carbon.
+  - Tabla compacta de 131 columnas ideal para paneles divididos de Herdr.
+  - Rotación inteligente paralela: 'agyc auto [gemini|claude|carbon]'.
   - Vaciado seguro y total: 'agyc wipe'.
 """
 
 import sys
 import os
 import re
+import glob
+import math
 import json
 import time
 import base64
@@ -33,16 +31,20 @@ import select
 import argparse
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 # Expresión regular para quitar secuencias de escape ANSI
-ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*m')
+ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def strip_ansi(s: str) -> str:
-    return ANSI_REGEX.sub('', str(s))
+    return ANSI_REGEX.sub("", str(s))
+
 
 def visible_len(s: str) -> int:
     return len(strip_ansi(s))
+
 
 def pad_visible(s: str, width: int, align: str = "left") -> str:
     vlen = visible_len(s)
@@ -56,7 +58,27 @@ def pad_visible(s: str, width: int, align: str = "left") -> str:
     else:
         return s + (" " * pad)
 
-REAL_HOME = os.environ.get("AGYC_REAL_HOME") or os.environ.get("REAL_HOME") or "/home/aidev"
+
+def resolve_real_home() -> str:
+    """Resuelve el HOME real del usuario, inmune a sesiones con HOME aislado en ~/.agyc_homes/."""
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
+        val = os.environ.get(env_key, "").strip()
+        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
+            return val.rstrip("/") or "/"
+    expanded = os.path.expanduser("~")
+    if "/.agyc_homes/" in expanded:
+        prefix = expanded.split("/.agyc_homes/")[0]
+        if prefix:
+            return prefix
+    if expanded and expanded != "~" and "/.agyc_homes" not in expanded and os.path.isdir(expanded):
+        return expanded.rstrip("/") or "/"
+    return "/home/aidev"
+
+
+REAL_HOME = resolve_real_home()
+
+# User-Agent oficial Antigravity 1.5.10 que habilita ambos grupos unificados en CloudCode PA
+ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
 
 # Credenciales OAuth estándar de Google Antigravity
 GOOGLE_CLIENT_ID = "moc.tnetnocresuelgoog.sppa.pe304g4hjolotv532ercl12h2nisshmt-1950606001701"[::-1]
@@ -67,6 +89,7 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/cclog",
     "https://www.googleapis.com/auth/experimentsandconfigs",
+    "https://www.googleapis.com/auth/aicode",
 ]
 OAUTH_PORTS = [9120, 9121, 9122, 9123, 9124]
 
@@ -84,25 +107,39 @@ C_WHITE = "\033[97m"
 C_BG_GREEN = "\033[42m\033[30m"
 C_BG_BLUE = "\033[44m\033[97m"
 
+
+def normalize_alias(alias: str | None) -> str | None:
+    if not alias:
+        return None
+    m = re.match(r"^(?:agy|agi)(\d+)$", alias.strip())
+    if m:
+        return f"agy{int(m.group(1)):02d}"
+    return alias.strip()
+
+
 def get_base_dir() -> str:
+    real_home = resolve_real_home()
     candidates = [
         os.environ.get("ANTIGRAVITY_HOME"),
         os.environ.get("AGY_CONFIG_DIR"),
-        os.path.expanduser("~/.gemini/antigravity-cli"),
+        os.path.join(real_home, ".gemini", "antigravity-cli"),
         "/home/aidev/.gemini/antigravity-cli",
+        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
         "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli",
     ]
     for c in candidates:
-        if c and os.path.exists(c):
+        if c and "/.agyc_homes/" not in c and not c.endswith("/.agyc_homes") and os.path.exists(c):
             return c
-    default_path = os.path.expanduser("~/.gemini/antigravity-cli")
+    default_path = os.path.join(real_home, ".gemini", "antigravity-cli")
     os.makedirs(default_path, exist_ok=True)
     return default_path
+
 
 def get_bin_dir() -> str:
     b = os.path.join(get_base_dir(), "bin")
     os.makedirs(b, exist_ok=True)
     return b
+
 
 def get_accounts_dir() -> str:
     base = get_base_dir()
@@ -110,11 +147,35 @@ def get_accounts_dir() -> str:
     os.makedirs(d, exist_ok=True)
     return d
 
+
 def get_active_token_path() -> str:
     return os.path.join(get_base_dir(), "antigravity-oauth-token")
 
+
 def get_config_path() -> str:
     return os.path.join(get_accounts_dir(), "config.json")
+
+
+def _atomic_write_json(path: str, payload: dict, mode: int | None = None, indent: int | None = 2):
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        if mode is not None:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=indent)
+            os.chmod(tmp, mode)
+        else:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=indent)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
 
 def load_config() -> dict:
     p = get_config_path()
@@ -126,12 +187,10 @@ def load_config() -> dict:
             pass
     return {"default_account": None, "active_account": None}
 
+
 def save_config(cfg: dict):
-    p = get_config_path()
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-    os.replace(tmp, p)
+    _atomic_write_json(get_config_path(), cfg, indent=2)
+
 
 def load_account(alias: str) -> dict | None:
     p = os.path.join(get_accounts_dir(), f"{alias}.json")
@@ -143,17 +202,72 @@ def load_account(alias: str) -> dict | None:
             pass
     return None
 
-def save_account(alias: str, data: dict):
+
+def _sync_isolated_token_if_present(alias: str, token_data: dict | None):
+    if not alias or not isinstance(token_data, dict) or not token_data:
+        return
+    iso_gemini = os.path.join(resolve_real_home(), ".agyc_homes", alias, ".gemini", "antigravity-cli")
+    if not os.path.isdir(iso_gemini):
+        return
+    token_dst = os.path.join(iso_gemini, "antigravity-oauth-token")
+    if os.path.islink(token_dst):
+        try:
+            os.unlink(token_dst)
+        except Exception:
+            pass
+    try:
+        _atomic_write_json(token_dst, token_data, mode=0o600, indent=2)
+    except Exception:
+        pass
+
+
+def save_account(alias: str, data: dict, sync_links: bool = True):
     data["alias"] = alias
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
     if "created_at" not in data:
         data["created_at"] = data["updated_at"]
     p = os.path.join(get_accounts_dir(), f"{alias}.json")
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, p)
-    sync_account_symlinks()
+    _atomic_write_json(p, data, mode=0o600, indent=2)
+    _sync_isolated_token_if_present(alias, data.get("token_data"))
+    if sync_links:
+        sync_account_symlinks()
+
+
+def write_quota_cache(alias: str, quota_dict: dict):
+    """Guarda de forma atómica (0600) la caché de cuotas en /tmp/agyc_quota_cache_{alias}.json."""
+    if not alias or not isinstance(quota_dict, dict):
+        return
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    tmp_file = f"{cache_file}.tmp.{os.getpid()}.{threading.get_ident()}"
+    payload = dict(quota_dict)
+    payload["cached_at"] = time.time()
+    try:
+        fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.chmod(tmp_file, 0o600)
+        os.replace(tmp_file, cache_file)
+    except Exception:
+        try:
+            if os.path.exists(tmp_file):
+                os.remove(tmp_file)
+        except Exception:
+            pass
+
+
+def read_quota_cache(alias: str, max_age: float = 60.0) -> dict | None:
+    cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
+    if not os.path.exists(cache_file):
+        return None
+    try:
+        with open(cache_file, "r", encoding="utf-8") as cf:
+            cached = json.load(cf)
+        if isinstance(cached, dict) and (time.time() - float(cached.get("cached_at", 0)) < max_age):
+            return cached
+    except Exception:
+        pass
+    return None
+
 
 def list_account_aliases() -> list[str]:
     d = get_accounts_dir()
@@ -162,6 +276,7 @@ def list_account_aliases() -> list[str]:
         if f.endswith(".json") and f != "config.json":
             aliases.append(f[:-5])
     return aliases
+
 
 def get_next_correlative_alias() -> str:
     """Calcula automáticamente el siguiente alias según orden correlativo (agy01, agy02, ...)."""
@@ -176,6 +291,7 @@ def get_next_correlative_alias() -> str:
     next_num = max(nums) + 1
     return f"agy{next_num:02d}"
 
+
 def sync_account_symlinks():
     """Crea symlinks en el directorio bin para que el usuario pueda escribir 'agy01', 'agy02', etc."""
     bin_dir = get_bin_dir()
@@ -183,10 +299,8 @@ def sync_account_symlinks():
     if not os.path.exists(agyc_path):
         return
 
-    # Sincronizar cuentas existentes
     aliases = list_account_aliases()
     all_to_link = set(aliases)
-    # Pre-crear enlaces hasta agy15 y agi15 por comodidad
     for i in range(1, 16):
         all_to_link.add(f"agy{i:02d}")
         all_to_link.add(f"agi{i:02d}")
@@ -199,7 +313,6 @@ def sync_account_symlinks():
             except Exception:
                 pass
 
-    # Symlink agi -> agy
     agi_bin = os.path.join(bin_dir, "agi")
     agy_bin = os.path.join(bin_dir, "agy")
     if os.path.exists(agy_bin) and not os.path.exists(agi_bin):
@@ -208,18 +321,19 @@ def sync_account_symlinks():
         except Exception:
             pass
 
-    # Sincronizar y activar agyc-statusline
     ensure_statusline_configured()
 
+
 def ensure_statusline_configured():
-    """Garantiza que agyc-statusline esté configurado y activo en settings.json de todas las cuentas."""
+    """Garantiza que agyc-statusline y agyc-titleline estén configurados y activos en settings.json."""
+    real_home = resolve_real_home()
     bin_dir = get_bin_dir()
     statusline_bin = os.path.join(bin_dir, "agyc-statusline")
     if not os.path.exists(statusline_bin):
         for cand in [
-            "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agyc-statusline",
             "/home/aidev/proyectos/agyc-antigravity-cli-switcher/bin/agyc-statusline",
-            os.path.expanduser("~/.local/bin/agyc-statusline"),
+            os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
+            os.path.join(real_home, ".local", "bin", "agyc-statusline"),
         ]:
             if os.path.exists(cand):
                 try:
@@ -229,12 +343,21 @@ def ensure_statusline_configured():
                 except Exception:
                     pass
 
+    titleline_bin = os.path.join(bin_dir, "agyc-titleline")
+    if os.path.exists(statusline_bin) and not os.path.exists(titleline_bin):
+        try:
+            if os.path.lexists(titleline_bin):
+                os.unlink(titleline_bin)
+            os.symlink(statusline_bin, titleline_bin)
+        except Exception:
+            pass
+
     base_paths = [
         get_base_dir(),
-        os.path.expanduser("~/.gemini/antigravity-cli"),
+        os.path.join(real_home, ".gemini", "antigravity-cli"),
         "/home/aidev/.gemini/antigravity-cli",
     ]
-    homes_base = os.path.join(REAL_HOME, ".agyc_homes")
+    homes_base = os.path.join(real_home, ".agyc_homes")
     if os.path.exists(homes_base):
         try:
             for h in os.listdir(homes_base):
@@ -244,26 +367,40 @@ def ensure_statusline_configured():
         except Exception:
             pass
 
-    for bp in set(base_paths):
+    desired_sl = {"type": "command", "command": "agyc-statusline", "enabled": True}
+    desired_tl = {"type": "command", "command": "agyc-titleline", "enabled": True}
+
+    seen_real_files = set()
+    for bp in base_paths:
         sp = os.path.join(bp, "settings.json")
-        if os.path.exists(sp):
-            try:
-                with open(sp, "r", encoding="utf-8") as f:
-                    s = json.load(f)
-                cur = s.get("statusLine", {})
-                if cur.get("command") != "agyc-statusline" or not cur.get("enabled"):
-                    s["statusLine"] = {
-                        "type": "command",
-                        "command": "agyc-statusline",
-                        "enabled": True
-                    }
-                    with open(sp, "w", encoding="utf-8") as f:
-                        json.dump(s, f, indent=2)
-            except Exception:
-                pass
+        if not os.path.exists(sp):
+            continue
+        real_sp = os.path.realpath(sp)
+        if real_sp in seen_real_files:
+            continue
+        seen_real_files.add(real_sp)
+        try:
+            with open(real_sp, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            if not isinstance(s, dict):
+                continue
+            cur_sl = s.get("statusLine", {})
+            cur_tl = s.get("title", {})
+            changed = False
+            if cur_sl.get("command") != "agyc-statusline" or not cur_sl.get("enabled") or cur_sl.get("type") != "command":
+                s["statusLine"] = desired_sl
+                changed = True
+            if cur_tl.get("command") != "agyc-titleline" or not cur_tl.get("enabled") or cur_tl.get("type") != "command":
+                s["title"] = desired_tl
+                changed = True
+            if changed:
+                _atomic_write_json(real_sp, s, indent=2)
+        except Exception:
+            pass
+
 
 def parse_iso_datetime(dt_str: str) -> datetime:
-    clean = dt_str.replace("Z", "+00:00")
+    clean = dt_str.strip().replace("Z", "+00:00")
     if "." in clean:
         parts = clean.split(".")
         subparts = parts[1].split("+")
@@ -275,7 +412,48 @@ def parse_iso_datetime(dt_str: str) -> datetime:
             if len(subparts) == 2:
                 micros = subparts[0][:6].ljust(6, "0")
                 clean = f"{parts[0]}.{micros}-{subparts[1]}"
-    return datetime.fromisoformat(clean)
+    dt = datetime.fromisoformat(clean)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def normalize_window(frac: float | None, reset_str: str | None) -> tuple[float | None, str | None]:
+    """
+    Normaliza una ventana de cuota (5H o Semanal):
+      - Si reset_str ya venció (delta <= 0), la cuota ya se recargó -> frac = 1.0, reset_str = None.
+      - Si frac >= 0.9995, limpia reset_str = None (evita mostrar now+5h / now+7d sintético al 100%).
+    """
+    if reset_str:
+        try:
+            reset_dt = parse_iso_datetime(reset_str)
+            delta = (reset_dt - datetime.now(timezone.utc)).total_seconds()
+            if delta <= 0:
+                frac = 1.0
+                reset_str = None
+        except Exception:
+            reset_str = None
+
+    if frac is not None:
+        frac = max(0.0, min(1.0, float(frac)))
+        if frac >= 0.9995:
+            frac = 1.0
+            reset_str = None
+
+    return frac, reset_str
+
+
+def pct_display(frac: float | None) -> int | None:
+    """Porcentaje entero sin redondear al alza a 100% cuando ya hubo consumo (math.floor)."""
+    if frac is None:
+        return None
+    f = max(0.0, min(1.0, float(frac)))
+    if f >= 0.9995:
+        return 100
+    if f <= 0.0:
+        return 0
+    return int(math.floor(f * 100))
+
 
 def format_countdown(reset_str: str | None) -> str:
     if not reset_str:
@@ -285,7 +463,7 @@ def format_countdown(reset_str: str | None) -> str:
         now_dt = datetime.now(timezone.utc)
         delta = (reset_dt - now_dt).total_seconds()
         if delta <= 0:
-            return "Refrescado"
+            return "Disponible"
         days = int(delta // 86400)
         hours = int((delta % 86400) // 3600)
         minutes = int((delta % 3600) // 60)
@@ -295,13 +473,36 @@ def format_countdown(reset_str: str | None) -> str:
     except Exception:
         return "N/A"
 
-def make_linebar(fraction: float | None, length: int = 10) -> str:
+
+def format_window_status(frac: float | None, reset_str: str | None, mode: str = "list") -> str:
+    """Formatea el estado textual de una ventana normalizada para cmd_list o cmd_quota."""
+    frac, reset_str = normalize_window(frac, reset_str)
+    if frac is None:
+        return f"{C_DIM}N/A{C_RESET}"
+    if frac >= 0.9995:
+        if mode == "quota":
+            return f"{C_DIM}Quota available{C_RESET}"
+        return f"{C_DIM}Disponible{C_RESET}"
+    if reset_str:
+        cd = format_countdown(reset_str)
+        if cd not in ("N/A", "Disponible"):
+            if mode == "quota":
+                return f"(Reinicio: {cd})"
+            return f"({cd})"
+    if frac <= 0.001:
+        if mode == "quota":
+            return f"{C_RED}(Quota exhausted){C_RESET}"
+        return f"{C_RED}(Agotada){C_RESET}"
+    return f"{C_DIM}(Activa){C_RESET}"
+
+
+def make_linebar(fraction: float | None, length: int = 8) -> str:
     if fraction is None:
         return f"{C_DIM}[{'-' * length}]  N/A{C_RESET}"
     pct = max(0.0, min(1.0, float(fraction)))
     filled = int(round(pct * length))
     empty = length - filled
-    pct_int = int(round(pct * 100))
+    pct_int = pct_display(pct)
     if pct >= 0.5:
         color = C_GREEN
     elif pct >= 0.2:
@@ -310,6 +511,18 @@ def make_linebar(fraction: float | None, length: int = 10) -> str:
         color = C_RED
     bar = "█" * filled + "░" * empty
     return f"{color}[{bar}] {pct_int:3d}%{C_RESET}"
+
+
+def format_plan_badge(plan_type: str | None) -> str:
+    pt = (plan_type or "FREE").upper()
+    if pt == "ULTRA":
+        return f"{C_BOLD}{C_MAGENTA}ULTRA{C_RESET}"
+    if pt == "PRO":
+        return f"{C_BOLD}{C_CYAN}PRO{C_RESET}"
+    if pt == "ENT":
+        return f"{C_BOLD}{C_BLUE}ENT{C_RESET}"
+    return f"{C_DIM}FREE{C_RESET}"
+
 
 def decode_jwt_payload(jwt_token: str) -> dict:
     try:
@@ -322,9 +535,11 @@ def decode_jwt_payload(jwt_token: str) -> dict:
         pass
     return {}
 
+
 class TokenRevokedError(Exception):
     """Excepción lanzada cuando el token fue revocado o expiró (invalid_grant)."""
     pass
+
 
 def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict, bool]:
     token_obj = token_data.get("token", {})
@@ -358,7 +573,7 @@ def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict
     req = urllib.request.Request(
         "https://oauth2.googleapis.com/token",
         data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"}
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
@@ -370,7 +585,7 @@ def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict
         except Exception:
             pass
         if e.code in (400, 401) and "invalid_grant" in err_body:
-            raise TokenRevokedError(f"Token revocado o expirado por Google (invalid_grant)")
+            raise TokenRevokedError("Token revocado o expirado por Google (invalid_grant)")
         raise e
 
     token_obj["access_token"] = res["access_token"]
@@ -384,60 +599,303 @@ def refresh_token_if_needed(token_data: dict, force: bool = False) -> tuple[dict
     token_data["token"] = token_obj
     return token_data, True
 
-def fetch_quota_summary(access_token: str) -> dict | None:
-    endpoints = [
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-    ]
-    summary_data = {"groups": []}
-    for url in endpoints:
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps({}).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.4.0 linux/amd64",
-                }
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                for g in data.get("groups", []):
-                    gn = g.get("displayName", "")
-                    if not any(x.get("displayName") == gn for x in summary_data["groups"]):
-                        summary_data["groups"].append(g)
-        except Exception:
-            continue
 
-    if not summary_data.get("groups"):
+def _post_cloudcode_json(url: str, body: dict, access_token: str, timeout: int = 5) -> dict | None:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "User-Agent": ANTIGRAVITY_UA,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _classify_group_family(group_display: str, bucket_id: str = "") -> str:
+    gl = (group_display or "").lower()
+    bl = (bucket_id or "").lower()
+    if any(k in gl for k in ("claude", "gpt", "3p")) or any(k in bl for k in ("3p", "claude", "gpt")):
+        return "claude"
+    if any(k in gl for k in ("gemini", "argon")) or any(k in bl for k in ("gemini", "argon")):
+        return "gemini"
+    return gl or bl or "other"
+
+
+def _classify_bucket_window(bucket: dict) -> str:
+    win = (bucket.get("window") or "").lower()
+    bid = (bucket.get("bucketId") or "").lower()
+    bname = (bucket.get("displayName") or "").lower()
+    if "5h" in win or "5h" in bid or "five hour" in bname:
+        return "5h"
+    if "weekly" in win or "weekly" in bid or "weekly" in bname or "month" in bid:
+        return "weekly"
+    return win or bid or bname or "unknown"
+
+
+def _extract_raw_bucket_fraction(bucket: dict) -> float | None:
+    if bucket.get("disabled"):
+        return 0.0
+    if "remainingFraction" in bucket and bucket["remainingFraction"] is not None:
+        return float(bucket["remainingFraction"])
+    # En Proto3 JSON, remainingFraction == 0.0 puede omitirse mientras resetTime está presente
+    if bucket.get("resetTime"):
+        return 0.0
+    return None
+
+
+def fetch_quota_summary(access_token: str) -> dict | None:
+    """
+    Consulta Tiers y Cuotas oficiales de Antigravity 1.5.10 en CloudCode PA:
+      a) loadCodeAssist -> paidTier / currentTier -> plan_type (ULTRA/PRO/ENT/FREE), supports_carbon, project_id.
+      b) retrieveUserQuotaSummary en daily y prod -> fusión por (family, window) con min(remainingFraction).
+      c) retrieveUserQuota en daily y prod -> fusión por modelId con min(remainingFraction).
+    """
+    if not access_token:
         return None
 
-    # Fetch live per-model quota from retrieveUserQuota (crucial for real-time 5H limits)
-    models_endpoints = [
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-        "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
-    ]
-    for url in models_endpoints:
+    # a) loadCodeAssist para detectar plan Pro / Ultra y cloudaicompanionProject
+    lca_res = {}
+    lca_ok = False
+    lca_payload = {
+        "metadata": {
+            "ideType": "ANTIGRAVITY",
+            "platform": "LINUX_AMD64",
+            "pluginType": "GEMINI",
+        }
+    }
+    for host in ("cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"):
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps({}).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "application/json",
-                    "User-Agent": "antigravity/1.4.0 linux/amd64",
-                }
+            res = _post_cloudcode_json(
+                f"https://{host}/v1internal:loadCodeAssist",
+                lca_payload,
+                access_token,
+                timeout=5,
             )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                summary_data["_models_quota"] = json.loads(resp.read().decode("utf-8"))
+            if isinstance(res, dict):
+                lca_res = res
+                lca_ok = True
+                break
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
                 break
         except Exception:
             continue
 
-    return summary_data
+    tier_obj = lca_res.get("paidTier") or lca_res.get("currentTier") or {}
+    if not isinstance(tier_obj, dict):
+        tier_obj = {}
+    tier_id = (tier_obj.get("id") or "free-tier").lower()
+    tier_name = tier_obj.get("name") or "Antigravity"
+    tier_name_low = tier_name.lower()
+
+    if "ultra" in tier_id or "ultra" in tier_name_low:
+        plan_type = "ULTRA"
+    elif "pro" in tier_id or "pro" in tier_name_low:
+        plan_type = "PRO"
+    elif "enterprise" in tier_id or "standard" in tier_id:
+        plan_type = "ENT"
+    else:
+        plan_type = "FREE"
+
+    supports_carbon = (plan_type == "ULTRA")
+    raw_proj = lca_res.get("cloudaicompanionProject")
+    if isinstance(raw_proj, dict):
+        project_id = raw_proj.get("id")
+    elif isinstance(raw_proj, str) and raw_proj.strip():
+        project_id = raw_proj.strip()
+    else:
+        project_id = None
+
+    quota_body = {"project": project_id} if project_id else {}
+
+    # b) & c) Consultar en paralelo retrieveUserQuotaSummary y retrieveUserQuota en daily y prod
+    tasks = {
+        "sum_daily": "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "sum_prod": "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        "mod_daily": "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+        "mod_prod": "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+    }
+    raw_results: dict[str, dict | None] = {}
+
+    def _run_call(item: tuple[str, str]) -> tuple[str, dict | None]:
+        key, url = item
+        try:
+            return key, _post_cloudcode_json(url, quota_body, access_token, timeout=5)
+        except Exception:
+            return key, None
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for k, val in pool.map(_run_call, tasks.items()):
+            raw_results[k] = val
+
+    # Fusionar retrieveUserQuotaSummary de daily y prod por (family, window) con min(remainingFraction)
+    fused_buckets: dict[tuple[str, str], dict] = {}
+    group_meta: dict[str, dict] = {}
+    top_description = ""
+
+    for src_key in ("sum_daily", "sum_prod"):
+        s_data = raw_results.get(src_key)
+        if not isinstance(s_data, dict):
+            continue
+        if s_data.get("description") and not top_description:
+            top_description = s_data["description"]
+        for grp in s_data.get("groups", []):
+            g_disp = grp.get("displayName", "")
+            g_desc = grp.get("description", "")
+            fam = _classify_group_family(g_disp)
+            if fam not in group_meta:
+                group_meta[fam] = {
+                    "displayName": "Gemini Models" if fam == "gemini" else (g_disp or "Claude and GPT models"),
+                    "description": g_desc if g_desc.lower().startswith("models within this group") else "",
+                }
+            elif g_desc and g_desc.lower().startswith("models within this group"):
+                cur_d = group_meta[fam].get("description", "")
+                if not cur_d or ("carbon" in g_desc.lower() and "carbon" not in cur_d.lower()) or (
+                    "gemini 4" in g_desc.lower() and "gemini 4" not in cur_d.lower()
+                ) or len(g_desc) > len(cur_d):
+                    group_meta[fam]["description"] = g_desc
+
+            for b in grp.get("buckets", []):
+                b_fam = _classify_group_family(g_disp, b.get("bucketId", ""))
+                win = _classify_bucket_window(b)
+                raw_frac = _extract_raw_bucket_fraction(b)
+                norm_frac, norm_rst = normalize_window(raw_frac, b.get("resetTime"))
+                cand = {
+                    "bucketId": b.get("bucketId", f"{b_fam}-{win}"),
+                    "displayName": b.get("displayName", ""),
+                    "window": win,
+                    "remainingFraction": norm_frac,
+                    "resetTime": norm_rst,
+                    "description": b.get("description", "") if (norm_frac is not None and norm_frac < 0.9995) else "",
+                    "disabled": bool(b.get("disabled", False)) and (norm_frac is None or norm_frac <= 0.001),
+                }
+                key = (b_fam, win)
+                if key not in fused_buckets:
+                    fused_buckets[key] = cand
+                else:
+                    prev = fused_buckets[key]
+                    p_frac = prev.get("remainingFraction")
+                    c_frac = cand.get("remainingFraction")
+                    if c_frac is not None and (p_frac is None or c_frac < p_frac):
+                        cand["disabled"] = bool(prev.get("disabled") or cand.get("disabled"))
+                        fused_buckets[key] = cand
+                    elif c_frac is not None and p_frac is not None and abs(c_frac - p_frac) < 1e-9:
+                        if not prev.get("resetTime") and cand.get("resetTime"):
+                            prev["resetTime"] = cand["resetTime"]
+                        if not prev.get("description") and cand.get("description"):
+                            prev["description"] = cand["description"]
+                        prev["disabled"] = bool(prev.get("disabled") or cand.get("disabled"))
+
+    fused_groups = []
+    for fam in ("gemini", "claude"):
+        fam_buckets = []
+        for win in ("5h", "weekly"):
+            if (fam, win) in fused_buckets:
+                fam_buckets.append(fused_buckets[(fam, win)])
+        for (bfam, bwin), bval in fused_buckets.items():
+            if bfam == fam and bwin not in ("5h", "weekly"):
+                fam_buckets.append(bval)
+        if fam_buckets:
+            meta = group_meta.get(fam, {})
+            default_name = "Gemini Models" if fam == "gemini" else "Claude and GPT models"
+            fused_groups.append({
+                "displayName": meta.get("displayName") or default_name,
+                "description": meta.get("description", ""),
+                "buckets": fam_buckets,
+            })
+
+    # Fusionar retrieveUserQuota de daily y prod por modelId con min(remainingFraction)
+    fused_models: dict[str, dict] = {}
+    for src_key in ("mod_daily", "mod_prod"):
+        m_data = raw_results.get(src_key)
+        if not isinstance(m_data, dict):
+            continue
+        for mb in m_data.get("buckets", []):
+            mid = mb.get("modelId")
+            if not mid:
+                continue
+            raw_frac = _extract_raw_bucket_fraction(mb)
+            raw_rst = mb.get("resetTime")
+            # Conservar resetTime original cuando frac==1.0 solo para clasificar horizonte 5h vs weekly,
+            # pero si ya expiró (delta <= 0) sí se recarga a 1.0 sin reset vencido.
+            norm_rst = raw_rst
+            norm_frac = raw_frac
+            if raw_rst:
+                try:
+                    if (parse_iso_datetime(raw_rst) - datetime.now(timezone.utc)).total_seconds() <= 0:
+                        norm_frac = 1.0
+                        norm_rst = None
+                except Exception:
+                    norm_rst = None
+            if norm_frac is not None:
+                norm_frac = max(0.0, min(1.0, float(norm_frac)))
+
+            cand_m = dict(mb)
+            cand_m["remainingFraction"] = norm_frac
+            cand_m["resetTime"] = norm_rst
+
+            if mid not in fused_models:
+                fused_models[mid] = cand_m
+            else:
+                prev_m = fused_models[mid]
+                pf = prev_m.get("remainingFraction")
+                cf = cand_m.get("remainingFraction")
+                if cf is not None and (pf is None or cf < pf):
+                    fused_models[mid] = cand_m
+                elif cf is not None and pf is not None and abs(cf - pf) < 1e-9:
+                    if not prev_m.get("resetTime") and cand_m.get("resetTime"):
+                        prev_m["resetTime"] = cand_m["resetTime"]
+
+    if not fused_groups and not fused_models and not lca_ok:
+        return None
+
+    return {
+        "groups": fused_groups,
+        "description": top_description,
+        "_models_quota": {"buckets": list(fused_models.values())},
+        "_tier": {
+            "plan_type": plan_type,
+            "tier_id": tier_id,
+            "tier_name": tier_name,
+            "supports_carbon": supports_carbon,
+            "project_id": project_id,
+            "tier_fetched": lca_ok,
+        },
+    }
+
+
+def _apply_min_window(
+    cur_frac: float | None,
+    cur_rst: str | None,
+    cand_frac: float | None,
+    cand_rst: str | None,
+) -> tuple[float | None, str | None]:
+    cand_frac, cand_rst = normalize_window(cand_frac, cand_rst)
+    if cand_frac is None:
+        return cur_frac, cur_rst
+    if cur_frac is None or cand_frac < cur_frac:
+        return cand_frac, cand_rst
+    if abs(cand_frac - cur_frac) < 1e-9 and not cur_rst and cand_rst:
+        return cur_frac, cand_rst
+    return cur_frac, cur_rst
+
 
 def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = None) -> dict:
+    """
+    Extrae métricas unificadas en los 2 grupos oficiales (Gemini y Claude & GPT) + metadatos de plan:
+      - Grupo Gemini: gemini_5h_fraction, gemini_5h_reset, gemini_weekly_fraction, gemini_weekly_reset, gemini_disabled
+      - Grupo Claude & GPT: claude_5h_fraction, claude_5h_reset, claude_weekly_fraction, claude_weekly_reset, claude_disabled
+      - Plan: plan_type, tier_id, tier_name, supports_carbon, fetched_at
+    """
+    tier = (quota_json.get("_tier") if isinstance(quota_json, dict) else None) or {}
+    plan_type = tier.get("plan_type") or "FREE"
+    tier_id = tier.get("tier_id") or "free-tier"
+    tier_name = tier.get("tier_name") or "Antigravity"
+    supports_carbon = bool(tier.get("supports_carbon", plan_type == "ULTRA"))
+
     metrics = {
         "gemini_5h_fraction": None,
         "gemini_5h_reset": None,
@@ -449,124 +907,160 @@ def extract_quota_metrics(quota_json: dict | None, models_json: dict | None = No
         "claude_weekly_fraction": None,
         "claude_weekly_reset": None,
         "claude_disabled": False,
-        "argon_weekly_fraction": None,
-        "argon_weekly_reset": None,
-        "has_gemini4": False,
+        "plan_type": plan_type,
+        "tier_id": tier_id,
+        "tier_name": tier_name,
+        "supports_carbon": supports_carbon,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
-    if not quota_json or "groups" not in quota_json:
+    if not isinstance(quota_json, dict):
         return metrics
 
-    if not models_json and isinstance(quota_json, dict):
+    if not models_json:
         models_json = quota_json.get("_models_quota")
 
+    # 1. Procesar buckets de retrieveUserQuotaSummary (ya fusionados entre daily y prod)
     for grp in quota_json.get("groups", []):
-        display = grp.get("displayName", "")
-        buckets = grp.get("buckets", [])
-        d_lower = display.lower()
-
-        # 1. Grupo dedicado de Gemini 4 Argon
-        if "argon" in d_lower:
-            for b in buckets:
-                b_id = b.get("bucketId", "").lower()
-                win = b.get("window", "").lower()
-                b_name = b.get("displayName", "").lower()
-                frac = b.get("remainingFraction")
-                reset_t = b.get("resetTime")
-                if "weekly" in b_id or win == "weekly" or "weekly" in b_name or "month" in b_id:
-                    metrics["argon_weekly_fraction"] = frac
-                    metrics["argon_weekly_reset"] = reset_t
-                    metrics["has_gemini4"] = True
-            continue
-
-        # 2. Grupo Gemini estándar (puede incluir el bucket de Argon)
-        if "gemini" in d_lower:
-            for b in buckets:
-                b_id = b.get("bucketId", "").lower()
-                win = b.get("window", "").lower()
-                b_name = b.get("displayName", "").lower()
-                frac = b.get("remainingFraction")
-                reset_t = b.get("resetTime")
-                dis = b.get("disabled", False)
-                if "argon" in b_id or "argon" in b_name:
-                    metrics["argon_weekly_fraction"] = frac
-                    metrics["argon_weekly_reset"] = reset_t
-                    metrics["has_gemini4"] = True
-                elif "5h" in b_id or win == "5h":
-                    metrics["gemini_5h_fraction"] = frac
-                    metrics["gemini_5h_reset"] = reset_t
-                    if dis:
-                        metrics["gemini_disabled"] = True
-                elif "weekly" in b_id or win == "weekly":
-                    metrics["gemini_weekly_fraction"] = frac
-                    metrics["gemini_weekly_reset"] = reset_t
-                    if frac == 0 or dis:
-                        metrics["gemini_disabled"] = True
-
-        # 3. Grupo Claude y GPT
-        elif "claude" in d_lower or "gpt" in d_lower or "3p" in d_lower:
-            for b in buckets:
-                b_id = b.get("bucketId", "").lower()
-                win = b.get("window", "").lower()
-                frac = b.get("remainingFraction")
-                reset_t = b.get("resetTime")
-                dis = b.get("disabled", False)
-                if "5h" in b_id or win == "5h":
-                    metrics["claude_5h_fraction"] = frac
-                    metrics["claude_5h_reset"] = reset_t
-                    if dis:
-                        metrics["claude_disabled"] = True
-                elif "weekly" in b_id or win == "weekly":
-                    metrics["claude_weekly_fraction"] = frac
-                    metrics["claude_weekly_reset"] = reset_t
-                    if frac == 0 or dis:
-                        metrics["claude_disabled"] = True
-
-    # 4. Override con métricas live por modelo de retrieveUserQuota
-    if models_json and "buckets" in models_json:
-        for b in models_json.get("buckets", []):
-            mid = b.get("modelId", "").lower()
-            frac = b.get("remainingFraction")
-            rst = b.get("resetTime")
-            if frac is None:
+        g_disp = grp.get("displayName", "")
+        for b in grp.get("buckets", []):
+            fam = _classify_group_family(g_disp, b.get("bucketId", ""))
+            if fam not in ("gemini", "claude"):
                 continue
-            if "gemini-3.8" in mid or "gemini-2.5-flash" in mid:
-                metrics["gemini_5h_fraction"] = frac
-                if rst:
-                    metrics["gemini_5h_reset"] = rst
-            elif "claude-sonnet" in mid or "claude-opus" in mid or "claude" in mid or "gpt" in mid:
-                metrics["claude_5h_fraction"] = frac
-                if rst:
-                    metrics["claude_5h_reset"] = rst
-                if frac == 0:
-                    metrics["claude_disabled"] = True
-            elif "argon" in mid or "hydrogen" in mid or "carbon" in mid or "gemini-4" in mid:
-                metrics["argon_weekly_fraction"] = frac
-                metrics["has_gemini4"] = True
-                if rst:
-                    metrics["argon_weekly_reset"] = rst
+            win = _classify_bucket_window(b)
+            if win not in ("5h", "weekly"):
+                continue
+            raw_frac = _extract_raw_bucket_fraction(b)
+            frac, rst = normalize_window(raw_frac, b.get("resetTime"))
+            dis = bool(b.get("disabled", False)) and (frac is None or frac <= 0.001)
 
-    # Regla de consistencia: si el saldo semanal de Claude está agotado (0%), la cuota 5H queda bloqueada a 0%
-    if (metrics.get("claude_weekly_fraction") is not None and metrics["claude_weekly_fraction"] <= 0.001) or metrics.get("claude_disabled"):
-        metrics["claude_5h_fraction"] = 0.0
-        metrics["claude_disabled"] = True
+            fk = f"{fam}_{win}_fraction"
+            rk = f"{fam}_{win}_reset"
+            metrics[fk], metrics[rk] = _apply_min_window(metrics[fk], metrics[rk], frac, rst)
+            if dis or (win == "weekly" and frac is not None and frac <= 0.001):
+                metrics[f"{fam}_disabled"] = True
 
-    # Regla de consistencia: si Google no limitó gemini_weekly, asumimos 1.0 (disponible)
-    if metrics.get("gemini_weekly_fraction") is None and not metrics.get("gemini_disabled"):
-        metrics["gemini_weekly_fraction"] = 1.0
+    # 2. Cruzar con retrieveUserQuota por modelId separando estrictamente horizonte 5h vs weekly
+    now_dt = datetime.now(timezone.utc)
+    if isinstance(models_json, dict) and "buckets" in models_json:
+        for b in models_json.get("buckets", []):
+            mid = (b.get("modelId") or "").lower()
+            if not mid:
+                continue
+            if mid.startswith("gemini-") or mid.startswith("orchestrator"):
+                fam = "gemini"
+            elif mid.startswith("claude-") or mid.startswith("gpt-"):
+                fam = "claude"
+            else:
+                continue
+
+            raw_frac = _extract_raw_bucket_fraction(b)
+            raw_rst = b.get("resetTime")
+            if raw_frac is None:
+                continue
+
+            # Clasificar horizonte temporal ANTES de que normalize_window limpie resetTime sintético al 100%
+            horizon = "5h"
+            if raw_rst:
+                try:
+                    r_dt = parse_iso_datetime(raw_rst)
+                    delta_sec = (r_dt - now_dt).total_seconds()
+                    if 0 < delta_sec <= (5 * 3600 + 300):
+                        horizon = "5h"
+                    elif delta_sec > (5 * 3600 + 300):
+                        horizon = "weekly"
+                except Exception:
+                    horizon = "5h"
+
+            frac, rst = normalize_window(raw_frac, raw_rst)
+            fk = f"{fam}_{horizon}_fraction"
+            rk = f"{fam}_{horizon}_reset"
+            metrics[fk], metrics[rk] = _apply_min_window(metrics[fk], metrics[rk], frac, rst)
+            if horizon == "weekly" and frac is not None and frac <= 0.001:
+                metrics[f"{fam}_disabled"] = True
+
+    # 3. Normalización final y reglas de consistencia por familia
+    for fam in ("gemini", "claude"):
+        f5, r5 = normalize_window(metrics[f"{fam}_5h_fraction"], metrics[f"{fam}_5h_reset"])
+        fw, rw = normalize_window(metrics[f"{fam}_weekly_fraction"], metrics[f"{fam}_weekly_reset"])
+        dis = bool(metrics[f"{fam}_disabled"])
+
+        if fw is None and not dis:
+            fw, rw = 1.0, None
+        if f5 is None and not dis:
+            f5, r5 = 1.0, None
+
+        if (fw is not None and fw <= 0.001) or (dis and (fw is None or fw <= 0.001)):
+            dis = True
+            f5 = 0.0
+        else:
+            dis = False
+
+        metrics[f"{fam}_5h_fraction"] = f5
+        metrics[f"{fam}_5h_reset"] = r5
+        metrics[f"{fam}_weekly_fraction"] = fw
+        metrics[f"{fam}_weekly_reset"] = rw
+        metrics[f"{fam}_disabled"] = dis
 
     return metrics
+
+
+def _merge_tier_fallback_if_unfetched(new_q: dict, old_q: dict | None, q_raw: dict | None) -> dict:
+    """Solo si loadCodeAssist falló por red, conserva el plan previamente conocido sin tocar cuotas/resets."""
+    tier_fetched = bool(((q_raw or {}).get("_tier") or {}).get("tier_fetched"))
+    if not tier_fetched and isinstance(old_q, dict) and old_q.get("plan_type"):
+        new_q["plan_type"] = old_q["plan_type"]
+        new_q["tier_id"] = old_q.get("tier_id", new_q.get("tier_id"))
+        new_q["tier_name"] = old_q.get("tier_name", new_q.get("tier_name"))
+        new_q["supports_carbon"] = bool(old_q.get("supports_carbon", new_q["plan_type"] == "ULTRA"))
+    return new_q
+
+
+def _sanitize_cached_or_stored_quota(q: dict, fallback_plan_source: dict | None = None) -> dict:
+    """Limpia y normaliza cualquier estructura de cuota leída de caché o disco (elimina resets vencidos)."""
+    out = dict(q or {})
+    if not out.get("plan_type") and isinstance(fallback_plan_source, dict) and fallback_plan_source.get("plan_type"):
+        out["plan_type"] = fallback_plan_source.get("plan_type")
+        out["tier_id"] = fallback_plan_source.get("tier_id", "free-tier")
+        out["tier_name"] = fallback_plan_source.get("tier_name", "Antigravity")
+        out["supports_carbon"] = bool(fallback_plan_source.get("supports_carbon", out["plan_type"] == "ULTRA"))
+
+    for fam in ("gemini", "claude"):
+        f5, r5 = normalize_window(out.get(f"{fam}_5h_fraction"), out.get(f"{fam}_5h_reset"))
+        fw, rw = normalize_window(out.get(f"{fam}_weekly_fraction"), out.get(f"{fam}_weekly_reset"))
+        dis = bool(out.get(f"{fam}_disabled", False))
+        if fw is None and not dis:
+            fw, rw = 1.0, None
+        if f5 is None and not dis:
+            f5, r5 = 1.0, None
+        if (fw is not None and fw <= 0.001) or (dis and (fw is None or fw <= 0.001)):
+            dis = True
+            f5 = 0.0
+        else:
+            dis = False
+        out[f"{fam}_5h_fraction"] = f5
+        out[f"{fam}_5h_reset"] = r5
+        out[f"{fam}_weekly_fraction"] = fw
+        out[f"{fam}_weekly_reset"] = rw
+        out[f"{fam}_disabled"] = dis
+
+    # Limpiar llaves obsoletas de v1.4 si existían
+    out.pop("argon_weekly_fraction", None)
+    out.pop("argon_weekly_reset", None)
+    out.pop("has_gemini4", None)
+    return out
+
 
 def fetch_user_profile(access_token: str) -> dict:
     try:
         req = urllib.request.Request(
             "https://www.googleapis.com/oauth2/v2/userinfo",
-            headers={"Authorization": f"Bearer {access_token}"}
+            headers={"Authorization": f"Bearer {access_token}"},
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception:
         return {}
+
 
 def ensure_auto_migration():
     aliases = list_account_aliases()
@@ -598,6 +1092,8 @@ def ensure_auto_migration():
             "quota": quota,
         }
         save_account("agy01", acc_data)
+        if quota:
+            write_quota_cache("agy01", quota)
         cfg = load_config()
         cfg["active_account"] = "agy01"
         cfg["default_account"] = "agy01"
@@ -605,8 +1101,10 @@ def ensure_auto_migration():
     except Exception:
         pass
 
+
 def switch_active_account(alias: str, silent: bool = False) -> dict:
-    """Cambia la sesión activa de agy al alias indicado y renueva el token."""
+    """Cambia la sesión activa global de agy al alias indicado, renueva el token y sincroniza caché."""
+    alias = normalize_alias(alias) or alias
     data = load_account(alias)
     if not data:
         raise ValueError(f"La cuenta '{alias}' no existe.")
@@ -627,25 +1125,17 @@ def switch_active_account(alias: str, silent: bool = False) -> dict:
             print(f"{C_YELLOW}Aviso al renovar token:{C_RESET} {e}")
 
     active_path = get_active_token_path()
-    tmp_path = active_path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(token_data, f, indent=2)
-    try:
-        os.chmod(tmp_path, 0o600)
-    except Exception:
-        pass
-    os.replace(tmp_path, active_path)
+    _atomic_write_json(active_path, token_data, mode=0o600, indent=2)
 
-    # Mantener sincronizado el token tanto en host (~/.gemini) como en snap
-    for sec_dir in ["/home/aidev/.gemini/antigravity-cli", "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli"]:
+    real_home = resolve_real_home()
+    for sec_dir in [
+        os.path.join(real_home, ".gemini", "antigravity-cli"),
+        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
+    ]:
         sec_path = os.path.join(sec_dir, "antigravity-oauth-token")
         if os.path.abspath(sec_path) != os.path.abspath(active_path) and os.path.exists(sec_dir):
             try:
-                sec_tmp = sec_path + ".tmp"
-                with open(sec_tmp, "w", encoding="utf-8") as f:
-                    json.dump(token_data, f, indent=2)
-                os.chmod(sec_tmp, 0o600)
-                os.replace(sec_tmp, sec_path)
+                _atomic_write_json(sec_path, token_data, mode=0o600, indent=2)
             except Exception:
                 pass
 
@@ -653,72 +1143,73 @@ def switch_active_account(alias: str, silent: bool = False) -> dict:
     cfg["active_account"] = alias
     save_config(cfg)
 
-    # Actualizar cuota en segundo plano
     access_token = token_data.get("token", {}).get("access_token")
     if access_token:
         try:
             q_raw = fetch_quota_summary(access_token)
             if q_raw:
-                data["quota"] = extract_quota_metrics(q_raw)
+                old_q = data.get("quota", {})
+                new_q = _merge_tier_fallback_if_unfetched(extract_quota_metrics(q_raw), old_q, q_raw)
+                data["quota"] = new_q
+                data.pop("has_gemini4", None)
                 save_account(alias, data)
+                write_quota_cache(alias, new_q)
         except Exception:
             pass
 
     return data
 
+
 def launch_real_agy(extra_args: list[str], alias: str | None = None):
     """Ejecuta el binario oficial de agy con --dangerously-skip-permissions por defecto."""
-    real_agy = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
-    if not os.path.exists(real_agy):
-        real_agy = "/home/aidev/.gemini/antigravity-cli/bin/agy-real"
-    if not os.path.exists(real_agy):
-        real_agy = "/home/aidev/.local/bin/agy"
-    if not os.path.exists(real_agy):
-        real_agy = "/snap/antigravity-cli/current/bin/agy"
-    if not os.path.exists(real_agy):
-        real_agy = "/snap/antigravity-cli/23/bin/agy"
+    real_home = resolve_real_home()
+    candidates = [
+        os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real"),
+        "/home/aidev/.gemini/antigravity-cli/bin/agy-real",
+        "/snap/antigravity-cli/current/bin/agy",
+        "/snap/antigravity-cli/23/bin/agy",
+    ]
+    real_agy = candidates[0]
+    for c in candidates:
+        if os.path.exists(c):
+            real_agy = c
+            break
 
-    # Forzar almacenamiento basado en archivo (antigravity-oauth-token) para evitar
-    # que agy intente consultar el Keyring de GNOME/desktop y pida login
     if not os.environ.get("SSH_TTY") and not os.environ.get("SSH_CLIENT"):
         os.environ["SSH_TTY"] = "/dev/pts/0"
 
-    # Aislamiento real de HOME por alias: cada cuenta tiene su propio $HOME virtual
-    # con su token blindado, evitando colisiones entre paneles paralelos de herdr.
+    os.environ["AGYC_REAL_HOME"] = real_home
     if alias:
         isolated_home = prepare_isolated_home(alias)
         os.environ["HOME"] = isolated_home
 
     cmd_args = [real_agy]
-    # Inyectar --dangerously-skip-permissions por defecto si no está presente
     if "--dangerously-skip-permissions" not in extra_args:
         cmd_args.append("--dangerously-skip-permissions")
     cmd_args.extend(extra_args)
 
-    # Reemplazar el proceso actual para preservar terminal TUI y señales intactas
     os.execv(real_agy, cmd_args)
 
 
 def prepare_isolated_home(alias: str) -> str:
     """
     Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/.
-    - El token de la cuenta queda blindado (copiado, no symlink) para no competir
-      con otros paneles de herdr que usen cuentas distintas.
-    - settings.json, accounts/, projects/, brain/, conversations/, annotations/
-      y las bases de datos de resúmenes son symlinks al directorio compartido
-      ~/.gemini/antigravity-cli/ para compartir contexto, sesiones e historial completo.
-
-    Retorna la ruta del HOME aislado (ej. /home/aidev/.agyc_homes/agy02).
+    - Escribe directamente acc["token_data"] de forma atómica (0600) en
+      isolated_gemini/antigravity-oauth-token (jamás copia shared_base/antigravity-oauth-token).
+    - Enlaza recursos compartidos (settings.json, accounts/, projects/, brain/, conversations/, etc.)
+      al directorio base real para compartir contexto e historial sin mezclar tokens.
     """
-    homes_base = os.path.join(REAL_HOME, ".agyc_homes")
+    alias = normalize_alias(alias) or alias
+    real_home = resolve_real_home()
+    homes_base = os.path.join(real_home, ".agyc_homes")
     isolated_home = os.path.join(homes_base, alias)
     isolated_gemini = os.path.join(isolated_home, ".gemini", "antigravity-cli")
     os.makedirs(isolated_gemini, exist_ok=True)
 
     shared_base = get_base_dir()
 
-    # ── Enlazar .gemini/config para compartir servidores MCP globales (mcp_config.json) ──
-    user_gemini_config = os.path.join(os.path.expanduser("~"), ".gemini", "config")
+    # ── Enlazar .gemini/config para compartir servidores MCP globales ──
+    user_gemini_config = os.path.join(real_home, ".gemini", "config")
     iso_gemini_config = os.path.join(isolated_home, ".gemini", "config")
     if os.path.exists(user_gemini_config) and not os.path.lexists(iso_gemini_config):
         try:
@@ -726,20 +1217,24 @@ def prepare_isolated_home(alias: str) -> str:
         except Exception:
             pass
 
-    # ── Token: copiar el token activo (ya switcha al alias) como archivo propio ──
-    token_src = os.path.join(shared_base, "antigravity-oauth-token")
+    # ── Token aislado: escribir acc["token_data"] del alias de forma atómica (0600) ──
+    acc = load_account(alias)
     token_dst = os.path.join(isolated_gemini, "antigravity-oauth-token")
-    if os.path.exists(token_src):
-        shutil.copy2(token_src, token_dst)
+    if acc and isinstance(acc.get("token_data"), dict) and acc["token_data"]:
+        if os.path.islink(token_dst):
+            try:
+                os.unlink(token_dst)
+            except Exception:
+                pass
         try:
-            os.chmod(token_dst, 0o600)
+            _atomic_write_json(token_dst, acc["token_data"], mode=0o600, indent=2)
         except Exception:
             pass
 
-    # ── Enlazar bin para compartir binarios (agy-real, agy, agyc, webm_encoder) ──
+    # ── Enlazar bin para compartir binarios ──
     user_gemini_bin = os.path.join(shared_base, "bin")
     if not os.path.exists(user_gemini_bin):
-        user_gemini_bin = "/home/aidev/.gemini/antigravity-cli/bin"
+        user_gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
     iso_gemini_bin = os.path.join(isolated_gemini, "bin")
     if os.path.exists(user_gemini_bin):
         if os.path.islink(iso_gemini_bin):
@@ -761,9 +1256,34 @@ def prepare_isolated_home(alias: str) -> str:
             except Exception:
                 pass
 
-    # ── Recursos compartidos para unificar conversaciones, contexto y settings ──
+    # ── settings.json por perfil: preserva el modelo elegido en cada cuenta (PRO vs ULTRA) ──
+    iso_settings = os.path.join(isolated_gemini, "settings.json")
+    shared_settings = os.path.join(shared_base, "settings.json")
+    try:
+        base_s = {}
+        if os.path.isfile(iso_settings) and not os.path.islink(iso_settings):
+            with open(iso_settings, "r", encoding="utf-8") as f:
+                base_s = json.load(f)
+        elif os.path.exists(shared_settings):
+            with open(shared_settings, "r", encoding="utf-8") as f:
+                base_s = json.load(f)
+        if not isinstance(base_s, dict):
+            base_s = {}
+        if os.path.islink(iso_settings):
+            os.unlink(iso_settings)
+        # Si la cuenta es explícitamente PRO/FREE y heredó un modelo Carbon exclusivo de ULTRA, ajustar fallback seguro
+        p_type = (acc.get("plan_type") or (acc.get("quota") or {}).get("plan_type") or "").upper() if acc else ""
+        cur_mod = str(base_s.get("model") or "")
+        if p_type in ("PRO", "FREE") and "carbon" in cur_mod.lower():
+            base_s["model"] = "Gemini 4 Argon (High)"
+        base_s["statusLine"] = {"type": "command", "command": "agyc-statusline", "enabled": True}
+        base_s["title"] = {"type": "command", "command": "agyc-titleline", "enabled": True}
+        _atomic_write_json(iso_settings, base_s, mode=0o600, indent=2)
+    except Exception:
+        pass
+
+    # ── Recursos compartidos para unificar conversaciones, memoria e historial ──
     shared_items = [
-        "settings.json",
         "accounts",
         "projects",
         "brain",
@@ -786,7 +1306,6 @@ def prepare_isolated_home(alias: str) -> str:
         if not os.path.exists(target):
             continue
 
-        # Si ya es un symlink apuntando al target correcto, no tocar
         if os.path.islink(link):
             try:
                 if os.readlink(link) == target:
@@ -795,7 +1314,6 @@ def prepare_isolated_home(alias: str) -> str:
             except Exception:
                 pass
 
-        # Si es un directorio local vacío, eliminarlo para poner el symlink
         if os.path.isdir(link) and not os.path.islink(link):
             if not os.listdir(link):
                 try:
@@ -805,7 +1323,6 @@ def prepare_isolated_home(alias: str) -> str:
             else:
                 continue
 
-        # Si es un archivo local redundante (ej. settings o db vacía), reemplazarlo
         if os.path.isfile(link) and not os.path.islink(link):
             try:
                 os.remove(link)
@@ -820,26 +1337,50 @@ def prepare_isolated_home(alias: str) -> str:
     return isolated_home
 
 
+def _load_or_refresh_account_for_list(alias: str, force_refresh: bool) -> dict | None:
+    data = load_account(alias)
+    if not data:
+        return None
 
-def check_has_gemini4(acc: dict, alias: str) -> bool:
-    if acc.get("has_gemini4"):
-        return True
-    q = acc.get("quota", {})
-    if q.get("has_gemini4"):
-        return True
-    if q.get("argon_weekly_fraction") is not None:
-        return True
-    s_path = f"/home/aidev/.agyc_homes/{alias}/.gemini/antigravity-cli/settings.json"
-    if os.path.exists(s_path):
-        try:
-            with open(s_path, "r", encoding="utf-8") as sf:
-                s_data = json.load(sf)
-                s_mod = (s_data.get("model") or "").lower()
-                if "argon" in s_mod or "hydrogen" in s_mod or "carbon" in s_mod or "gemini-4" in s_mod or "gemini 4" in s_mod:
-                    return True
-        except Exception:
-            pass
-    return False
+    old_q = data.get("quota", {}) if isinstance(data.get("quota"), dict) else {}
+
+    # Usar caché viva < 60s si no se pidió -r y ya contiene plan_type conocido
+    if not force_refresh and not data.get("is_revoked"):
+        cached = read_quota_cache(alias, max_age=60.0)
+        if cached is not None:
+            known_plan = cached.get("plan_type") or old_q.get("plan_type")
+            if known_plan:
+                data["quota"] = _sanitize_cached_or_stored_quota(cached, fallback_plan_source=old_q)
+                return data
+
+    token_data = data.get("token_data", {})
+    try:
+        token_data, refreshed = refresh_token_if_needed(token_data, force=force_refresh)
+        data["token_data"] = token_data
+        data["is_revoked"] = False
+        access_token = token_data.get("token", {}).get("access_token")
+        if access_token:
+            q_raw = fetch_quota_summary(access_token)
+            if q_raw:
+                new_q = _merge_tier_fallback_if_unfetched(extract_quota_metrics(q_raw), old_q, q_raw)
+                data["quota"] = new_q
+                data.pop("has_gemini4", None)
+                save_account(alias, data, sync_links=False)
+                write_quota_cache(alias, new_q)
+            else:
+                data["quota"] = _sanitize_cached_or_stored_quota(old_q)
+                if refreshed:
+                    save_account(alias, data, sync_links=False)
+        elif refreshed:
+            save_account(alias, data, sync_links=False)
+    except TokenRevokedError:
+        data["is_revoked"] = True
+        save_account(alias, data, sync_links=False)
+    except Exception:
+        data["quota"] = _sanitize_cached_or_stored_quota(old_q)
+
+    return data
+
 
 def cmd_list(args):
     ensure_auto_migration()
@@ -855,65 +1396,13 @@ def cmd_list(args):
         print(f"O usa {C_CYAN}agyc capture{C_RESET} para importar la sesión abierta actualmente.\n")
         return
 
+    force_ref = bool(getattr(args, "refresh", False))
     accounts = []
-    for alias in aliases:
-        data = load_account(alias)
-        if not data:
-            continue
-        token_data = data.get("token_data", {})
-        try:
-            force_ref = getattr(args, "refresh", False)
-            token_data, refreshed = refresh_token_if_needed(token_data, force=force_ref)
-            q_meta = data.get("quota", {})
-            fetched_at_str = q_meta.get("fetched_at", "")
-            is_stale = True
-            if fetched_at_str:
-                try:
-                    dt_f = datetime.fromisoformat(fetched_at_str)
-                    if (datetime.now(timezone.utc) - dt_f).total_seconds() < 60:
-                        is_stale = False
-                except Exception:
-                    is_stale = True
-
-            # If live cache from agy statusline exists and is recent (< 5 min), use its live metrics
-            cache_file = f"/tmp/agyc_quota_cache_{alias}.json"
-            if os.path.exists(cache_file):
-                try:
-                    with open(cache_file, "r") as cf:
-                        cached = json.load(cf)
-                    if cached and (time.time() - cached.get("cached_at", 0) < 300):
-                        q_meta.update(cached)
-                        data["quota"] = q_meta
-                        is_stale = False
-                except Exception:
-                    pass
-
-            if refreshed or force_ref or is_stale or "claude_disabled" not in q_meta:
-                data["token_data"] = token_data
-                data["is_revoked"] = False
-                access_token = token_data.get("token", {}).get("access_token")
-                if access_token:
-                    q_raw = fetch_quota_summary(access_token)
-                    if q_raw:
-                        new_q = extract_quota_metrics(q_raw)
-                        for k, v in q_meta.items():
-                            if new_q.get(k) is None and v is not None:
-                                new_q[k] = v
-                        if data.get("has_gemini4"):
-                            new_q["has_gemini4"] = True
-                        if new_q.get("has_gemini4"):
-                            if new_q.get("argon_weekly_fraction") is None:
-                                new_q["argon_weekly_fraction"] = new_q.get("gemini_weekly_fraction", 1.0)
-                            if new_q.get("argon_weekly_reset") is None:
-                                new_q["argon_weekly_reset"] = new_q.get("gemini_weekly_reset")
-                        data["quota"] = new_q
-                save_account(alias, data)
-        except TokenRevokedError:
-            data["is_revoked"] = True
-            save_account(alias, data)
-        except Exception:
-            pass
-        accounts.append(data)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(lambda a: _load_or_refresh_account_for_list(a, force_ref), aliases))
+    for item in results:
+        if item:
+            accounts.append(item)
 
     if getattr(args, "json", False):
         out = {
@@ -925,29 +1414,30 @@ def cmd_list(args):
         return
 
     print()
-    header_title = f"{C_BOLD}{C_WHITE}PANEL DE CUENTAS DE GOOGLE AI PRO (ANTIGRAVITY / AGYC){C_RESET}"
+    header_title = f"{C_BOLD}{C_WHITE}PANEL DE CUENTAS DE GOOGLE ANTIGRAVITY (PRO / ULTRA — AGYC v1.5){C_RESET}"
     print(header_title)
-    print(f"{C_DIM}Desarrollo a tiempo completo: consumo de tokens Gemini y Claude/GPT diarios y semanales.{C_RESET}\n")
+    print(f"{C_DIM}Consumo unificado en vivo: Gemini (Carbon/Argon/Hydrogen/Flash) y Claude & GPT (5H y Semanal).{C_RESET}\n")
 
+    # Ancho exacto: 10 + 26 + 9 + 13 + 33 + 33 + 7 bordes = 131 caracteres
     col_alias = 10
-    col_email = 25
+    col_email = 26
+    col_plan = 9
     col_state = 13
-    col_gemini = 34
-    col_gem4 = 34
-    col_claude = 34
+    col_gemini = 33
+    col_claude = 33
 
-    border_top = f"┌{'─' * col_alias}┬{'─' * col_email}┬{'─' * col_state}┬{'─' * col_gemini}┬{'─' * col_gem4}┬{'─' * col_claude}┐"
-    border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_gem4}┼{'─' * col_claude}┤"
-    border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_state}┴{'─' * col_gemini}┴{'─' * col_gem4}┴{'─' * col_claude}┘"
+    border_top = f"┌{'─' * col_alias}┬{'─' * col_email}┬{'─' * col_plan}┬{'─' * col_state}┬{'─' * col_gemini}┬{'─' * col_claude}┐"
+    border_mid = f"├{'─' * col_alias}┼{'─' * col_email}┼{'─' * col_plan}┼{'─' * col_state}┼{'─' * col_gemini}┼{'─' * col_claude}┤"
+    border_bot = f"└{'─' * col_alias}┴{'─' * col_email}┴{'─' * col_plan}┴{'─' * col_state}┴{'─' * col_gemini}┴{'─' * col_claude}┘"
 
     print(border_top)
     hdr = (
         f"│ {pad_visible(C_BOLD + 'ALIAS' + C_RESET, col_alias - 2)} "
         f"│ {pad_visible(C_BOLD + 'CUENTA / EMAIL' + C_RESET, col_email - 2)} "
+        f"│ {pad_visible(C_BOLD + 'PLAN' + C_RESET, col_plan - 2)} "
         f"│ {pad_visible(C_BOLD + 'ESTADO' + C_RESET, col_state - 2)} "
-        f"│ {pad_visible(C_BOLD + 'GEMINI (DIARIO / SEM)' + C_RESET, col_gemini - 2)} "
-        f"│ {pad_visible(C_BOLD + 'GEMINI 4 (DIARIO / SEM)' + C_RESET, col_gem4 - 2)} "
-        f"│ {pad_visible(C_BOLD + 'CLAUDE & GPT (DIARIO / SEM)' + C_RESET, col_claude - 2)} │"
+        f"│ {pad_visible(C_BOLD + 'GEMINI (5H / SEMANAL)' + C_RESET, col_gemini - 2)} "
+        f"│ {pad_visible(C_BOLD + 'CLAUDE & GPT (5H / SEMANAL)' + C_RESET, col_claude - 2)} │"
     )
     print(hdr)
     print(border_mid)
@@ -956,23 +1446,23 @@ def cmd_list(args):
         alias = acc.get("alias", "")
         email = acc.get("email", "")
         if len(email) > col_email - 2:
-            email_disp = email[:col_email - 5] + "..."
+            email_disp = email[: col_email - 5] + "..."
         else:
             email_disp = email
 
         is_active = (alias == active)
         is_default = (alias == default)
-        is_revoked = acc.get("is_revoked", False)
+        is_revoked = bool(acc.get("is_revoked", False))
+        q = _sanitize_cached_or_stored_quota(acc.get("quota", {}))
+        plan_disp = format_plan_badge(q.get("plan_type"))
 
         if is_revoked:
             state_str = f"{C_BOLD}{C_RED}EXPIRADA{C_RESET}"
             alias_disp = f"  {C_RED}{alias}{C_RESET}"
             g_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
-            g_line2 = f"{C_DIM}Re-vincular cuenta{C_RESET}"
-            g4_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
-            g4_line2 = f"{C_YELLOW}Ejecuta: agyc add {alias}{C_RESET}"
+            g_line2 = f"{C_YELLOW}Ejecuta: agyc renew {alias}{C_RESET}"
             c_line1 = f"{C_RED}Token revocado por Google{C_RESET}"
-            c_line2 = f"{C_DIM}para reactivar cuotas{C_RESET}"
+            c_line2 = f"{C_DIM}Re-vincular para activar{C_RESET}"
         else:
             if is_active and is_default:
                 state_str = f"{C_BG_GREEN}*ACTIVA+DEF{C_RESET}"
@@ -987,79 +1477,42 @@ def cmd_list(args):
                 state_str = f"{C_DIM}  LISTA{C_RESET}"
                 alias_disp = f"  {alias}"
 
-            q = acc.get("quota", {})
-            g5h = q.get("gemini_5h_fraction")
-            g5h_reset = format_countdown(q.get("gemini_5h_reset"))
-            g_disabled = q.get("gemini_disabled", False)
-            gweek = q.get("gemini_weekly_fraction")
-            if gweek is None and not g_disabled:
-                gweek = 1.0
-                gweek_reset = "7d 0h"
-            else:
-                gweek_reset = format_countdown(q.get("gemini_weekly_reset"))
-                if gweek_reset == "N/A":
-                    gweek_reset = "7d 0h"
+            g5h, g5h_rst = normalize_window(q.get("gemini_5h_fraction"), q.get("gemini_5h_reset"))
+            gweek, gweek_rst = normalize_window(q.get("gemini_weekly_fraction"), q.get("gemini_weekly_reset"))
+            g_dis = bool(q.get("gemini_disabled", False))
 
-            c5h = q.get("claude_5h_fraction")
-            c5h_reset = format_countdown(q.get("claude_5h_reset"))
-            cweek = q.get("claude_weekly_fraction")
-            c_disabled = q.get("claude_disabled", False)
-            if cweek is None and not c_disabled:
-                cweek = 1.0
-                cweek_reset = "7d 0h"
-            else:
-                cweek_reset = format_countdown(q.get("claude_weekly_reset"))
-                if cweek_reset == "N/A":
-                    cweek_reset = "7d 0h"
+            c5h, c5h_rst = normalize_window(q.get("claude_5h_fraction"), q.get("claude_5h_reset"))
+            cweek, cweek_rst = normalize_window(q.get("claude_weekly_fraction"), q.get("claude_weekly_reset"))
+            c_dis = bool(q.get("claude_disabled", False))
 
-            has_g4 = check_has_gemini4(acc, alias)
-            aweek = q.get("argon_weekly_fraction")
-            if aweek is None and has_g4:
-                aweek = gweek if gweek is not None else 1.0
-            aweek_reset = q.get("argon_weekly_reset") or (q.get("gemini_weekly_reset") if has_g4 else None)
-
-            # Fila 1: Límites Diarios (5 Horas) con coherencia frente al límite semanal
-            g_weekly_empty = (gweek is not None and gweek <= 0.001) or g_disabled
+            g_weekly_empty = (gweek is not None and gweek <= 0.001) or g_dis
             if g_weekly_empty:
-                g_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
+                g_line1 = f"5H:  {make_linebar(0.0, length=8)} {C_RED}(Sem: 0%){C_RESET}"
             else:
-                g_line1 = f"5H:  {make_linebar(g5h, length=10)} ({g5h_reset})"
+                g_line1 = f"5H:  {make_linebar(g5h, length=8)} {format_window_status(g5h, g5h_rst, 'list')}"
+            g_line2 = f"Sem: {make_linebar(gweek, length=8)} {format_window_status(gweek, gweek_rst, 'list')}"
 
-            c_weekly_empty = (cweek is not None and cweek <= 0.001) or c_disabled
+            c_weekly_empty = (cweek is not None and cweek <= 0.001) or c_dis
             if c_weekly_empty:
-                c_line1 = f"5H:  {make_linebar(0.0, length=10)} {C_RED}(Sem: 0%){C_RESET}"
+                c_line1 = f"5H:  {make_linebar(0.0, length=8)} {C_RED}(Sem: 0%){C_RESET}"
             else:
-                c_line1 = f"5H:  {make_linebar(c5h, length=10)} ({c5h_reset})"
-
-            # Fila 2: Límites Semanales
-            g_line2 = f"Sem: {make_linebar(gweek, length=10)} ({gweek_reset})"
-            c_line2 = f"Sem: {make_linebar(cweek, length=10)} ({cweek_reset})"
-
-            # Fila Gemini 4 (Argon solo tiene recarga semanal, no tiene ventana rodante de 5 horas)
-            if not has_g4:
-                g4_line1 = f"{C_DIM}5H:  [──────────]   --{C_RESET}"
-                g4_line2 = f"{C_DIM}Sem: [──────────] No cuenta{C_RESET}"
-            else:
-                aweek_reset_str = format_countdown(aweek_reset) if aweek_reset else gweek_reset
-                if aweek_reset_str == "N/A":
-                    aweek_reset_str = gweek_reset if gweek_reset != "N/A" else "7d 0h"
-                g4_line1 = f"{C_DIM}5H:  [──────────]   --{C_RESET}"
-                g4_line2 = f"Sem: {make_linebar(aweek, length=10)} ({aweek_reset_str})"
+                c_line1 = f"5H:  {make_linebar(c5h, length=8)} {format_window_status(c5h, c5h_rst, 'list')}"
+            c_line2 = f"Sem: {make_linebar(cweek, length=8)} {format_window_status(cweek, cweek_rst, 'list')}"
 
         row1 = (
             f"│ {pad_visible(alias_disp, col_alias - 2)} "
             f"│ {pad_visible(email_disp, col_email - 2)} "
+            f"│ {pad_visible(plan_disp, col_plan - 2)} "
             f"│ {pad_visible(state_str, col_state - 2)} "
             f"│ {pad_visible(g_line1, col_gemini - 2)} "
-            f"│ {pad_visible(g4_line1, col_gem4 - 2)} "
             f"│ {pad_visible(c_line1, col_claude - 2)} │"
         )
         row2 = (
             f"│ {pad_visible('', col_alias - 2)} "
             f"│ {pad_visible('', col_email - 2)} "
+            f"│ {pad_visible('', col_plan - 2)} "
             f"│ {pad_visible('', col_state - 2)} "
             f"│ {pad_visible(g_line2, col_gemini - 2)} "
-            f"│ {pad_visible(g4_line2, col_gem4 - 2)} "
             f"│ {pad_visible(c_line2, col_claude - 2)} │"
         )
         print(row1)
@@ -1069,15 +1522,16 @@ def cmd_list(args):
 
     print(border_bot)
     print(f"\n{C_BOLD}Atajos rápidos para desarrollo a tiempo completo:{C_RESET}")
-    print(f"  • Entrar directo a cuenta: {C_GREEN}agy01{C_RESET} | {C_GREEN}agy02{C_RESET} | {C_GREEN}agy03{C_RESET} (inicia agy con --dangerously-skip-permissions)")
-    print(f"  • Cambiar sin iniciar:     {C_CYAN}agyc agy02{C_RESET}      (o 'agyc switch agy02')")
-    print(f"  • Agregar nueva cuenta:    {C_CYAN}agyc add{C_RESET}        (asigna correlativo agy02, agy03... en automático)")
-    print(f"  • Actualizar agyc:         {C_CYAN}agyc update{C_RESET}     (o 'agy update', sincroniza binarios y repositorios)")
-    print(f"  • Rotación por cuota:      {C_CYAN}agyc auto{C_RESET}       (o 'agyc auto argon' para Gemini 4 Argon)")
-    print(f"  • Vaciar credenciales:     {C_CYAN}agyc wipe{C_RESET}       (limpieza total segura con confirmación)\n")
+    print(f"  • Entrar directo a cuenta: {C_GREEN}agy01{C_RESET} | {C_GREEN}agy02{C_RESET} | {C_GREEN}agy10{C_RESET} (HOME aislado + --dangerously-skip-permissions)")
+    print(f"  • Cambiar sin iniciar:     {C_CYAN}agyc agy02{C_RESET}                  (o 'agyc switch agy02')")
+    print(f"  • Rotación inteligente:    {C_CYAN}agyc auto [gemini|claude|carbon]{C_RESET} (elige mejor saldo 5H + Semanal)")
+    print(f"  • Reporte detallado:       {C_CYAN}agyc quota [alias]{C_RESET}          (plan Pro/Ultra, Carbon y ventanas)")
+    print(f"  • Agregar / renovar:       {C_CYAN}agyc add [alias]{C_RESET}            (OAuth correlativo o re-vinculación)")
+    print(f"  • Actualizar / limpiar:    {C_CYAN}agyc update{C_RESET} | {C_CYAN}agyc wipe{C_RESET}\n")
+
 
 def cmd_switch(args):
-    alias = args.alias
+    alias = normalize_alias(args.alias) or args.alias
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1089,42 +1543,40 @@ def cmd_switch(args):
         data = switch_active_account(alias)
     except TokenRevokedError:
         print(f"\n{C_BOLD}{C_RED}Error: El token de Google para '{alias}' ({data.get('email')}) expiró o fue revocado (invalid_grant).{C_RESET}")
-        print(f"Para proteger tu entorno y evitar el fallback silencioso a la cuenta principal, se detuvo el cambio.")
+        print("Para proteger tu entorno y evitar el fallback silencioso a otra cuenta, se detuvo el cambio.")
         print(f"\n{C_BOLD}Solución:{C_RESET} Re-vincula únicamente esta cuenta ejecutando:")
-        print(f"  {C_GREEN}agyc add {alias}{C_RESET}\n")
+        print(f"  {C_GREEN}agyc renew {alias}{C_RESET}\n")
         sys.exit(1)
 
-    q = data.get("quota", {})
-    g5h = q.get("gemini_5h_fraction")
-    gweek = q.get("gemini_weekly_fraction")
-    g_disabled = q.get("gemini_disabled", False)
-    has_g4 = check_has_gemini4(data, alias)
-    aweek = q.get("argon_weekly_fraction")
-    if aweek is None and has_g4:
-        aweek = q.get("gemini_weekly_fraction", 1.0)
-    aweek_reset = format_countdown(q.get("argon_weekly_reset") or q.get("gemini_weekly_reset")) if (q.get("argon_weekly_reset") or q.get("gemini_weekly_reset")) else "168h"
+    q = _sanitize_cached_or_stored_quota(data.get("quota", {}))
+    plan_badge = format_plan_badge(q.get("plan_type"))
+    tier_name = q.get("tier_name") or "Antigravity"
 
-    cweek = q.get("claude_weekly_fraction")
-    c_disabled = q.get("claude_disabled", False)
+    g5h, g5h_rst = normalize_window(q.get("gemini_5h_fraction"), q.get("gemini_5h_reset"))
+    gweek, gweek_rst = normalize_window(q.get("gemini_weekly_fraction"), q.get("gemini_weekly_reset"))
+    g_dis = bool(q.get("gemini_disabled", False))
 
-    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({data.get('email')}){C_RESET}")
-    if (gweek is not None and gweek <= 0.001) or g_disabled:
-        print(f"  Gemini 5H (Diario):     {make_linebar(0.0, length=12)} {C_RED}(Semanal agotada){C_RESET}")
+    c5h, c5h_rst = normalize_window(q.get("claude_5h_fraction"), q.get("claude_5h_reset"))
+    cweek, cweek_rst = normalize_window(q.get("claude_weekly_fraction"), q.get("claude_weekly_reset"))
+    c_dis = bool(q.get("claude_disabled", False))
+
+    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta activa cambiada a: {alias} ({data.get('email')}){C_RESET} [{plan_badge} — {tier_name}]")
+    if (gweek is not None and gweek <= 0.001) or g_dis:
+        print(f"  Gemini 5H:        {make_linebar(0.0, length=12)} {C_RED}(Semanal agotada){C_RESET}")
     else:
-        print(f"  Gemini 5H (Diario):     {make_linebar(g5h, length=12)} (reset: {format_countdown(q.get('gemini_5h_reset'))})")
-    print(f"  Gemini Semanal:         {make_linebar(gweek, length=12)} (reset: {format_countdown(q.get('gemini_weekly_reset'))})")
-    if not has_g4:
-        print(f"  Gemini 4 Semanal:       {C_DIM}[────────────] No cuenta (No habilitado aún por Google){C_RESET}")
+        print(f"  Gemini 5H:        {make_linebar(g5h, length=12)} {format_window_status(g5h, g5h_rst, 'list')}")
+    print(f"  Gemini Semanal:   {make_linebar(gweek, length=12)} {format_window_status(gweek, gweek_rst, 'list')}")
+
+    if (cweek is not None and cweek <= 0.001) or c_dis:
+        print(f"  Claude & GPT 5H:  {make_linebar(0.0, length=12)} {C_RED}(Semanal agotada){C_RESET}")
     else:
-        print(f"  Gemini 4 Semanal:       {make_linebar(aweek, length=12)} (reset: {aweek_reset})")
-    if (cweek is not None and cweek <= 0.001) or c_disabled:
-        print(f"  Claude Semanal:         {make_linebar(0.0, length=12)} (reset: {format_countdown(q.get('claude_weekly_reset'))}) {C_RED}[AGOTADA]{C_RESET}")
-    elif cweek is not None:
-        print(f"  Claude Semanal:         {make_linebar(cweek, length=12)} (reset: {format_countdown(q.get('claude_weekly_reset'))})")
+        print(f"  Claude & GPT 5H:  {make_linebar(c5h, length=12)} {format_window_status(c5h, c5h_rst, 'list')}")
+    print(f"  Claude & GPT Sem: {make_linebar(cweek, length=12)} {format_window_status(cweek, cweek_rst, 'list')}")
     print(f"{C_DIM}A partir de ahora, 'agy' o '{alias}' utilizarán esta sesión con --dangerously-skip-permissions.{C_RESET}\n")
 
+
 def cmd_default(args):
-    alias = args.alias
+    alias = normalize_alias(args.alias) or args.alias
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1135,11 +1587,11 @@ def cmd_default(args):
     cfg["default_account"] = alias
     save_config(cfg)
 
-    # Aplicar inmediatamente como activa
     switch_active_account(alias, silent=True)
 
     print(f"{C_BOLD}{C_CYAN}★ Cuenta '{alias}' configurada como PREDEFINIDA (Default).{C_RESET}")
     print(f"Al ejecutar 'agy' en la terminal, iniciará siempre con {data.get('email')} y --dangerously-skip-permissions.\n")
+
 
 class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     auth_code = None
@@ -1176,9 +1628,9 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
             </head>
             <body>
                 <div class="card">
-                    <div class="badge">Google AI Pro</div>
+                    <div class="badge">Google Antigravity (Pro / Ultra)</div>
                     <h1>¡Autenticación Exitosa!</h1>
-                    <p>Tu cuenta ha sido vinculada correctamente para Google Antigravity.</p>
+                    <p>Tu cuenta ha sido vinculada correctamente para Google Antigravity (agyc v1.5).</p>
                     <p style="color: #64748b; font-size: 14px;">Ya puedes cerrar esta ventana y regresar a tu terminal.</p>
                 </div>
             </body>
@@ -1198,9 +1650,9 @@ class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+
 def cmd_add(args):
-    # Asignación correlativa automática si no se proporciona alias
-    alias = getattr(args, "alias", None)
+    alias = normalize_alias(getattr(args, "alias", None))
     if not alias:
         alias = get_next_correlative_alias()
         print(f"{C_BOLD}{C_GREEN}▶ Asignando automáticamente alias correlativo: {alias}{C_RESET}")
@@ -1208,7 +1660,7 @@ def cmd_add(args):
     existing = load_account(alias)
     if existing:
         print(f"{C_YELLOW}Aviso:{C_RESET} Ya existe una cuenta con el alias '{alias}' ({existing.get('email')}).")
-        ans = input(f"¿Deseas sobrescribirla? (s/N): ").strip().lower()
+        ans = input("¿Deseas sobrescribirla? (s/N): ").strip().lower()
         if ans not in ("s", "si", "y", "yes"):
             print("Operación cancelada.")
             return
@@ -1240,11 +1692,11 @@ def cmd_add(args):
 
     print()
     print(f"{C_BOLD}{C_CYAN}══════════════════════════════════════════════════════════════════════════{C_RESET}")
-    print(f"{C_BOLD} VINCULAR CUENTA DE GOOGLE AI PRO: {C_GREEN}{alias}{C_RESET}")
+    print(f"{C_BOLD} VINCULAR CUENTA DE GOOGLE ANTIGRAVITY: {C_GREEN}{alias}{C_RESET}")
     print(f"{C_BOLD}{C_CYAN}══════════════════════════════════════════════════════════════════════════{C_RESET}")
     print("1. Abre el enlace en tu navegador para autorizar la cuenta:")
     print(f"\n   {C_CYAN}{C_BOLD}{auth_url}{C_RESET}\n")
-    print(f"2. Selecciona la cuenta de Google AI Pro que deseas registrar.")
+    print("2. Selecciona la cuenta de Google AI Pro / Ultra que deseas registrar.")
     print(f"3. Esperando respuesta automática en {C_GREEN}{redirect_uri}{C_RESET}...")
     print(f"{C_DIM}--------------------------------------------------------------------------{C_RESET}")
     print(f"{C_DIM}Si estás en una terminal remota/SSH sin navegador:")
@@ -1321,7 +1773,7 @@ def cmd_add(args):
         req = urllib.request.Request(
             "https://oauth2.googleapis.com/token",
             data=token_payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         with urllib.request.urlopen(req, timeout=12) as resp:
             token_res = json.loads(resp.read().decode("utf-8"))
@@ -1350,7 +1802,7 @@ def cmd_add(args):
         claims = decode_jwt_payload(token_res["id_token"])
         email = claims.get("email")
 
-    print(f"{C_CYAN}Consultando cuotas para {email}...{C_RESET}")
+    print(f"{C_CYAN}Consultando plan y cuotas para {email}...{C_RESET}")
     quota = extract_quota_metrics(fetch_quota_summary(access_token))
 
     acc_data = {
@@ -1360,12 +1812,18 @@ def cmd_add(args):
         "picture": profile.get("picture"),
         "token_data": token_data,
         "quota": quota,
+        "is_revoked": False,
     }
     save_account(alias, acc_data)
+    write_quota_cache(alias, quota)
+    prepare_isolated_home(alias)
 
-    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta '{alias}' ({acc_data['email']}) vinculada con éxito!{C_RESET}")
-    print(f"  Gemini 5H (Diario):  {make_linebar(quota.get('gemini_5h_fraction'), length=12)}")
-    print(f"  Gemini Semanal:      {make_linebar(quota.get('gemini_weekly_fraction'), length=12)}")
+    plan_badge = format_plan_badge(quota.get("plan_type"))
+    print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta '{alias}' ({acc_data['email']}) vinculada con éxito!{C_RESET} [{plan_badge}]")
+    print(f"  Gemini 5H:        {make_linebar(quota.get('gemini_5h_fraction'), length=12)}")
+    print(f"  Gemini Semanal:   {make_linebar(quota.get('gemini_weekly_fraction'), length=12)}")
+    print(f"  Claude & GPT 5H:  {make_linebar(quota.get('claude_5h_fraction'), length=12)}")
+    print(f"  Claude & GPT Sem: {make_linebar(quota.get('claude_weekly_fraction'), length=12)}")
     print(f"\n{C_BOLD}Atajo listo:{C_RESET} Ya puedes entrar a esta cuenta directamente ejecutando {C_GREEN}{alias}{C_RESET} en tu terminal.\n")
 
     cfg = load_config()
@@ -1386,8 +1844,9 @@ def cmd_add(args):
         else:
             print(f"{C_DIM}La sesión activa se mantiene en '{current_active}'. Puedes cambiar en cualquier momento con: agyc {alias}{C_RESET}\n")
 
+
 def cmd_capture(args):
-    alias = getattr(args, "alias", None)
+    alias = normalize_alias(getattr(args, "alias", None))
     if not alias:
         alias = get_next_correlative_alias()
 
@@ -1417,20 +1876,25 @@ def cmd_capture(args):
             "picture": profile.get("picture"),
             "token_data": token_data,
             "quota": quota,
+            "is_revoked": False,
         }
         save_account(alias, acc_data)
+        if quota:
+            write_quota_cache(alias, quota)
+        prepare_isolated_home(alias)
         cfg = load_config()
         cfg["active_account"] = alias
         if not cfg.get("default_account"):
             cfg["default_account"] = alias
         save_config(cfg)
 
-        print(f"\n{C_BOLD}{C_GREEN}✓ Sesión actual guardada como alias '{alias}' ({acc_data['email']}){C_RESET}\n")
+        print(f"\n{C_BOLD}{C_GREEN}✓ Sesión actual guardada como alias '{alias}' ({acc_data['email']}) [{format_plan_badge(quota.get('plan_type'))}]{C_RESET}\n")
     except Exception as e:
         print(f"{C_RED}Error al capturar sesión:{C_RESET} {e}")
 
+
 def cmd_remove(args):
-    alias = args.alias
+    alias = normalize_alias(args.alias) or args.alias
     data = load_account(alias)
     if not data:
         print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe.")
@@ -1440,6 +1904,21 @@ def cmd_remove(args):
     if os.path.exists(p):
         os.remove(p)
 
+    # Limpiar HOME aislado de este alias (~/.agyc_homes/{alias})
+    iso_home = os.path.join(resolve_real_home(), ".agyc_homes", alias)
+    if os.path.exists(iso_home) and not os.path.islink(iso_home):
+        try:
+            shutil.rmtree(iso_home)
+        except Exception:
+            pass
+
+    # Limpiar caché temporal de cuota del alias
+    for tmp_p in glob.glob(f"/tmp/agyc_quota_cache_{alias}.json*") + glob.glob(f"/tmp/agyc_quota_refreshing_{alias}.lock"):
+        try:
+            os.remove(tmp_p)
+        except Exception:
+            pass
+
     cfg = load_config()
     if alias == cfg.get("active_account"):
         remaining = list_account_aliases()
@@ -1448,7 +1927,7 @@ def cmd_remove(args):
             switch_active_account(cfg["active_account"], silent=True)
         else:
             token_path = get_active_token_path()
-            for tp in [token_path, token_path + ".tmp"]:
+            for tp in [token_path] + glob.glob(f"{token_path}.tmp*"):
                 if os.path.exists(tp):
                     try:
                         os.remove(tp)
@@ -1460,30 +1939,33 @@ def cmd_remove(args):
     save_config(cfg)
     sync_account_symlinks()
 
-    print(f"{C_GREEN}✓ Cuenta '{alias}' eliminada correctamente.{C_RESET}")
+    print(f"{C_GREEN}✓ Cuenta '{alias}', su caché y su HOME aislado eliminados correctamente.{C_RESET}")
+
 
 def cmd_wipe(args):
-    """Limpia de forma segura y completa todas las credenciales, configuraciones y caché."""
+    """Limpia de forma segura y completa todas las credenciales, tokens aislados y caché."""
     force = getattr(args, "force", False)
+    real_home = resolve_real_home()
     aliases = list_account_aliases()
     base_dir = get_base_dir()
     accounts_dir = get_accounts_dir()
     token_path = get_active_token_path()
     cache_dir = os.path.join(base_dir, "cache")
     config_path = get_config_path()
+    homes_base = os.path.join(real_home, ".agyc_homes")
 
     print()
     print(f"{C_BOLD}{C_RED}══════════════════════════════════════════════════════════════════════════{C_RESET}")
     print(f"{C_BOLD}{C_RED} ADVERTENCIA: VACIADO TOTAL DE CREDENCIALES Y CACHÉ (WIPE){C_RESET}")
     print(f"{C_BOLD}{C_RED}══════════════════════════════════════════════════════════════════════════{C_RESET}")
-    print(f"Esta acción eliminará de forma irreversible:")
+    print("Esta acción eliminará de forma irreversible:")
     print(f"  • {len(aliases)} cuenta(s) registrada(s) en {accounts_dir}")
     print(f"  • Configuración de cuentas ({config_path})")
-    print(f"  • Token activo de sesión de Antigravity ({token_path})")
-    print(f"  • Archivos temporales y de caché de sesión ({cache_dir})")
+    print(f"  • Token activo y tokens aislados en {homes_base}/*/.gemini/antigravity-cli/")
+    print("  • Archivos temporales /tmp/agyc_quota_cache_*.json y caché de sesión")
     print(f"{C_DIM}--------------------------------------------------------------------------{C_RESET}")
-    print(f"Esto garantiza un reinicio limpio desde cero para registrar agy01, agy02, etc.")
-    print(f"sin residuos ni caídas silenciosas (fallback) a credenciales anteriores.\n")
+    print("Esto garantiza un reinicio limpio desde cero para registrar agy01, agy02, etc.")
+    print("sin residuos ni caídas silenciosas (fallback) a credenciales anteriores.\n")
 
     if not force:
         try:
@@ -1500,7 +1982,7 @@ def cmd_wipe(args):
     # 1. Eliminar archivos de cuentas
     if os.path.exists(accounts_dir):
         for f in os.listdir(accounts_dir):
-            if f.endswith(".json") or f.endswith(".tmp"):
+            if f.endswith(".json") or ".tmp" in f:
                 fp = os.path.join(accounts_dir, f)
                 try:
                     os.remove(fp)
@@ -1511,16 +1993,47 @@ def cmd_wipe(args):
     # 2. Restablecer config.json vacío
     save_config({"default_account": None, "active_account": None})
 
-    # 3. Eliminar antigravity-oauth-token y sus .tmp
-    for p in [token_path, token_path + ".tmp"]:
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-                deleted_count += 1
-            except Exception as e:
-                print(f"  {C_YELLOW}Aviso:{C_RESET} No se pudo eliminar {p}: {e}")
+    # 3. Eliminar antigravity-oauth-token global, snap y sus .tmp
+    token_candidates = [
+        token_path,
+        os.path.join(real_home, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+    ]
+    for base_tp in set(token_candidates):
+        for p in [base_tp] + glob.glob(f"{base_tp}.tmp*"):
+            if os.path.lexists(p):
+                try:
+                    os.remove(p)
+                    deleted_count += 1
+                except Exception as e:
+                    print(f"  {C_YELLOW}Aviso:{C_RESET} No se pudo eliminar {p}: {e}")
 
-    # 4. Limpiar caché de sesión
+    # 4. Eliminar tokens en ~/.agyc_homes/*/.gemini/antigravity-cli/antigravity-oauth-token
+    if os.path.isdir(homes_base):
+        try:
+            for h in os.listdir(homes_base):
+                iso_gem = os.path.join(homes_base, h, ".gemini", "antigravity-cli")
+                if os.path.isdir(iso_gem):
+                    for fn in os.listdir(iso_gem):
+                        if fn.startswith("antigravity-oauth-token"):
+                            tp = os.path.join(iso_gem, fn)
+                            try:
+                                os.remove(tp)
+                                deleted_count += 1
+                            except Exception:
+                                pass
+        except Exception:
+            pass
+
+    # 5. Limpiar cachés de cuotas en /tmp/agyc_quota_cache_*.json y locks
+    for cp in glob.glob("/tmp/agyc_quota_cache_*.json*") + glob.glob("/tmp/agyc_quota_refreshing_*.lock"):
+        try:
+            os.remove(cp)
+            deleted_count += 1
+        except Exception:
+            pass
+
+    # 6. Limpiar caché de sesión
     cache_files_to_clean = [
         "default_project_id.txt",
         "last_conversations.json",
@@ -1536,15 +2049,16 @@ def cmd_wipe(args):
                 except Exception:
                     pass
 
-    # 5. Sincronizar symlinks para dejar los accesos limpios
+    # 7. Sincronizar symlinks
     sync_account_symlinks()
 
     print(f"\n{C_BOLD}{C_GREEN}✓ Vaciado completado con éxito ({deleted_count} elementos purgados).{C_RESET}")
-    print(f"  • Entorno 100% limpio sin tokens residuales.")
+    print("  • Entorno 100% limpio sin tokens residuales ni cachés caducas.")
     print(f"  • Listo para registrar cuentas correlativas con: {C_CYAN}agyc add{C_RESET} (iniciará con agy01).\n")
 
+
 def cmd_quota(args):
-    target_alias = getattr(args, "alias", None)
+    target_alias = normalize_alias(getattr(args, "alias", None))
     cfg = load_config()
     if not target_alias:
         target_alias = cfg.get("active_account")
@@ -1562,58 +2076,108 @@ def cmd_quota(args):
         return
 
     token_data = data.get("token_data", {})
-    token_data, _ = refresh_token_if_needed(token_data)
+    try:
+        token_data, refreshed = refresh_token_if_needed(token_data)
+        if refreshed:
+            data["token_data"] = token_data
+            data["is_revoked"] = False
+    except TokenRevokedError:
+        data["is_revoked"] = True
+        save_account(target_alias, data)
+        print(f"\n{C_BOLD}{C_RED}✗ Token revocado o expirado para '{target_alias}' ({data.get('email')}).{C_RESET}")
+        print(f"Re-vincula la cuenta ejecutando: {C_GREEN}agyc renew {target_alias}{C_RESET}\n")
+        return
+    except Exception as e:
+        print(f"{C_YELLOW}Aviso al verificar token de '{target_alias}':{C_RESET} {e}")
+
     access_token = token_data.get("token", {}).get("access_token")
     q_raw = fetch_quota_summary(access_token) if access_token else None
 
     print(f"\n{C_BOLD}{C_WHITE}REPORTE COMPLETO DE CUOTAS: {C_GREEN}{target_alias}{C_RESET} ({data.get('email')})")
-    print(f"{C_DIM}{'=' * 65}{C_RESET}")
+    print(f"{C_DIM}{'=' * 74}{C_RESET}")
 
-    if not q_raw or "groups" not in q_raw:
+    if not q_raw:
         print(f"{C_YELLOW}No se pudo obtener información en tiempo real de Google CloudCode PA.{C_RESET}\n")
         return
 
+    old_q = data.get("quota", {}) if isinstance(data.get("quota"), dict) else {}
+    metrics = _merge_tier_fallback_if_unfetched(extract_quota_metrics(q_raw), old_q, q_raw)
+    data["quota"] = metrics
+    data["is_revoked"] = False
+    data.pop("has_gemini4", None)
+    save_account(target_alias, data)
+    write_quota_cache(target_alias, metrics)
+
+    plan_type = metrics.get("plan_type", "FREE")
+    tier_name = metrics.get("tier_name") or "Antigravity"
+    tier_id = metrics.get("tier_id") or "free-tier"
+    supports_carbon = bool(metrics.get("supports_carbon", plan_type == "ULTRA"))
+
+    print(f"  {C_BOLD}Plan / Suscripción:{C_RESET}  {tier_name} [{format_plan_badge(plan_type)}] {C_DIM}({tier_id}){C_RESET}")
+    if supports_carbon:
+        print(f"  {C_BOLD}Gemini 4 Carbon:{C_RESET}     {C_GREEN}✓ Habilitado{C_RESET} {C_DIM}(Exclusivo Google AI Ultra — grupo unificado Gemini){C_RESET}")
+    else:
+        print(f"  {C_BOLD}Gemini 4 Carbon:{C_RESET}     {C_DIM}✗ No disponible en plan {plan_type} (Requiere Google AI Ultra){C_RESET}")
+
+    # Extraer descripciones detalladas por grupo/bucket si vinieron del backend
+    grp_desc_map: dict[str, str] = {}
+    bucket_desc_map: dict[tuple[str, str], str] = {}
     for grp in q_raw.get("groups", []):
-        name = grp.get("displayName", "Grupo")
-        desc = grp.get("description", "")
-        print(f"\n{C_BOLD}{C_CYAN}▶ {name}{C_RESET}")
-        if desc:
-            print(f"  {C_DIM}{desc}{C_RESET}")
-
+        fam = _classify_group_family(grp.get("displayName", ""))
+        if grp.get("description"):
+            grp_desc_map[fam] = grp["description"]
         for b in grp.get("buckets", []):
-            d_name = b.get("displayName", b.get("bucketId", ""))
-            frac = b.get("remainingFraction")
-            reset_t = b.get("resetTime")
-            b_desc = b.get("description", "")
-            is_dis = b.get("disabled", False)
-            if is_dis:
-                bar = make_linebar(0.0, length=16)
-                dis_str = f" {C_RED}[Inactivo - Semanal agotada]{C_RESET}"
-            else:
-                bar = make_linebar(frac, length=16)
-                dis_str = ""
-            reset_str = format_countdown(reset_t)
-            print(f"    • {d_name:<26} {bar}  (Reinicio: {reset_str}){dis_str}")
-            if b_desc:
-                print(f"      {C_DIM}{b_desc}{C_RESET}")
+            win = _classify_bucket_window(b)
+            if b.get("description"):
+                bucket_desc_map[(fam, win)] = b["description"]
 
-    has_argon_group = any("argon" in grp.get("displayName", "").lower() for grp in q_raw.get("groups", []))
-    if not has_argon_group:
-        q = data.get("quota", {})
-        has_g4 = check_has_gemini4(data, alias)
-        print(f"\n{C_BOLD}{C_CYAN}▶ Gemini 4 Argon{C_RESET}")
-        print(f"  {C_DIM}Models within this group: Gemini 4 Argon (separate weekly quota bucket){C_RESET}")
-        if not has_g4:
-            print(f"    • {'Weekly Limit Remaining':<26} {C_DIM}[────────────────] No cuenta (No habilitado aún){C_RESET}")
-            print(f"      {C_DIM}Google aún no ha activado Gemini 4 Argon en esta cuenta (rollout progresivo).{C_RESET}")
+    gem_desc = grp_desc_map.get("gemini") or (
+        "Models within this group: Gemini 4 Carbon, Gemini 4 Argon, Gemini 4 Hydrogen, Gemini Flash"
+        if supports_carbon
+        else "Models within this group: Gemini 4 Argon, Gemini 4 Hydrogen, Gemini 3.8/2.5 Flash & Pro"
+    )
+    claude_desc = grp_desc_map.get("claude") or (
+        "Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B"
+    )
+
+    sections = [
+        ("gemini", "Gemini Models", gem_desc),
+        ("claude", "Claude & GPT Models", claude_desc),
+    ]
+
+    for fam, title, desc in sections:
+        print(f"\n{C_BOLD}{C_CYAN}▶ {title}{C_RESET}")
+        print(f"  {C_DIM}{desc}{C_RESET}")
+
+        f5, r5 = normalize_window(metrics.get(f"{fam}_5h_fraction"), metrics.get(f"{fam}_5h_reset"))
+        fw, rw = normalize_window(metrics.get(f"{fam}_weekly_fraction"), metrics.get(f"{fam}_weekly_reset"))
+        dis = bool(metrics.get(f"{fam}_disabled", False))
+        weekly_empty = (fw is not None and fw <= 0.001) or dis
+
+        # Ventana 5H
+        if weekly_empty:
+            bar_5h = make_linebar(0.0, length=16)
+            st_5h = f"{C_RED}[Inactivo - Semanal agotada]{C_RESET}"
         else:
-            aweek = q.get("argon_weekly_fraction")
-            if aweek is None:
-                aweek = q.get("gemini_weekly_fraction", 1.0)
-            areset = format_countdown(q.get("argon_weekly_reset") or q.get("gemini_weekly_reset")) if (q.get("argon_weekly_reset") or q.get("gemini_weekly_reset")) else "168h"
-            print(f"    • {'Weekly Limit Remaining':<26} {make_linebar(aweek, length=16)}  (Reinicio: {areset})")
+            bar_5h = make_linebar(f5, length=16)
+            st_5h = format_window_status(f5, r5, mode="quota")
+        print(f"    • {'Five Hour Limit Remaining':<27} {bar_5h}  {st_5h}")
+        b_desc_5h = bucket_desc_map.get((fam, "5h"))
+        if b_desc_5h and f5 is not None and f5 < 0.9995 and not weekly_empty:
+            print(f"      {C_DIM}{b_desc_5h}{C_RESET}")
 
-    print(f"\n{C_DIM}{q_raw.get('description', '')}{C_RESET}\n")
+        # Ventana Weekly
+        bar_wk = make_linebar(fw, length=16)
+        st_wk = format_window_status(fw, rw, mode="quota")
+        print(f"    • {'Weekly Limit Remaining':<27} {bar_wk}  {st_wk}")
+        b_desc_wk = bucket_desc_map.get((fam, "weekly"))
+        if b_desc_wk and fw is not None and fw < 0.9995:
+            print(f"      {C_DIM}{b_desc_wk}{C_RESET}")
+
+    if q_raw.get("description"):
+        print(f"\n{C_DIM}{q_raw['description']}{C_RESET}")
+    print()
+
 
 def get_active_model_name() -> str:
     base = get_base_dir()
@@ -1627,193 +2191,202 @@ def get_active_model_name() -> str:
             pass
     return "Gemini 3.8 Flash (High)"
 
+
+def _eval_account_for_auto(alias: str) -> tuple[str, dict | None, dict]:
+    data = load_account(alias)
+    if not data:
+        return alias, None, {}
+    old_q = data.get("quota", {}) if isinstance(data.get("quota"), dict) else {}
+    token_data = data.get("token_data", {})
+    try:
+        token_data, _ = refresh_token_if_needed(token_data)
+        data["token_data"] = token_data
+        data["is_revoked"] = False
+        access_token = token_data.get("token", {}).get("access_token")
+        q_raw = fetch_quota_summary(access_token) if access_token else None
+        if q_raw:
+            quota = _merge_tier_fallback_if_unfetched(extract_quota_metrics(q_raw), old_q, q_raw)
+            data["quota"] = quota
+            data.pop("has_gemini4", None)
+            save_account(alias, data, sync_links=False)
+            write_quota_cache(alias, quota)
+        else:
+            quota = _sanitize_cached_or_stored_quota(old_q)
+    except TokenRevokedError:
+        data["is_revoked"] = True
+        save_account(alias, data, sync_links=False)
+        quota = _sanitize_cached_or_stored_quota(old_q)
+    except Exception:
+        quota = _sanitize_cached_or_stored_quota(old_q)
+
+    return alias, data, quota
+
+
 def cmd_auto(args):
     aliases = list_account_aliases()
     if not aliases:
         print(f"{C_YELLOW}No hay cuentas registradas.{C_RESET}")
         return
 
-    # Determinar si evaluamos cuota de Claude o Gemini
     active_model = get_active_model_name()
     forced_family = getattr(args, "family", None)
     if forced_family:
-        forced_family = forced_family.lower()
-        if "argon" in forced_family or "gemini 4" in forced_family or "gemini-4" in forced_family:
-            target_family = "argon"
-        elif "claude" in forced_family or "gpt" in forced_family:
-            target_family = "claude"
+        f_low = forced_family.strip().lower()
+        if f_low in ("carbon", "ultra") or "carbon" in f_low or "ultra" in f_low:
+            target_mode = "carbon"
+        elif f_low in ("claude", "gpt", "3p") or any(k in f_low for k in ("claude", "gpt", "3p", "opus", "sonnet")):
+            target_mode = "claude"
+        elif f_low in ("gemini", "argon", "hydrogen", "flash") or any(k in f_low for k in ("gemini", "argon", "hydrogen", "flash")):
+            target_mode = "gemini"
         else:
-            target_family = "gemini"
+            print(f"{C_RED}Error:{C_RESET} Familia '{forced_family}' no válida. Usa: gemini, claude o carbon.")
+            sys.exit(1)
     else:
-        m_lower = active_model.lower()
-        if "argon" in m_lower or "gemini 4" in m_lower or "gemini-4" in m_lower:
-            target_family = "argon"
-        elif "claude" in m_lower or "gpt" in m_lower or "opus" in m_lower or "sonnet" in m_lower:
-            target_family = "claude"
+        m_low = active_model.lower()
+        if "carbon" in m_low:
+            target_mode = "carbon"
+        elif any(k in m_low for k in ("claude", "gpt", "3p", "opus", "sonnet")):
+            target_mode = "claude"
         else:
-            target_family = "gemini"
+            target_mode = "gemini"
 
-    if target_family == "argon":
-        family_label = "Gemini 4 Argon"
-    elif target_family == "claude":
-        family_label = "Claude y GPT"
+    if target_mode == "carbon":
+        family_label = "Gemini 4 Carbon (Exclusivo ULTRA)"
+        fam_key = "gemini"
+    elif target_mode == "claude":
+        family_label = "Claude & GPT"
+        fam_key = "claude"
     else:
-        family_label = "Gemini"
+        family_label = "Gemini (Argon / Hydrogen / Flash)"
+        fam_key = "gemini"
 
     print(f"{C_CYAN}Modelo activo en configuración: {C_BOLD}{active_model}{C_RESET}")
-    print(f"{C_CYAN}Evaluando saldo de cuotas para {C_BOLD}{family_label}{C_RESET} entre {len(aliases)} cuentas...{C_RESET}")
+    print(f"{C_CYAN}Evaluando cuotas en paralelo para {C_BOLD}{family_label}{C_RESET} entre {len(aliases)} cuentas...{C_RESET}")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        eval_results = list(pool.map(_eval_account_for_auto, aliases))
 
     best_alias = None
-    best_5h = -1.0
-    best_week = -1.0
-
-    for alias in aliases:
-        data = load_account(alias)
-        if not data:
-            continue
-        token_data = data.get("token_data", {})
-        try:
-            token_data, _ = refresh_token_if_needed(token_data)
-            data["is_revoked"] = False
-            access_token = token_data.get("token", {}).get("access_token")
-            q_raw = fetch_quota_summary(access_token)
-            if q_raw:
-                quota = extract_quota_metrics(q_raw)
-                for k, v in data.get("quota", {}).items():
-                    if quota.get(k) is None and v is not None:
-                        quota[k] = v
-                if data.get("has_gemini4"):
-                    quota["has_gemini4"] = True
-                if quota.get("has_gemini4"):
-                    if quota.get("argon_weekly_fraction") is None:
-                        quota["argon_weekly_fraction"] = quota.get("gemini_weekly_fraction", 1.0)
-                    if quota.get("argon_weekly_reset") is None:
-                        quota["argon_weekly_reset"] = quota.get("gemini_weekly_reset")
-                data["quota"] = quota
-                save_account(alias, data)
-            else:
-                quota = data.get("quota", {})
-        except TokenRevokedError:
-            data["is_revoked"] = True
-            save_account(alias, data)
-            print(f"  • {alias:<8} ({data.get('email')}): {C_RED}[EXPIRADA - Re-vincular con 'agyc add {alias}']{C_RESET}")
-            continue
-        except Exception:
-            quota = data.get("quota", {})
-
-        if data.get("is_revoked"):
-            print(f"  • {alias:<8} ({data.get('email')}): {C_RED}[EXPIRADA - Re-vincular con 'agyc add {alias}']{C_RESET}")
-            continue
-
-        if target_family == "argon":
-            has_g4 = check_has_gemini4(data, alias)
-            if not has_g4:
-                print(f"  • {alias:<8} ({data.get('email')}): {C_DIM}[Gemini 4 no habilitado en esta cuenta]{C_RESET}")
-                continue
-            qweek = quota.get("argon_weekly_fraction")
-            if qweek is None:
-                qweek = quota.get("gemini_weekly_fraction", 1.0)
-            q5h = quota.get("gemini_5h_fraction", 1.0)
-        elif target_family == "claude":
-            q5h = quota.get("claude_5h_fraction")
-            qweek = quota.get("claude_weekly_fraction")
-            c_dis = quota.get("claude_disabled", False)
-            if (qweek is not None and qweek <= 0.001) or c_dis:
-                q5h = 0.0
-                qweek = 0.0
-        else:
-            q5h = quota.get("gemini_5h_fraction")
-            qweek = quota.get("gemini_weekly_fraction")
-            g_dis = quota.get("gemini_disabled", False)
-            if (qweek is not None and qweek <= 0.001) or g_dis:
-                q5h = 0.0
-                qweek = 0.0
-
-        q5h = 0.0 if q5h is None else float(q5h)
-        qweek = 0.0 if qweek is None else float(qweek)
-
-        status_flag = ""
-        if qweek <= 0.001:
-            status_flag = f" {C_RED}[Semanal/Argon Agotada]{C_RESET}"
-        elif q5h <= 0.001:
-            status_flag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
-
-        if target_family == "argon":
-            print(f"  • {alias:<8} ({data.get('email')}): Semanal Argon = {int(qweek*100):3d}%{status_flag}")
-        else:
-            print(f"  • {alias:<8} ({data.get('email')}): 5H = {int(q5h*100):3d}% | Semanal = {int(qweek*100):3d}%{status_flag}")
-
-        # Algoritmo de selección según familia
-        if target_family == "argon":
-            if qweek > 0.001:
-                if qweek > best_week:
-                    best_week = qweek
-                    best_alias = alias
-        elif target_family == "claude":
-            # Si la cuota semanal está agotada, no sirve para Claude
-            if qweek > 0.001:
-                score = (qweek * 0.7) + (q5h * 0.3)
-                best_score = (best_week * 0.7) + (best_5h * 0.3)
-                if score > best_score:
-                    best_5h = q5h
-                    best_week = qweek
-                    best_alias = alias
-        else:
-            if q5h > best_5h or (abs(q5h - best_5h) < 0.01 and qweek > best_week):
-                best_5h = q5h
-                best_week = qweek
-                best_alias = alias
+    best_score = -1.0
+    best_5h = 0.0
+    best_week = 0.0
+    ultra_count = 0
 
     earliest_alias = None
     min_reset_seconds = float("inf")
     earliest_reset_str = "N/A"
+    now_dt = datetime.now(timezone.utc)
 
-    for alias in aliases:
-        data = load_account(alias)
-        if not data or data.get("is_revoked"):
+    for alias, data, quota in eval_results:
+        if not data:
             continue
-        quota = data.get("quota", {})
-        if target_family == "argon":
-            if not check_has_gemini4(data, alias):
-                continue
-            r_str = quota.get("argon_weekly_reset") or quota.get("gemini_weekly_reset")
-        elif target_family == "claude":
-            r_str = quota.get("claude_weekly_reset")
-        else:
-            r_str = quota.get("gemini_5h_reset")
-        if r_str:
-            try:
-                r_dt = parse_iso_datetime(r_str)
-                secs = max(0.0, (r_dt - datetime.now(timezone.utc)).total_seconds())
-                if secs < min_reset_seconds:
-                    min_reset_seconds = secs
-                    earliest_alias = alias
-                    earliest_reset_str = format_countdown(r_str)
-            except Exception:
-                pass
+        email = data.get("email", "")
+        if data.get("is_revoked"):
+            print(f"  • {alias:<8} ({email}): {C_RED}[EXPIRADA - Re-vincular con 'agyc renew {alias}']{C_RESET}")
+            continue
 
-    if target_family == "argon" and not best_alias and min_reset_seconds == float("inf"):
-        print(f"\n{C_BOLD}{C_YELLOW}⚠ Ninguna de tus cuentas registradas tiene Gemini 4 Argon habilitado aún.{C_RESET}")
-        print(f"Google está desplegando Gemini 4 de forma progresiva. Puedes seguir usando los modelos Gemini 3.8 / 3.5 y Claude.\n")
+        plan_type = (quota.get("plan_type") or "FREE").upper()
+        supports_carbon = bool(quota.get("supports_carbon") or plan_type == "ULTRA")
+        plan_badge = format_plan_badge(plan_type)
+
+        if target_mode == "carbon" and not supports_carbon:
+            print(f"  • {alias:<8} [{plan_badge}] ({email}): {C_DIM}[Omitida — Gemini 4 Carbon requiere ULTRA]{C_RESET}")
+            continue
+
+        if supports_carbon:
+            ultra_count += 1
+
+        q5h, r5h = normalize_window(quota.get(f"{fam_key}_5h_fraction"), quota.get(f"{fam_key}_5h_reset"))
+        qweek, rweek = normalize_window(quota.get(f"{fam_key}_weekly_fraction"), quota.get(f"{fam_key}_weekly_reset"))
+        dis = bool(quota.get(f"{fam_key}_disabled", False))
+
+        if (qweek is not None and qweek <= 0.001) or (dis and (qweek is None or qweek <= 0.001)):
+            q5h = 0.0
+            qweek = 0.0
+
+        q5h = 0.0 if q5h is None else float(q5h)
+        qweek = 0.0 if qweek is None else float(qweek)
+
+        p5 = pct_display(q5h) or 0
+        pw = pct_display(qweek) or 0
+
+        status_flag = ""
+        if qweek <= 0.001:
+            status_flag = f" {C_RED}[Semanal Agotada]{C_RESET}"
+        elif q5h <= 0.001:
+            status_flag = f" {C_YELLOW}[5H Agotada]{C_RESET}"
+
+        print(f"  • {alias:<8} [{plan_badge}] ({email}): 5H = {p5:3d}% | Semanal = {pw:3d}%{status_flag}")
+
+        # Requisito estricto: AMBAS ventanas deben tener saldo disponible (AND, nunca OR)
+        if q5h > 0.001 and qweek > 0.001:
+            if target_mode == "claude":
+                score = (qweek * 0.65) + (q5h * 0.35)
+            else:
+                score = (q5h * 0.65) + (qweek * 0.35)
+            if score > best_score:
+                best_score = score
+                best_5h = q5h
+                best_week = qweek
+                best_alias = alias
+        else:
+            # Si está bloqueada, medir cuándo vuelve a estar operativa (weekly si semanal=0, sino 5h)
+            blocking_rst = rweek if qweek <= 0.001 else r5h
+            if blocking_rst:
+                try:
+                    r_dt = parse_iso_datetime(blocking_rst)
+                    secs = max(0.0, (r_dt - now_dt).total_seconds())
+                    if secs > 0 and secs < min_reset_seconds:
+                        min_reset_seconds = secs
+                        earliest_alias = alias
+                        earliest_reset_str = format_countdown(blocking_rst)
+                except Exception:
+                    pass
+
+    if target_mode == "carbon" and ultra_count == 0:
+        print(f"\n{C_BOLD}{C_YELLOW}⚠ Ninguna de tus cuentas registradas tiene suscripción Google AI Ultra.{C_RESET}")
+        print(f"Gemini 4 Carbon solo está habilitado en cuentas ULTRA. Usa {C_CYAN}agyc auto gemini{C_RESET} para Argon/Hydrogen/Flash.\n")
         return
 
-    if best_alias and (best_week > 0.001 or best_5h > 0.001):
-        if target_family == "argon":
-            print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (Semanal Argon: {int(best_week*100)}%){C_RESET}")
-        else:
-            print(f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} (5H: {int(best_5h*100)}%, Semanal: {int(best_week*100)}%){C_RESET}")
+    if best_alias is not None and best_5h > 0.001 and best_week > 0.001:
+        print(
+            f"\n{C_BOLD}{C_GREEN}✓ Cuenta óptima para {family_label}: {best_alias} "
+            f"(5H: {pct_display(best_5h)}%, Semanal: {pct_display(best_week)}%){C_RESET}"
+        )
         switch_active_account(best_alias)
     elif earliest_alias:
-        print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas tienen la cuota de {family_label} agotada (0%).{C_RESET}")
+        print(f"\n{C_BOLD}{C_YELLOW}⚠ Todas las cuentas elegibles tienen la cuota de {family_label} agotada.{C_RESET}")
         print(f"La cuenta más próxima a reiniciarse es {C_CYAN}{earliest_alias}{C_RESET} (se reinicia en: {earliest_reset_str}).")
         print(f"Cambiando a {earliest_alias} para cuando se renueve el ciclo...")
         switch_active_account(earliest_alias)
     else:
-        print(f"{C_YELLOW}No se pudo encontrar ninguna cuenta disponible.{C_RESET}")
+        print(f"\n{C_YELLOW}No se encontró ninguna cuenta disponible con saldo en 5H y Semanal para {family_label}.{C_RESET}\n")
+
+
+def _copy_executable(src: str, dst: str) -> bool:
+    if not os.path.exists(src):
+        return False
+    if os.path.abspath(src) == os.path.abspath(dst):
+        return True
+    parent = os.path.dirname(dst)
+    if not os.path.exists(parent):
+        return False
+    try:
+        if os.path.islink(dst):
+            os.unlink(dst)
+        tmp = f"{dst}.tmp.{os.getpid()}"
+        shutil.copy2(src, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+        return True
+    except Exception:
+        return False
+
 
 def cmd_update(args):
-    print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY{C_RESET}")
-    print(f"{C_DIM}{'=' * 65}{C_RESET}\n")
+    real_home = resolve_real_home()
+    print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY (v1.5){C_RESET}")
+    print(f"{C_DIM}{'=' * 68}{C_RESET}\n")
 
     repo_candidates = [
         "/home/aidev/proyectos/agyc-antigravity-cli-switcher",
@@ -1826,7 +2399,8 @@ def cmd_update(args):
             repo_dir = cand
             break
 
-    bin_src = os.path.join(repo_dir, "bin", "agyc") if os.path.exists(os.path.join(repo_dir, "bin", "agyc")) else __file__
+    repo_bin = os.path.join(repo_dir, "bin")
+    bin_src = os.path.join(repo_bin, "agyc") if os.path.exists(os.path.join(repo_bin, "agyc")) else __file__
 
     # 1. Comprobar repositorio en GitHub
     print(f"[{C_CYAN}1/4{C_RESET}] Comprobando repositorio en GitHub...")
@@ -1854,59 +2428,76 @@ def cmd_update(args):
         except Exception as e:
             print(f"  {C_YELLOW}⚠ Descarga omitida: {e}{C_RESET}")
 
-    # 2. Sincronización de binarios y lanzadores en todo el sistema
-    print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, wrappers y lanzadores...")
-    sync_targets = [
-        os.path.expanduser("~/.gemini/antigravity-cli/bin/agyc"),
-        os.path.expanduser("~/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agyc"),
-        "/home/aidev/proyectos/backup_agyc/bin/agyc",
-    ]
-    for sp in sync_targets:
-        if os.path.exists(os.path.dirname(sp)):
-            try:
-                shutil.copy2(bin_src, sp)
-                os.chmod(sp, 0o755)
-                print(f"  {C_GREEN}✓{C_RESET} {sp}")
-            except Exception:
-                pass
+    # 2. Sincronizar agyc, agy (wrapper), agyc-statusline, agyc-topbar y symlink agyc-titleline
+    print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, wrappers, statusline, titleline y topbar...")
+    gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
+    snap_bin = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin")
+    local_bin = os.path.join(real_home, ".local", "bin")
+    backup_bin = "/home/aidev/proyectos/backup_agyc/bin"
 
-    # Sincronizar wrapper agy si existe
-    wrapper_src = os.path.join(repo_dir, "bin", "agy")
-    if os.path.exists(wrapper_src):
-        for wp in [
-            "/home/aidev/.gemini/antigravity-cli/bin/agy",
-            "/home/aidev/snap/antigravity-cli/common/.gemini/antigravity-cli/bin/agy",
-            "/home/aidev/proyectos/backup_agyc/bin/agy",
-        ]:
-            try:
-                shutil.copy2(wrapper_src, wp)
-                os.chmod(wp, 0o755)
-            except Exception:
-                pass
-
-    # Sincronizar lanzadores agy01..agy15 en ~/.local/bin
-    local_bin = os.path.expanduser("~/.local/bin")
+    os.makedirs(gemini_bin, exist_ok=True)
     os.makedirs(local_bin, exist_ok=True)
+
+    target_bin_dirs = [gemini_bin, snap_bin, local_bin, backup_bin]
+    managed_bins = ["agyc", "agy", "agyc-statusline", "agyc-topbar"]
+
+    for bname in managed_bins:
+        src_path = os.path.join(repo_bin, bname)
+        if bname == "agyc" and not os.path.exists(src_path):
+            src_path = bin_src
+        if not os.path.exists(src_path):
+            continue
+        for tdir in target_bin_dirs:
+            if os.path.isdir(tdir):
+                dst_path = os.path.join(tdir, bname)
+                if _copy_executable(src_path, dst_path):
+                    print(f"  {C_GREEN}✓{C_RESET} {dst_path}")
+
+    # Symlink agyc-titleline -> agyc-statusline en ~/.gemini/antigravity-cli/bin, snap y ~/.local/bin
+    for tdir in [gemini_bin, snap_bin, local_bin]:
+        if not os.path.isdir(tdir):
+            continue
+        sl_path = os.path.join(tdir, "agyc-statusline")
+        tl_path = os.path.join(tdir, "agyc-titleline")
+        if os.path.exists(sl_path):
+            try:
+                if os.path.lexists(tl_path):
+                    os.unlink(tl_path)
+                os.symlink(sl_path, tl_path)
+                print(f"  {C_GREEN}✓{C_RESET} {tl_path} -> {sl_path}")
+            except Exception:
+                pass
+
+    # Sincronizar lanzadores agy01..agy15 y agi01..agi15 en ~/.local/bin y ~/.gemini/antigravity-cli/bin
+    canonical_agyc = os.path.join(gemini_bin, "agyc")
+    all_aliases = set(list_account_aliases())
     for i in range(1, 16):
-        al = f"agy{i:02d}"
+        all_aliases.add(f"agy{i:02d}")
+        all_aliases.add(f"agi{i:02d}")
+
+    for al in sorted(all_aliases):
         lp = os.path.join(local_bin, al)
         try:
-            if os.path.islink(lp):
+            if os.path.lexists(lp):
                 os.unlink(lp)
-            os.symlink(os.path.expanduser("~/.gemini/antigravity-cli/bin/agyc"), lp)
+            os.symlink(canonical_agyc, lp)
         except Exception:
-            try:
-                shutil.copy2(bin_src, lp)
-                os.chmod(lp, 0o755)
-            except Exception:
-                pass
-    print(f"  {C_GREEN}✓{C_RESET} Lanzadores agy01..agy15 en {local_bin}")
+            _copy_executable(bin_src, lp)
+    agi_local = os.path.join(local_bin, "agi")
+    agy_local = os.path.join(local_bin, "agy")
+    if os.path.exists(agy_local):
+        try:
+            if os.path.lexists(agi_local):
+                os.unlink(agi_local)
+            os.symlink(agy_local, agi_local)
+        except Exception:
+            pass
+    print(f"  {C_GREEN}✓{C_RESET} Lanzadores directos sincronizados en {local_bin}")
 
-    # 3. Comprobar motor oficial de Google Antigravity CLI
+    # 3. Comprobar motor oficial de Google Antigravity CLI (agy-real)
+    # IMPORTANTE: jamás sobrescribir ~/.local/bin/agy con native_bin; ~/.local/bin/agy usa el wrapper bin/agy.
     print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando motor oficial de Google Antigravity CLI...")
-    native_bin = "/home/aidev/.gemini/antigravity-cli/bin/agy-real"
-    if not os.path.exists(os.path.dirname(native_bin)):
-        native_bin = os.path.expanduser("~/.gemini/antigravity-cli/bin/agy-real")
+    native_bin = os.path.join(gemini_bin, "agy-real")
     current_ver = None
     if os.path.exists(native_bin):
         try:
@@ -1930,52 +2521,45 @@ def cmd_update(args):
             import tarfile
             with tarfile.open(scratch_tar, "r:gz") as tar:
                 tar.extract("antigravity", path="/tmp/")
-            if os.path.exists(native_bin):
+            if os.path.lexists(native_bin):
                 try:
                     os.unlink(native_bin)
                 except Exception:
                     pass
             shutil.move("/tmp/antigravity", native_bin)
             os.chmod(native_bin, 0o755)
-            # Mantener .local/bin/agy sincronizado
-            for extra_p in ["/home/aidev/.local/bin/agy"]:
-                try:
-                    if os.path.exists(extra_p):
-                        os.unlink(extra_p)
-                    shutil.copy2(native_bin, extra_p)
-                    os.chmod(extra_p, 0o755)
-                except Exception:
-                    pass
-            print(f"  {C_GREEN}✓ Antigravity CLI actualizado al release oficial v{latest_ver}{C_RESET}")
+            print(f"  {C_GREEN}✓ Antigravity CLI actualizado al release oficial v{latest_ver} ({native_bin}){C_RESET}")
         else:
-            print(f"  {C_GREEN}✓ Antigravity CLI nativo en su última versión oficial: v{current_ver or '1.4.0'}{C_RESET}")
+            print(f"  {C_GREEN}✓ Antigravity CLI nativo en su última versión oficial: v{current_ver or '1.5.10'}{C_RESET}")
     except Exception as e:
         if current_ver:
             print(f"  {C_GREEN}✓ Antigravity CLI nativo instalado: v{current_ver}{C_RESET}")
         else:
             print(f"  {C_YELLOW}⚠ Aviso comprobando release oficial de Google: {e}{C_RESET}")
 
-    # 4. Actualizar perfiles aislados (~/.agyc_homes)
-    print(f"\n[{C_CYAN}4/4{C_RESET}] Actualizando perfiles aislados (~/.agyc_homes) y cuotas...")
+    # 4. Actualizar settings.json y perfiles aislados (~/.agyc_homes)
+    print(f"\n[{C_CYAN}4/4{C_RESET}] Actualizando perfiles aislados (~/.agyc_homes) y hooks...")
+    sync_account_symlinks()
     for al in list_account_aliases():
         try:
             prepare_isolated_home(al)
         except Exception:
             pass
-    print(f"  {C_GREEN}✓ Perfiles aislados actualizados y sincronizados.{C_RESET}")
+    print(f"  {C_GREEN}✓ Perfiles aislados y hooks statusLine/title sincronizados.{C_RESET}")
 
-    print(f"\n{C_BOLD}{C_GREEN}═════════════════════════════════════════════════════════════════{C_RESET}")
-    print(f"{C_BOLD}{C_GREEN}  ✓ SISTEMA ACTUALIZADO AL 100% (agyc v1.4)            {C_RESET}")
-    print(f"{C_BOLD}{C_GREEN}═════════════════════════════════════════════════════════════════{C_RESET}")
-    print(f"• Soporte incorporado para: {C_BOLD}Gemini 4 Argon{C_RESET}")
+    print(f"\n{C_BOLD}{C_GREEN}════════════════════════════════════════════════════════════════════{C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}  ✓ SISTEMA ACTUALIZADO AL 100% (agyc v1.5 — Pro / Ultra)           {C_RESET}")
+    print(f"{C_BOLD}{C_GREEN}════════════════════════════════════════════════════════════════════{C_RESET}")
+    print(f"• Motor unificado v1.5.10:  {C_BOLD}Google AI Pro / Ultra + Gemini 4 Carbon{C_RESET}")
     print(f"• Refresca cuotas en vivo:  {C_CYAN}agyc list -r{C_RESET}")
-    print(f"• Rotación para Argon:      {C_CYAN}agyc auto argon{C_RESET} (o 'agyc auto')\n")
+    print(f"• Rotación inteligente:     {C_CYAN}agyc auto [gemini|claude|carbon]{C_RESET}\n")
+
 
 def main():
     sync_account_symlinks()
     prog_name = os.path.basename(sys.argv[0])
 
-    # 1. Si el usuario ejecutó directamente un alias como comando: 'agy01', 'agy02' (o 'agi01', 'agi05', etc.)
+    # 1. Lanzamiento directo por alias invocado como comando: 'agy01', 'agy02', 'agi05', etc.
     m_prog = re.match(r"^(?:agy|agi)(\d+)$", prog_name)
     if m_prog:
         alias = f"agy{int(m_prog.group(1)):02d}"
@@ -1984,11 +2568,8 @@ def main():
             print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' aún no está registrada.")
             print(f"Ejecuta {C_CYAN}agyc add{C_RESET} para registrarla.")
             sys.exit(1)
-        # Con perfiles HOME aislados cada panel tiene su propio token blindado —
-        # no hay riesgo de colisión entre paneles, así que se lanza directo.
         sys_argv_to_pass = [a for a in sys.argv[1:] if a not in ("-y", "--yes", "-f", "--force")]
 
-        # Cambiar a la cuenta y lanzar agy con --dangerously-skip-permissions
         try:
             switch_active_account(alias, silent=True)
         except TokenRevokedError:
@@ -2000,12 +2581,9 @@ def main():
         launch_real_agy(sys_argv_to_pass, alias=alias)
         return
 
-    # 2. Si el usuario ejecutó 'agyc <alias>' directamente (ej. 'agyc agy02' o 'agyc agi05') para hacer switch
+    # 2. Ejecución directa 'agyc <alias>' para switch rápido
     if len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
-        candidate = sys.argv[1]
-        m_cand = re.match(r"^(?:agy|agi)(\d+)$", candidate)
-        if m_cand:
-            candidate = f"agy{int(m_cand.group(1)):02d}"
+        candidate = normalize_alias(sys.argv[1]) or sys.argv[1]
         if candidate in list_account_aliases():
             class DirectSwitchArgs:
                 alias = candidate
@@ -2014,14 +2592,14 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="agyc",
-        description="Administrador multi-cuenta de Google AI Pro para Antigravity (agy)",
+        description="Administrador multi-cuenta de Google Antigravity (Pro / Ultra — agyc v1.5)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="subcommand", help="Comandos disponibles")
 
     # list
-    p_list = subparsers.add_parser("list", help="Lista todas las cuentas y sus barras de consumo")
-    p_list.add_argument("-r", "--refresh", action="store_true", help="Forzar actualización de cuota desde Google")
+    p_list = subparsers.add_parser("list", help="Lista todas las cuentas, planes y barras de consumo")
+    p_list.add_argument("-r", "--refresh", action="store_true", help="Forzar actualización en paralelo desde Google")
     p_list.add_argument("--json", action="store_true", help="Salida en formato JSON")
     p_list.set_defaults(func=cmd_list)
 
@@ -2035,7 +2613,7 @@ def main():
     p_default.add_argument("alias", help="Alias de la cuenta predefinida")
     p_default.set_defaults(func=cmd_default)
 
-    # add (alias opcional, se autogenera si se omite; soporta renew/reauth/login)
+    # add
     p_add = subparsers.add_parser("add", aliases=["renew", "reauth", "login"], help="Registra o renueva una cuenta (ej. agyc renew agy03)")
     p_add.add_argument("alias", nargs="?", default=None, help="Alias opcional (por defecto correlativo automático)")
     p_add.set_defaults(func=cmd_add)
@@ -2046,27 +2624,32 @@ def main():
     p_capture.set_defaults(func=cmd_capture)
 
     # remove / rm
-    p_rm = subparsers.add_parser("remove", aliases=["rm"], help="Elimina una cuenta guardada")
+    p_rm = subparsers.add_parser("remove", aliases=["rm"], help="Elimina una cuenta guardada, su caché y su HOME aislado")
     p_rm.add_argument("alias", help="Alias de la cuenta a eliminar")
     p_rm.set_defaults(func=cmd_remove)
 
     # quota
-    p_quota = subparsers.add_parser("quota", help="Muestra el reporte detallado de modelos y cuotas")
+    p_quota = subparsers.add_parser("quota", help="Muestra el reporte detallado de plan, Carbon y grupos de cuota")
     p_quota.add_argument("alias", nargs="?", default=None, help="Alias de la cuenta (por defecto la activa)")
     p_quota.set_defaults(func=cmd_quota)
 
     # auto
-    p_auto = subparsers.add_parser("auto", help="Auto-switch a la cuenta con mayor cuota (detecta automáticamente si usas Claude o Gemini)")
-    p_auto.add_argument("family", nargs="?", default=None, help="Familia de modelos a priorizar: claude o gemini (por defecto detecta según settings.json)")
+    p_auto = subparsers.add_parser("auto", help="Auto-switch paralelo a la mejor cuenta (gemini, claude o carbon)")
+    p_auto.add_argument(
+        "family",
+        nargs="?",
+        default=None,
+        help="Familia/modo: gemini (argon/hydrogen/flash), claude (gpt/3p) o carbon (ultra)",
+    )
     p_auto.set_defaults(func=cmd_auto)
 
     # wipe / clean / purge
-    p_wipe = subparsers.add_parser("wipe", aliases=["clean", "purge"], help="Vacía todas las credenciales, configuraciones y caché de forma segura")
+    p_wipe = subparsers.add_parser("wipe", aliases=["clean", "purge"], help="Vacía todas las credenciales, tokens aislados y caché")
     p_wipe.add_argument("-f", "--force", "-y", "--yes", action="store_true", dest="force", help="Omitir confirmación interactiva")
     p_wipe.set_defaults(func=cmd_wipe)
 
     # update / upgrade
-    p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc desde GitHub y sincroniza el entorno")
+    p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc, wrappers y Antigravity CLI")
     p_update.set_defaults(func=cmd_update)
 
     args = parser.parse_args()
@@ -2078,6 +2661,7 @@ def main():
         cmd_list(DefaultListArgs())
     else:
         args.func(args)
+
 
 if __name__ == "__main__":
     main()

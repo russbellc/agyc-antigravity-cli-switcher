@@ -261,6 +261,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 
 ## Documentación Adicional y Licencia
 
-- Manual completo de operación y arquitectura: [docs/MANUAL.md](docs/MANUAL.md)
+- Manual completo de operación: [docs/MANUAL.md](docs/MANUAL.md)
+- Arquitectura técnica, seguridad, APIs y portabilidad a Windows: [docs/ARQUITECTURA_Y_FUNCIONALIDAD.md](docs/ARQUITECTURA_Y_FUNCIONALIDAD.md)
 - Skill para agentes: [skills/agyc/SKILL.md](skills/agyc/SKILL.md)
 - Licencia: MIT — ver [LICENSE](LICENSE)

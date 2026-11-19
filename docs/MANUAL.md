@@ -5,6 +5,7 @@
 > **Motor soportado:** Google Antigravity CLI `1.5.10+` (binario nativo o Snap `antigravity-cli`)
 > **Suscripciones soportadas:** Google AI Pro (`PRO`) y Google AI Ultra (`ULTRA`)
 > **Plataforma:** Ubuntu Linux x86_64
+> **Referencia técnica:** [Arquitectura y Funcionalidad Técnica](ARQUITECTURA_Y_FUNCIONALIDAD.md)
 
 ---
 

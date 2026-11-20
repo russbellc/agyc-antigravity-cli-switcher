@@ -327,9 +327,6 @@ echo ""
 
 # ── Paso 5: Configurar PATH (sin contaminar SSH_TTY global en el shell) ───────
 echo -e "${BOLD}[5/7] Configurando PATH...${RESET}"
-SHELL_RC="$REAL_HOME/.bashrc"
-[ -n "$ZSH_VERSION" ] && SHELL_RC="$REAL_HOME/.zshrc"
-
 PATH_LINE='export PATH="$HOME/.local/bin:$HOME/.gemini/antigravity-cli/bin:$PATH"'
 
 # Limpiar export SSH_TTY=/dev/pts/0 global heredado de versiones anteriores en ~/.bashrc y ~/.zshrc
@@ -340,20 +337,33 @@ for rc_file in "$REAL_HOME/.bashrc" "$REAL_HOME/.zshrc"; do
     fi
 done
 
-if ! grep -qF '.gemini/antigravity-cli/bin' "$SHELL_RC" 2>/dev/null; then
-    echo "" >> "$SHELL_RC"
-    echo "# agyc — multi-account switcher para Google Antigravity" >> "$SHELL_RC"
-    echo "$PATH_LINE" >> "$SHELL_RC"
-    echo -e "  ${DIM}PATH añadido a $SHELL_RC${RESET}"
-else
-    echo -e "  ${DIM}PATH ya configurado en $SHELL_RC${RESET}"
-fi
+for rc_file in "$REAL_HOME/.bashrc" "$REAL_HOME/.zshrc"; do
+    if [ -f "$rc_file" ] || { [ "$rc_file" = "$REAL_HOME/.zshrc" ] && [ "${SHELL##*/}" = "zsh" ]; } || { [ "$rc_file" = "$REAL_HOME/.bashrc" ] && [ "${SHELL##*/}" != "zsh" ]; }; then
+        if ! grep -qF '.gemini/antigravity-cli/bin' "$rc_file" 2>/dev/null; then
+            echo "" >> "$rc_file"
+            echo "# agyc — multi-account switcher para Google Antigravity" >> "$rc_file"
+            echo "$PATH_LINE" >> "$rc_file"
+            echo -e "  ${DIM}PATH añadido a $rc_file${RESET}"
+        else
+            echo -e "  ${DIM}PATH ya configurado en $rc_file${RESET}"
+        fi
+    fi
+done
 echo -e "${GREEN}✓ PATH configurado${RESET}"
 echo ""
 
 # ── Paso 6: Instalar skill para agentes ───────────────────────────────────────
 echo -e "${BOLD}[6/7] Instalando skill de agente...${RESET}"
 if [ -d "$REAL_HOME/proyectos/.agents/skills" ]; then
+    SKILL_BASE="$REAL_HOME/proyectos/.agents/skills"
+elif [ -d "$REAL_HOME/.agents/skills" ]; then
+    SKILL_BASE="$REAL_HOME/.agents/skills"
+else
+    SKILL_BASE=""
+fi
+
+if [ -n "$SKILL_BASE" ]; then
+    SKILL_DIR="$SKILL_BASE/agyc"
     mkdir -p "$SKILL_DIR"
     cp -f "$SCRIPT_DIR/skills/agyc/SKILL.md" "$SKILL_DIR/SKILL.md"
     echo -e "  ${DIM}→ $SKILL_DIR/SKILL.md${RESET}"

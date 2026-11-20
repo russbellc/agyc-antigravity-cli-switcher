@@ -1003,7 +1003,8 @@ class TestPlatformAbstractionLayer(AgycCoreIsolatedTestCase):
             with open(os.path.join(pdir, "environ"), "wb") as ef:
                 ef.write(b"\x00".join(f"{k}={v}".encode("utf-8") for k, v in env.items()) + b"\x00")
 
-        with mock.patch("os.getuid", create=True, return_value=0):
+        expected_uid = os.stat(fake_proc).st_uid
+        with mock.patch("os.getuid", create=True, return_value=expected_uid):
             found = lin.scan_agy_processes(proc_root=fake_proc)
         by_pid = {item["pid"]: item for item in found}
         self.assertEqual(set(by_pid.keys()), {101, 103})

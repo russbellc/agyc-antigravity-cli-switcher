@@ -379,19 +379,22 @@ echo ""
 echo -e "${BOLD}[7/7] Verificación final...${RESET}"
 if [ -f "$AGY_LIB_DIR/agyc_core.py" ]; then
     PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_LIB_DIR/agyc_core.py" \
-        "$AGY_LIB_DIR/platform/__init__.py" "$AGY_LIB_DIR/platform/linux.py" "$AGY_LIB_DIR/platform/win32.py" && \
-        echo -e "  ${GREEN}✓ Sintaxis Python correcta (lib/agyc_core.py + lib/platform/)${RESET}"
+        "$AGY_LIB_DIR/platform/__init__.py" "$AGY_LIB_DIR/platform/linux.py" "$AGY_LIB_DIR/platform/win32.py"
+    echo -e "  ${GREEN}✓ Sintaxis Python correcta (lib/agyc_core.py + lib/platform/)${RESET}"
 fi
-PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc)${RESET}"
+PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc"
+echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc)${RESET}"
 if [ -f "$AGY_BIN_DIR/agyc-statusline" ]; then
-    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-statusline" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-statusline / agyc-titleline)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-statusline"
+    echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-statusline / agyc-titleline)${RESET}"
 fi
 if [ -f "$AGY_BIN_DIR/agyc-topbar" ] && head -n 1 "$AGY_BIN_DIR/agyc-topbar" 2>/dev/null | grep -q "python"; then
-    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-topbar" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-topbar)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc-topbar"
+    echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc-topbar)${RESET}"
 fi
 if [ -f "$REPO_DIR/tests/test_agyc.py" ]; then
-    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$REPO_DIR/tests" && \
-        echo -e "  ${GREEN}✓ Suite de tests unitarios superada (tests/)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s "$REPO_DIR/tests"
+    echo -e "  ${GREEN}✓ Suite de tests unitarios superada (tests/)${RESET}"
 fi
 
 # Aplicar PATH en sesión actual

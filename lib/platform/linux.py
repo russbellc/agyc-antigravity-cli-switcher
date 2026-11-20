@@ -125,10 +125,22 @@ def read_dir_link(path: str) -> str:
 
 
 def create_file_link(src: str, dst: str) -> None:
-    """Creates a POSIX symlink for a file (`dst` -> `src`)."""
+    """Creates a POSIX symlink for a file (`dst` -> `src`), idempotent if already linked."""
     parent = os.path.dirname(os.path.abspath(dst))
     if parent:
         os.makedirs(parent, exist_ok=True)
+    try:
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            return
+    except OSError:
+        pass
+    if os.path.islink(dst):
+        try:
+            if os.path.realpath(dst) == os.path.realpath(src):
+                return
+            os.unlink(dst)
+        except OSError:
+            pass
     os.symlink(src, dst)
 
 

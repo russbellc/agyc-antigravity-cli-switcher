@@ -7,57 +7,113 @@ and renders live Gemini + Claude quota plus active conversation context in `5H -
 
 import sys
 import os
-import pwd
 import json
 import math
 import time
-import _socket
 from datetime import datetime, timezone
 
+if os.name == "nt":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-def _clean_agyc_home_path(raw: str) -> str | None:
-    if not raw:
-        return None
-    s = raw.strip()
-    if not s or s == "~":
-        return None
-    if "/.agyc_homes/" in s:
-        s = s.split("/.agyc_homes/", 1)[0]
-    elif s.endswith("/.agyc_homes"):
-        s = s[: -len("/.agyc_homes")]
-    s = s.rstrip("/") or "/"
-    return s if os.path.isdir(s) else None
+
+def _strip_agyc_homes_pre(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    norm = s.replace("\\", "/")
+    if "/.agyc_homes/" in norm:
+        s = s[: norm.find("/.agyc_homes/")]
+    elif norm.rstrip("/").endswith("/.agyc_homes"):
+        s = s[: norm.rstrip("/").rfind("/.agyc_homes")]
+    return s.rstrip("/\\") or ("/" if s.startswith("/") else s)
+
+
+def _load_platform():
+    real_here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [os.path.normpath(os.path.join(real_here, "..", "lib"))]
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            candidates.append(os.path.join(la, "agyc", "lib"))
+    for env_k in ("AGYC_REAL_HOME", "REAL_HOME", "USERPROFILE", "HOME"):
+        val = os.environ.get(env_k, "").strip()
+        if val and val != "~":
+            cleaned = _strip_agyc_homes_pre(val)
+            if cleaned:
+                candidates.append(os.path.join(cleaned, ".gemini", "antigravity-cli", "lib"))
+    if os.name != "nt":
+        exp = _strip_agyc_homes_pre(os.path.expanduser("~"))
+        if exp and exp != "~":
+            candidates.append(os.path.join(exp, ".gemini", "antigravity-cli", "lib"))
+            candidates.append(os.path.join(exp, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "lib"))
+        candidates.append("/home/aidev/proyectos/agyc-antigravity-cli-switcher/lib")
+
+    for lib_dir in candidates:
+        plat_init = os.path.join(lib_dir, "platform", "__init__.py")
+        if not os.path.isfile(plat_init):
+            continue
+        parent_dir = os.path.dirname(lib_dir)
+        if parent_dir and parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        try:
+            from lib import platform as mod  # type: ignore
+            if hasattr(mod, "resolve_real_home"):
+                return mod
+        except Exception:
+            pass
+        try:
+            import importlib.util
+            plat_dir = os.path.join(lib_dir, "platform")
+            spec = importlib.util.spec_from_file_location(
+                "_agyc_platform",
+                plat_init,
+                submodule_search_locations=[plat_dir],
+            )
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["_agyc_platform"] = mod
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception:
+            pass
+    return None
+
+
+platform = _load_platform()
+IS_WINDOWS: bool = bool(platform.IS_WINDOWS) if platform is not None else (os.name == "nt")
 
 
 def resolve_real_home() -> str:
     """Resolves real user HOME dynamically, immune to isolated ~/.agyc_homes/<alias> sessions."""
-    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
+    if platform is not None:
+        return platform.resolve_real_home()
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME", "USERPROFILE", "HOME"):
         val = os.environ.get(env_key, "").strip()
-        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
-            cleaned = _clean_agyc_home_path(val)
-            if cleaned:
+        if val and val != "~":
+            cleaned = _strip_agyc_homes_pre(val)
+            if cleaned and os.path.isdir(cleaned):
                 return cleaned
-    try:
-        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
-        cleaned = _clean_agyc_home_path(pw_dir)
-        if cleaned:
-            return cleaned
-    except Exception:
-        pass
-    for raw in (os.environ.get("HOME", ""), os.path.expanduser("~")):
-        cleaned = _clean_agyc_home_path(raw)
-        if cleaned:
-            return cleaned
-    return "/tmp"
+    return os.environ.get("SystemDrive", "C:") + os.sep if IS_WINDOWS else "/tmp"
 
 
 REAL_HOME = resolve_real_home()
-CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
+CACHE_DIR = platform.get_cache_dir(REAL_HOME) if platform is not None else os.path.join(REAL_HOME, ".cache", "agyc")
 CACHE_STALE_SECONDS = 30
 REFRESH_LOCK_SECONDS = 15
 
 
 def ensure_cache_dir() -> str:
+    if platform is not None:
+        try:
+            return platform.ensure_private_dir(CACHE_DIR, 0o700)
+        except Exception:
+            return CACHE_DIR
     try:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
     except Exception:
@@ -242,8 +298,15 @@ def format_compact_countdown(reset_iso: str | None) -> str | None:
 def get_default_active_account() -> str:
     config_paths = [
         os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", "config.json"),
-        os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
     ]
+    if platform is not None:
+        base_cfg = os.path.join(platform.get_base_dir(REAL_HOME), "accounts", "config.json")
+        if base_cfg not in config_paths:
+            config_paths.insert(0, base_cfg)
+    if not IS_WINDOWS:
+        config_paths.append(
+            os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json")
+        )
     for cp in config_paths:
         if os.path.exists(cp):
             try:
@@ -257,69 +320,50 @@ def get_default_active_account() -> str:
 
 
 def scan_proc_agy_panes(default_active: str) -> dict[str, tuple[str, int]]:
-    """Maps HERDR_PANE_ID -> (agy alias, pid) for running agy-real processes via /proc/<pid>/comm."""
+    """Maps HERDR_PANE_ID -> (agy alias, pid) for running agy processes via lib.platform."""
     pane_to_info: dict[str, tuple[str, int]] = {}
+    if platform is None:
+        return pane_to_info
     try:
-        pids = sorted((int(p) for p in os.listdir("/proc") if p.isdigit()))
+        run_dir = platform.get_run_dir(REAL_HOME) if IS_WINDOWS else None
+        procs = platform.scan_agy_processes(run_dir=run_dir)
     except Exception:
         return pane_to_info
 
-    for pid in pids:
-        try:
-            with open(f"/proc/{pid}/comm", "rb") as cf:
-                comm = cf.read().strip()
-            if comm != b"agy-real":
-                continue
-            with open(f"/proc/{pid}/environ", "rb") as ef:
-                env_bytes = ef.read()
-            pane_id = None
-            alias = None
-            for item in env_bytes.split(b"\x00"):
-                if item.startswith(b"HERDR_PANE_ID="):
-                    pane_id = item[14:].decode("utf-8", errors="ignore").strip()
-                elif item.startswith(b"HOME=") or item.startswith(b"ANTIGRAVITY_APP_DATA_DIR="):
-                    val = item.split(b"=", 1)[1].decode("utf-8", errors="ignore")
-                    found = extract_agy_alias(val)
-                    if found:
-                        alias = found
-            if pane_id:
-                pane_to_info[pane_id] = (alias or default_active, pid)
-        except Exception:
+    best_prio: dict[str, tuple[int, int, int, int]] = {}
+    for proc in procs:
+        pane_id = str(proc.get("herdr_pane_id") or "").strip()
+        if not pane_id:
             continue
+        pid = int(proc.get("pid") or 0)
+        raw_alias = proc.get("alias")
+        alias = str(raw_alias).lower() if isinstance(raw_alias, str) and raw_alias.strip() else ""
+        is_running = 1 if proc.get("is_running", True) else 0
+        has_alias = 1 if alias else 0
+        is_real = 1 if "agy-real" in str(proc.get("exe_name") or "").lower() else 0
+        prio = (is_running, has_alias, is_real, pid)
+        prev = best_prio.get(pane_id)
+        if prev is None or prio > prev:
+            best_prio[pane_id] = prio
+            pane_to_info[pane_id] = (alias or default_active, pid)
 
     return pane_to_info
 
 
 def query_herdr_panes() -> list[dict]:
-    """Queries Herdr socket for pane.list with 80ms timeout using C-level _socket."""
-    sock_path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(REAL_HOME, ".config", "herdr", "herdr.sock")
-    if not os.path.exists(sock_path):
+    """Queries Herdr IPC for pane.list with 80ms timeout via lib.platform."""
+    if platform is None:
         return []
-    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    s.settimeout(0.08)
-    try:
-        s.connect(sock_path)
-        s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
-        chunks: list[bytes] = []
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-        raw = b"".join(chunks).split(b"\n", 1)[0]
-        if not raw:
-            return []
-        resp = json.loads(raw.decode("utf-8", errors="replace"))
-        return (resp.get("result") or {}).get("panes") or []
-    except Exception:
+    sock_path = platform.default_herdr_socket_path(REAL_HOME)
+    resp = platform.query_herdr_ipc(
+        sock_path,
+        {"id": "1", "method": "pane.list", "params": {}},
+        timeout=0.08,
+    )
+    if not isinstance(resp, dict):
         return []
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+    panes = (resp.get("result") or {}).get("panes")
+    return panes if isinstance(panes, list) else []
 
 
 def extract_alias_from_pane(
@@ -376,8 +420,13 @@ def detect_target_account(forced_alias: str | None = None) -> tuple[str, str, di
     if not panes:
         if forced_alias:
             return forced_alias, "cli_arg", None
-        for env_k in ("HOME", "ANTIGRAVITY_APP_DATA_DIR"):
-            found = extract_agy_alias(os.environ.get(env_k, ""))
+        for env_k in ("HOME", "USERPROFILE", "ANTIGRAVITY_APP_DATA_DIR"):
+            val = os.environ.get(env_k, "")
+            found = (
+                platform._extract_alias_from_home_path(val)
+                if (platform is not None and val)
+                else extract_agy_alias(val)
+            )
             if found:
                 return found, "env", None
         return default_active, "active_account", None
@@ -625,6 +674,8 @@ def _peek_model_from_transcript_or_settings(transcript_path: str | None, pane: d
 
 
 def _extract_conv_id_from_proc(pid: int) -> str | None:
+    if IS_WINDOWS:
+        return None
     fd_dir = f"/proc/{pid}/fd"
     if not os.path.isdir(fd_dir):
         return None
@@ -789,25 +840,40 @@ def spawn_statusline_refresh(alias: str) -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, "agyc-statusline"),
-        os.path.join(REAL_HOME, ".local", "bin", "agyc-statusline"),
         os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
     ]
-    statusline_bin = next((c for c in candidates if os.path.exists(c)), None)
+    if IS_WINDOWS:
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            candidates.insert(1, os.path.join(la, "agyc", "bin", "agyc-statusline"))
+    else:
+        candidates.insert(1, os.path.join(REAL_HOME, ".local", "bin", "agyc-statusline"))
+    statusline_bin = next((c for c in candidates if os.path.isfile(c)), None)
     if not statusline_bin:
         return
 
     try:
-        import subprocess
         env = os.environ.copy()
         env["HOME"] = REAL_HOME
         env["AGYC_REAL_HOME"] = REAL_HOME
-        subprocess.Popen(
-            [sys.executable, "-S", statusline_bin, "--refresh-quota-bg", alias],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
+        if IS_WINDOWS:
+            env["USERPROFILE"] = REAL_HOME
+        py_exe = sys.executable
+        if IS_WINDOWS and (not py_exe or not os.path.exists(py_exe)):
+            import shutil
+            py_exe = shutil.which("python") or "python"
+        cmd = [py_exe, "-S", statusline_bin, "--refresh-quota-bg", alias]
+        if platform is not None:
+            platform.spawn_detached(cmd, env=env)
+        else:
+            import subprocess
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=not IS_WINDOWS,
+                env=env,
+            )
     except Exception:
         pass
 
@@ -832,7 +898,7 @@ def load_account_quota(alias: str) -> tuple[dict, str | None]:
                 quota = json.load(f)
         except Exception:
             quota = None
-    elif os.path.exists(legacy_cache):
+    elif not IS_WINDOWS and os.path.exists(legacy_cache):
         try:
             with open(legacy_cache, "r", encoding="utf-8") as f:
                 quota = json.load(f)

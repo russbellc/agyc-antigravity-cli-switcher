@@ -1,11 +1,11 @@
 # agyc — Google Antigravity Multi-Account Switcher (v1.6)
 
-> **Administrador multi-cuenta para Google Antigravity CLI 1.5.10+ en Ubuntu Linux**
-> Soporte Google AI Pro (`PRO`) & Google AI Ultra (`ULTRA`) | Detección de paneles en vivo (`EN USO`) | Motor *Reserva ULTRA + Burn-First* | Alertas `≤15%` en Herdr
+> **Administrador multi-cuenta para Google Antigravity CLI 1.5.10+ (Ubuntu Linux + Windows 10/11)**
+> Soporte Google AI Pro (`PRO`) & Google AI Ultra (`ULTRA`) | Detección de paneles en vivo (`EN USO`) | Motor *Reserva ULTRA + Burn-First* | Alertas `≤15%` en Herdr / Toast Win32
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version: v1.6](https://img.shields.io/badge/Version-v1.6-brightgreen.svg)](#historia-de-versiones)
-[![Platform: Ubuntu](https://img.shields.io/badge/Platform-Ubuntu%20Linux-orange.svg)](https://ubuntu.com)
+[![Platform: Linux & Windows](https://img.shields.io/badge/Platform-Ubuntu%20Linux%20%7C%20Windows%2010%2F11-orange.svg)](#requisitos)
 [![Python: 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
 [![Antigravity: 1.5.10+](https://img.shields.io/badge/Google%20Antigravity-1.5.10%2B-red.svg)](https://antigravity.google/docs/cli/reference)
 
@@ -24,9 +24,10 @@
 - 🟢 **Detección en Vivo de Paneles Activos (`EN USO`) y Anti-Colisión** — `agyc list` cruza procesos activos y paneles de Herdr mostrando `EN USO` / `▶ en p2`; `agyc auto` descarta cuentas ocupadas en otros paneles y cuentas `🔒 RESERVADA`.
 - 📝 **Notas y Reservas por Cuenta (`note` / `lock` / `unlock`)** — Anota el propósito de cada cuenta (`agyc note <alias> "<texto>"`) o bloquéala contra rotación automática (`agyc lock <alias> "[motivo]"`), visible en la segunda línea de cada fila de `agyc list` manteniendo **131 columnas** exactas.
 - 🔥 **Motor *"Reserva ULTRA + Burn-First"* (`agyc auto [--allow-ultra]`)** — Protege las suscripciones `ULTRA` para `Gemini 4 Carbon` priorizando cuentas `PRO` saludables en modelos estándar (salvo `--allow-ultra`), y quema primero ventanas móviles `5H` ya abiertas antes de estrenar cuentas al `100% Disponible`.
-- 🔔 **Alerta Inteligente al `≤15%` + Toast Único en Herdr** — Cuando la cuota efectiva baja a `≤15%`, `agyc-statusline` muestra un badge `⚠ ≤15%` (`⚠ AGOTADA` al `0%`), marca `⚠` en el borde del panel Herdr y lanza **un único toast por ciclo** sugiriendo la mejor cuenta libre disponible.
+- 🔔 **Alerta Inteligente al `≤15%` + Toast Único en Herdr / Win32** — Cuando la cuota efectiva baja a `≤15%`, `agyc-statusline` muestra un badge `⚠ ≤15%` (`⚠ AGOTADA` al `0%`), marca `⚠` en el borde del panel Herdr y lanza **un único toast por ciclo** (`herdr` en Linux/Windows o fallback `System.Windows.Forms.NotifyIcon` en Windows) sugiriendo la mejor cuenta libre disponible.
 - 🩺 **Diagnóstico y Auto-Reparación (`agyc doctor [--fix]`)** — Audita y corrige permisos `0700`/`0600`, symlinks rotos, deduplicación de caché `.npm` en `~/.agyc_homes/*` y hooks de `statusLine`, `title` y Herdr.
-- 🧩 **Librería Núcleo `lib/agyc_core.py` + Suite de Tests** — Lógica central desacoplada y verificada con `python3 -m unittest discover -s tests`.
+- 🧩 **Librería Núcleo `lib/agyc_core.py` + Capa `lib/platform/` (`linux.py`, `win32.py`)** — Lógica central desacoplada y capa de abstracción POSIX/Win32 verificada con **38 pruebas unitarias** (`tests/test_agyc.py`).
+- 📦 **Migración Portable entre Equipos (`agyc export` / `agyc import`)** — Exporta e importa vinculaciones OAuth en formato `agyc-bundle-v1` (`0600`) entre **Windows ↔ Ubuntu Linux** sin volver a autenticar en navegador en cada máquina.
 - 💎 **Soporte Google AI Pro (`PRO`) & Google AI Ultra (`ULTRA`)** — Panel compacto de 6 columnas alineado a los **2 grupos unificados de cuotas** de Antigravity `1.5.10` (**Gemini Models** y **Claude & GPT Models**).
 - 🖥️ **Telemetría en Vivo (`5H → Ctx → Sem`)** — Visualización simultánea en el pie de `agy` (`agyc-statusline`), título OSC (`agyc-titleline`), bordes de panel Herdr y barra global superior derecha (`agyc-topbar`).
 
@@ -47,30 +48,41 @@ En Antigravity `1.5.10`, Google unifica el consumo en **2 bolsas globales de cuo
 
 ## Instalación Rápida
 
+### Ubuntu Linux (`x86_64`)
+
 ```bash
 git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
 cd agyc-antigravity-cli-switcher
 chmod +x install.sh
 ./install.sh
-```
-
-Luego recargar el shell:
-
-```bash
 source ~/.bashrc
 ```
 
+### Windows 10/11 (`x86_64`)
+
+```powershell
+git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
+cd agyc-antigravity-cli-switcher
+.\install.ps1
+# o desde CMD / doble clic:
+install.cmd
+```
+
+*(Luego abre una nueva terminal para cargar el `User PATH` actualizado con `%LOCALAPPDATA%\agyc\bin` al inicio; si usas Herdr y la barra superior o los bordes aún no aparecen tras instalar, ejecuta `herdr server reload-config` o cierra y vuelve a abrir solo la ventana de Herdr sin perder sesiones).*
+
 El instalador `v1.6` configura y verifica automáticamente:
-- Librería compartida `lib/agyc_core.py` y `lib/__init__.py` en `~/.gemini/antigravity-cli/lib/` (`0755`/`0644`).
-- Binarios `agyc`, wrapper preservado `agy` (`~/.local/bin/agy` → `agy-real`), `agyc-statusline`, symlink `agyc-titleline -> agyc-statusline` y `agyc-topbar` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`.
-- Lanzadores directos `agy01`..`agy15` y deduplicación `.npm -> ~/.npm` en perfiles aislados `~/.agyc_homes/*`.
-- Bloques `"statusLine"` (`agyc-statusline`) y `"title"` (`agyc-titleline`) en `settings.json` (`0600`), más ejecución de la suite `python3 -m unittest discover -s tests`.
+- **Librería núcleo + capa OS:** `lib/__init__.py`, `lib/agyc_core.py` y `lib/platform/` (`__init__.py`, `linux.py`, `win32.py`) en `~/.gemini/antigravity-cli/lib/` (Linux) o `%USERPROFILE%\.gemini\antigravity-cli\lib\` + `%LOCALAPPDATA%\agyc\lib\` (Windows).
+- **Binarios y wrappers:**
+  - En Linux: `agyc`, wrapper preservado `agy` (`~/.local/bin/agy` → `agy-real`), `agyc-statusline`, symlink `agyc-titleline -> agyc-statusline`, `agyc-topbar` y lanzadores `agy01`..`agy15`.
+  - En Windows: `agyc.cmd`, `agy.cmd` (`bin/agy.cmd`), `agi.cmd`, `agyc-statusline.cmd`, `agyc-titleline.cmd` (`AGYC_INVOKED_AS=agyc-titleline`), `agyc-topbar.cmd` y lanzadores `agy01.cmd`..`agy15.cmd` / `agi01.cmd`..`agi15.cmd` en `%LOCALAPPDATA%\agyc\bin` y `%USERPROFILE%\.gemini\antigravity-cli\bin`.
+- **Aislamiento y deduplicación `.npm`:** symlinks en Linux o **NTFS Junctions** (`mklink /J`, sin requerir Administrador) en `%USERPROFILE%\.agyc_homes\*` y ACLs privadas (`0700`/`0600` o `icacls` vía `harden_ntfs_acl`).
+- **Telemetría, Herdr y tests:** bloques `"statusLine"` y `"title"` en `settings.json`; en Windows autoconfigura `%APPDATA%\herdr\config.toml` (`show_agent_labels_on_pane_borders = true`, `[[ui.tab_bar_right]]` con `agyc-topbar.cmd`, `[ui.toast]`) y ejecuta `herdr server reload-config`; compilación `py_compile` y ejecución automática de `unittest` en `tests/`.
 
 ### Requisitos
 
-- Ubuntu Linux (x86_64)
-- [Google Antigravity CLI](https://antigravity.google/docs/cli/reference) `1.5.10+` (binario nativo o snap)
-- Python 3.10+
+- **Sistema operativo:** Ubuntu Linux (`x86_64`) o Windows 10/11 (`x86_64`)
+- [Google Antigravity CLI](https://antigravity.google/docs/cli/reference) `1.5.10+` (binario nativo o snap en Linux; `%LOCALAPPDATA%\agy\bin\agy.exe` o descargado con `agyc update` en Windows)
+- Python 3.10+ (stdlib puro, sin dependencias externas)
 - Al menos 1 cuenta de [Google AI Pro o Google AI Ultra](https://one.google.com/about/plans)
 
 ---
@@ -133,6 +145,26 @@ agyc auto carbon          # filtra EXCLUSIVAMENTE cuentas ULTRA libres y no bloq
 agyc auto ultra           # alias de 'carbon': rota únicamente entre cuentas Google AI Ultra
 ```
 
+### Migrar vinculaciones entre equipos (`agyc export` / `agyc import`)
+
+Permite trasladar tus cuentas ya vinculadas entre máquinas (**Windows ↔ Ubuntu Linux**) sin repetir el flujo OAuth en navegador en cada equipo:
+
+```bash
+# En el equipo origen (exporta todas o un alias específico en formato agyc-bundle-v1, modo 0600):
+agyc export                               # genera agyc-accounts-bundle.json
+agyc export agy01 -o mi-cuenta.json       # exporta solo agy01 (por defecto agyc-agy01.json)
+
+# Transfiere por un canal cifrado (ej. scp):
+scp agyc-accounts-bundle.json usuario@otro-equipo:~/
+
+# En el equipo destino:
+agyc import ~/agyc-accounts-bundle.json                  # importa, crea HOMEs aislados y sincroniza lanzadores
+agyc import ~/mi-cuenta.json --alias work01 --overwrite  # renombra alias único o reemplaza duplicados
+rm ~/agyc-accounts-bundle.json                           # elimina el bundle tras importar (contiene tokens OAuth)
+```
+
+> **Nota sobre uso simultáneo en paralelo:** Si mantienes los mismos tokens activos en dos equipos a la vez, la renovación automática o rotación de `refresh_token` en un equipo puede invalidar el token en el otro (`invalid_grant`, corregible con `agyc renew <alias>`).
+
 ### Diagnóstico y auto-reparación (`agyc doctor`)
 
 ```bash
@@ -187,8 +219,10 @@ Sugerida libre: agy04 [PRO] (100% 5H) · Ejecuta: agyc auto
 | `agyc auto [--allow-ultra]` | Rotación *Reserva ULTRA + Burn-First* con anti-colisión de paneles activos |
 | `agyc auto [gemini\|claude\|carbon\|ultra]` | Fuerza familia objetivo (`carbon`/`ultra` filtra solo `ULTRA`) |
 | `agyc doctor [--fix]` | Diagnóstico integral y auto-reparación de permisos, symlinks, `.npm` y hooks |
-| `agyc add [alias]` | Registra una nueva cuenta `PRO` o `ULTRA` (OAuth en navegador) |
+| `agyc add [alias]` | Registra nueva cuenta `PRO` o `ULTRA` (OAuth en navegador) |
 | `agyc renew <alias>` | Re-vincula una cuenta cuando Google solicita re-autenticación |
+| `agyc export [alias] [-o <archivo>]` | Exporta una o todas las cuentas a un bundle portable `agyc-bundle-v1` (`0600`) |
+| `agyc import <archivo> [--alias ...] [--overwrite]` | Importa cuentas entre equipos (Windows ↔ Linux), prepara `HOME`s aislados y lanzadores |
 | `agyc update` / `agy update` | Actualiza `lib/`, binarios, barras (`statusline`/`titleline`/`topbar`) y motor `agy` |
 | `agyc switch <alias>` | Cambia la cuenta activa global sin lanzar Antigravity |
 | `agyc default <alias>` | Fija la cuenta predeterminada para `agy` |
@@ -200,25 +234,38 @@ Sugerida libre: agy04 [PRO] (100% 5H) · Ejecuta: agyc auto
 
 ## Arquitectura y Tests
 
-### Aislamiento de perfiles `HOME` y librería núcleo `lib/agyc_core.py`
+### Aislamiento de perfiles `HOME` y librería núcleo `lib/agyc_core.py` + `lib/platform/`
 
 ```text
-~/.gemini/antigravity-cli/
-├── lib/agyc_core.py              ← 🧩 motor compartido (scoring Burn-First, locks/notas, paneles activos, doctor)
-└── bin/                          ← 🚀 agyc, agy, agyc-statusline, agyc-titleline, agyc-topbar, agy01..15
+~/.gemini/antigravity-cli/          (Windows: %USERPROFILE%\.gemini\antigravity-cli\)
+├── lib/
+│   ├── __init__.py
+│   ├── agyc_core.py                ← 🧩 motor compartido (scoring Burn-First, locks/notas, paneles activos, doctor)
+│   └── platform/                   ← 🌐 abstracción OS POSIX + Win32 (<2ms bajo python -S)
+│       ├── __init__.py             ←    selector IS_WINDOWS + helpers de rutas/alias
+│       ├── linux.py                ←    symlinks, fcntl.flock, AF_UNIX, /proc ELF, select
+│       └── win32.py                ←    NTFS Junctions (mklink /J), icacls, msvcrt.locking,
+│                                        CreateToolhelp32Snapshot, PeekNamedPipe, Herdr TCP, Toast
+└── bin/                            ← 🚀 Linux: agyc, agy, statusline, titleline, topbar, agy01..15
+                                       Windows (%LOCALAPPDATA%\agyc\bin\): agyc.cmd, agy.cmd,
+                                       agyc-statusline.cmd, agyc-titleline.cmd, agyc-topbar.cmd, agy01..15.cmd
 
-~/.agyc_homes/
+~/.cache/agyc/                      (Windows: %LOCALAPPDATA%\agyc\cache\)
+├── locks/                          ← 🔒 locks de sesión OAuth y deduplicación de alertas
+└── run/                            ← 📋 registro <pid>.json usado en Windows por scan_agy_processes()
+
+~/.agyc_homes/                      (Windows: %USERPROFILE%\.agyc_homes\)
 ├── agy01/
-│   ├── .npm                      ← 🔗 symlink deduplicado → ~/.npm (ahorro de caché MCP/npx)
+│   ├── .npm                        ← 🔗 symlink deduplicado → ~/.npm (ahorro de caché MCP/npx)
 │   └── .gemini/antigravity-cli/
 │       ├── antigravity-oauth-token ← 🔒 token exclusivo 0600 (dev1@gmail.com - ULTRA)
 │       ├── lib/                    ← 🔗 symlink compartido → ~/.gemini/antigravity-cli/lib
-│       ├── settings.json           ← 🔗 symlink compartido (statusLine + title)
+│       ├── settings.json           ← 🔒 configuración por perfil (statusLine + title)
 │       ├── accounts/               ← 🔗 symlink compartido
 │       ├── conversations/          ← 🔗 symlink compartido
 │       └── brain/                  ← 🔗 symlink compartido
-├── agy02/...                     ← 🔒 token exclusivo 0600 (dev2@gmail.com - PRO)
-└── agy03/...                     ← 🔒 token exclusivo 0600 (dev3@gmail.com - PRO)
+├── agy02/...                       ← 🔒 token exclusivo 0600 (dev2@gmail.com - PRO)
+└── agy03/...                       ← 🔒 token exclusivo 0600 (dev3@gmail.com - PRO)
 ```
 
 ### Algoritmo *"Reserva ULTRA + Burn-First"* (`agyc auto`)
@@ -237,10 +284,20 @@ Sugerida libre: agy04 [PRO] (100% 5H) · Ejecuta: agyc auto
    una cuenta íntegra al 100% Disponible, maximizando la regeneración paralela de ciclos de 5h.
 ```
 
-### Ejecutar la suite de tests unitarios
+### Ejecutar la suite de tests unitarios (38 pruebas)
+
+En **Ubuntu Linux**:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+En **Windows 10/11 (PowerShell / CMD)**:
+
+```powershell
+python -B -m unittest discover -s tests
+# o sin -B:
+python -m unittest discover -s tests
 ```
 
 ---
@@ -255,13 +312,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 | **v1.3** | Oct 15, 2026 | Perfiles `HOME` aislados (`prepare_isolated_home()`), ejecución paralela sin colisiones |
 | **v1.4** | Oct 16, 2026 | Soporte preliminar para Gemini 4 Argon, wrapper `bin/agy` y actualizador `agyc update` |
 | **v1.5** | Nov 2026 | Esquema oficial **Antigravity 1.5.10** (`PRO` / `ULTRA`, 2 grupos unificados `Gemini` y `Claude & GPT`), Top/Bottom Bar en vivo con `% Ctx` real y orden unificado `5H → Ctx → Sem` |
-| **v1.6** | Nov 2026 | Detección en vivo de paneles activos (`EN USO` / `▶ en pX`) y anti-colisión, notas y reservas (`agyc note`, `agyc lock`/`unlock` en 131 cols), motor **Reserva ULTRA + Burn-First** (`agyc auto [--allow-ultra]`), **alerta `≤15%` + toast único en Herdr**, diagnóstico `agyc doctor [--fix]`, librería `lib/agyc_core.py` y suite de tests `tests/` |
+| **v1.6** | Nov 2026 | Detección en vivo de paneles activos (`EN USO` / `▶ en pX`) y anti-colisión, notas y reservas (`agyc note`, `agyc lock`/`unlock` en 131 cols), motor **Reserva ULTRA + Burn-First** (`agyc auto [--allow-ultra]`), **alerta `≤15%` + toast único en Herdr/Win32**, `agyc doctor [--fix]`, librería `lib/agyc_core.py`, soporte nativo **Windows 10/11 + Ubuntu Linux** (`lib/platform/`, `install.ps1`, `install.cmd`, `bin/agy.cmd`), migración portable (`agyc export` / `agyc import`) y **38 pruebas** en `tests/test_agyc.py` |
 
 ---
 
 ## Documentación Adicional y Licencia
 
 - Manual completo de operación: [docs/MANUAL.md](docs/MANUAL.md)
-- Arquitectura técnica, seguridad, APIs y portabilidad a Windows: [docs/ARQUITECTURA_Y_FUNCIONALIDAD.md](docs/ARQUITECTURA_Y_FUNCIONALIDAD.md)
+- Arquitectura técnica, seguridad, APIs y soporte multiplataforma (`lib/platform/`): [docs/ARQUITECTURA_Y_FUNCIONALIDAD.md](docs/ARQUITECTURA_Y_FUNCIONALIDAD.md)
 - Skill para agentes: [skills/agyc/SKILL.md](skills/agyc/SKILL.md)
 - Licencia: MIT — ver [LICENSE](LICENSE)

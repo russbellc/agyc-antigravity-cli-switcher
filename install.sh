@@ -132,11 +132,11 @@ echo ""
 # ── Paso 3: Instalar lib/agyc_core.py, agyc, wrapper agy y barras ────────────
 echo -e "${BOLD}[3/7] Instalando librería núcleo, agyc, wrapper agy, statusline, titleline y topbar...${RESET}"
 
-# 0. Instalar lib/agyc_core.py y lib/__init__.py (si existen en $REPO_DIR/lib) con permisos 0755/0644
+# 0. Instalar lib/agyc_core.py, lib/__init__.py y lib/platform/* (si existen en $REPO_DIR/lib) con permisos 0755/0644
 if [ -d "$REPO_DIR/lib" ]; then
-    mkdir -p -m 755 "$AGY_LIB_DIR"
-    chmod 755 "$AGY_LIB_DIR"
-    for lib_file in "__init__.py" "agyc_core.py"; do
+    mkdir -p -m 755 "$AGY_LIB_DIR" "$AGY_LIB_DIR/platform"
+    chmod 755 "$AGY_LIB_DIR" "$AGY_LIB_DIR/platform"
+    for lib_file in "__init__.py" "agyc_core.py" "platform/__init__.py" "platform/linux.py" "platform/win32.py"; do
         if [ -f "$REPO_DIR/lib/$lib_file" ]; then
             rm -f "$AGY_LIB_DIR/$lib_file"
             cp -f "$REPO_DIR/lib/$lib_file" "$AGY_LIB_DIR/$lib_file"
@@ -228,8 +228,8 @@ fi
 # 5. Sincronizar a ruta snap si existe
 if [ -d "$(dirname "$SNAP_BIN_DIR")" ]; then
     if [ -d "$REPO_DIR/lib" ]; then
-        mkdir -p -m 755 "$SNAP_LIB_DIR" 2>/dev/null || true
-        for lib_file in "__init__.py" "agyc_core.py"; do
+        mkdir -p -m 755 "$SNAP_LIB_DIR" "$SNAP_LIB_DIR/platform" 2>/dev/null || true
+        for lib_file in "__init__.py" "agyc_core.py" "platform/__init__.py" "platform/linux.py" "platform/win32.py"; do
             if [ -f "$REPO_DIR/lib/$lib_file" ]; then
                 cp -f "$REPO_DIR/lib/$lib_file" "$SNAP_LIB_DIR/$lib_file" 2>/dev/null && \
                     chmod 644 "$SNAP_LIB_DIR/$lib_file" 2>/dev/null || true
@@ -368,8 +368,9 @@ echo ""
 # ── Paso 7: Verificación final ────────────────────────────────────────────────
 echo -e "${BOLD}[7/7] Verificación final...${RESET}"
 if [ -f "$AGY_LIB_DIR/agyc_core.py" ]; then
-    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_LIB_DIR/agyc_core.py" && \
-        echo -e "  ${GREEN}✓ Sintaxis Python correcta (lib/agyc_core.py)${RESET}"
+    PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_LIB_DIR/agyc_core.py" \
+        "$AGY_LIB_DIR/platform/__init__.py" "$AGY_LIB_DIR/platform/linux.py" "$AGY_LIB_DIR/platform/win32.py" && \
+        echo -e "  ${GREEN}✓ Sintaxis Python correcta (lib/agyc_core.py + lib/platform/)${RESET}"
 fi
 PYTHONDONTWRITEBYTECODE=1 python3 -m py_compile "$AGY_BIN_DIR/agyc" && echo -e "  ${GREEN}✓ Sintaxis Python correcta (agyc)${RESET}"
 if [ -f "$AGY_BIN_DIR/agyc-statusline" ]; then

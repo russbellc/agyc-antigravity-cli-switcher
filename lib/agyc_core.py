@@ -1,8 +1,8 @@
 """
 agyc_core: Shared pure-stdlib core for agyc, agyc-statusline, and agyc-topbar.
 
-Designed for <2ms import latency under `python3 -S` (heavy modules such as
-`json`, `pwd`, and `_socket` are imported lazily inside functions).
+Designed for <2ms import latency under `python -S` (heavy modules such as
+`json`, `pwd`, `ctypes`, `subprocess`, and `_socket` are imported lazily inside functions).
 """
 
 from __future__ import annotations
@@ -11,6 +11,41 @@ import math
 import os
 import time
 from datetime import datetime, timezone
+
+_platform_mod = None
+
+
+def _plat():
+    """Lazily loads `lib.platform` without polluting `sys.modules['platform']`."""
+    global _platform_mod
+    if _platform_mod is not None:
+        return _platform_mod
+    if __package__:
+        from . import platform as mod
+    else:
+        import sys as _sys
+
+        _lib_dir = os.path.dirname(os.path.abspath(__file__))
+        _parent_dir = os.path.dirname(_lib_dir)
+        if os.path.basename(_lib_dir) == "lib" and _parent_dir:
+            if _parent_dir not in _sys.path:
+                _sys.path.insert(0, _parent_dir)
+            from lib import platform as mod
+        else:
+            import importlib.util as _ilu
+
+            _plat_dir = os.path.join(_lib_dir, "platform")
+            _spec = _ilu.spec_from_file_location(
+                "_agyc_platform",
+                os.path.join(_plat_dir, "__init__.py"),
+                submodule_search_locations=[_plat_dir],
+            )
+            assert _spec is not None and _spec.loader is not None
+            mod = _ilu.module_from_spec(_spec)
+            _sys.modules["_agyc_platform"] = mod
+            _spec.loader.exec_module(mod)
+    _platform_mod = mod
+    return mod
 
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
 
@@ -49,6 +84,8 @@ RESERVED_ALIASES: frozenset[str] = frozenset({
     "purge",
     "update",
     "upgrade",
+    "export",
+    "import",
     "help",
     "status",
     "version",
@@ -96,91 +133,45 @@ _SECRET_SUBSTRINGS: tuple[str, ...] = (
 
 
 def _has_agyc_homes_segment(path: str) -> bool:
-    s = (path or "").strip()
-    return "/.agyc_homes/" in s or s.rstrip("/").endswith("/.agyc_homes")
+    return _plat()._has_agyc_homes_segment(path)
 
 
 def _strip_agyc_homes(path: str) -> str:
-    s = (path or "").strip()
-    if "/.agyc_homes/" in s:
-        s = s.split("/.agyc_homes/", 1)[0]
-    elif s.endswith("/.agyc_homes"):
-        s = s[: -len("/.agyc_homes")]
-    elif s.rstrip("/").endswith("/.agyc_homes"):
-        s = s.rstrip("/")[: -len("/.agyc_homes")]
-    return s.rstrip("/") or "/"
+    return _plat()._strip_agyc_homes(path)
 
 
 def resolve_real_home() -> str:
-    """Resolves real user HOME ignoring isolated `/.agyc_homes/` values."""
-    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
-        val = os.environ.get(env_key, "").strip()
-        if val and val != "~" and not _has_agyc_homes_segment(val):
-            cleaned = val.rstrip("/") or "/"
-            if os.path.isdir(cleaned):
-                return cleaned
-
-    try:
-        import pwd
-
-        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
-        if pw_dir:
-            cleaned_pw = _strip_agyc_homes(pw_dir)
-            if cleaned_pw and os.path.isdir(cleaned_pw):
-                return cleaned_pw
-    except Exception:
-        pass
-
-    home_env = os.environ.get("HOME", "").strip()
-    if home_env and home_env != "~" and not _has_agyc_homes_segment(home_env):
-        cleaned_home = home_env.rstrip("/") or "/"
-        if os.path.isdir(cleaned_home):
-            return cleaned_home
-
-    return "/home/aidev"
+    """Resolves real user HOME ignoring isolated `.agyc_homes` values."""
+    return _plat().resolve_real_home()
 
 
 def _ensure_private_dir(path: str, mode: int = 0o700) -> str:
-    os.makedirs(path, mode=mode, exist_ok=True)
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
-    return path
+    return _plat().ensure_private_dir(path, mode)
 
 
 def get_base_dir(real_home: str | None = None) -> str:
     """Returns Antigravity CLI base directory (`~/.gemini/antigravity-cli`), immune to `.agyc_homes`."""
-    rh = _strip_agyc_homes(real_home) if real_home else resolve_real_home()
-    candidates: list[str | None] = []
-    if real_home is None:
-        candidates.append(os.environ.get("ANTIGRAVITY_HOME"))
-        candidates.append(os.environ.get("AGY_CONFIG_DIR"))
-    candidates.append(os.path.join(rh, ".gemini", "antigravity-cli"))
-    candidates.append(os.path.join(rh, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"))
-
-    for cand in candidates:
-        if cand and not _has_agyc_homes_segment(cand) and os.path.exists(cand):
-            return cand.rstrip("/") or "/"
-
-    default_path = os.path.join(rh, ".gemini", "antigravity-cli")
-    return _ensure_private_dir(default_path, 0o700)
+    return _plat().get_base_dir(real_home)
 
 
 def get_accounts_dir(real_home: str | None = None) -> str:
-    """Returns `~/.gemini/antigravity-cli/accounts` with strict `0700` permissions."""
-    return _ensure_private_dir(os.path.join(get_base_dir(real_home), "accounts"), 0o700)
+    """Returns `<base_dir>/accounts` with private directory permissions."""
+    return _plat().ensure_private_dir(os.path.join(get_base_dir(real_home), "accounts"), 0o700)
 
 
 def get_cache_dir(real_home: str | None = None) -> str:
-    """Returns `~/.cache/agyc` with strict `0700` permissions."""
-    rh = _strip_agyc_homes(real_home) if real_home else resolve_real_home()
-    return _ensure_private_dir(os.path.join(rh, ".cache", "agyc"), 0o700)
+    """Returns platform cache directory (`~/.cache/agyc` or `%LOCALAPPDATA%\\agyc\\cache`)."""
+    return _plat().get_cache_dir(real_home)
 
 
 def get_locks_dir(real_home: str | None = None) -> str:
-    """Returns `~/.cache/agyc/locks` with strict `0700` permissions."""
-    return _ensure_private_dir(os.path.join(get_cache_dir(real_home), "locks"), 0o700)
+    """Returns `<cache_dir>/locks`."""
+    return _plat().get_locks_dir(real_home)
+
+
+def get_run_dir(real_home: str | None = None) -> str:
+    """Returns `<cache_dir>/run`."""
+    return _plat().get_run_dir(real_home)
 
 
 def normalize_alias(alias: str) -> str:
@@ -272,8 +263,18 @@ def atomic_write_json(
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=indent, ensure_ascii=False)
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
+        if os.name != "nt":
+            os.chmod(tmp_path, mode)
+            os.replace(tmp_path, path)
+        else:
+            for attempt in range(4):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.005)
     except Exception:
         try:
             if os.path.exists(tmp_path):
@@ -661,10 +662,11 @@ def estimate_context_from_transcript(transcript_path: str, max_tokens: int) -> t
 def _extract_alias_from_home_path(path_val: str) -> str | None:
     if not path_val:
         return None
+    norm = path_val.replace("\\", "/")
     marker = "/.agyc_homes/"
-    idx = path_val.find(marker)
+    idx = norm.find(marker)
     if idx != -1:
-        rest = path_val[idx + len(marker) :]
+        rest = norm[idx + len(marker) :]
         seg = rest.split("/", 1)[0].strip()
         if seg:
             try:
@@ -672,39 +674,6 @@ def _extract_alias_from_home_path(path_val: str) -> str | None:
             except ValueError:
                 pass
     return extract_agy_alias(path_val)
-
-
-def _is_elf_agy_binary(proc_dir: str, comm: bytes) -> bool:
-    if comm == b"agy-real":
-        return True
-    if comm not in (b"agy", b"antigravity"):
-        return False
-    exe_link = os.path.join(proc_dir, "exe")
-    try:
-        target = os.readlink(exe_link)
-        base = os.path.basename(target).lower()
-        if base.startswith(("python", "bash", "sh", "dash", "zsh", "node", "perl")):
-            return False
-    except OSError:
-        pass
-    try:
-        with open(exe_link, "rb") as ef:
-            return ef.read(4) == b"\x7fELF"
-    except OSError:
-        return False
-
-
-def _read_proc_state_only(proc_dir: str) -> bytes:
-    """Reads 1-byte task state (`R`, `S`, `D`, `T`, `Z`, ...) only for matched `agy` processes."""
-    try:
-        with open(os.path.join(proc_dir, "stat"), "rb") as sf:
-            data = sf.read(128)
-        rparen = data.rfind(b")")
-        if rparen != -1 and rparen + 3 <= len(data):
-            return data[rparen + 2 : rparen + 3] or b"S"
-    except OSError:
-        pass
-    return b"S"
 
 
 def _read_default_active_account(rh: str) -> str | None:
@@ -727,44 +696,21 @@ def _read_default_active_account(rh: str) -> str | None:
 
 
 def _query_herdr_pane_list(sock_path: str, timeout: float = 0.06) -> tuple[bool, dict[str, dict]]:
-    import _socket
-    import json
-
-    if not sock_path or not os.path.exists(sock_path):
+    resp = _plat().query_herdr_ipc(
+        sock_path,
+        {"id": "1", "method": "pane.list", "params": {}},
+        timeout=timeout,
+    )
+    if not isinstance(resp, dict):
         return False, {}
-
-    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(sock_path)
-        s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
-        chunks: list[bytes] = []
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-        raw_line = b"".join(chunks).split(b"\n", 1)[0]
-        if not raw_line:
-            return False, {}
-        resp = json.loads(raw_line.decode("utf-8", errors="replace"))
-        panes = (resp.get("result") or {}).get("panes")
-        if not isinstance(panes, list):
-            return False, {}
-        by_id: dict[str, dict] = {}
-        for p in panes:
-            if isinstance(p, dict) and isinstance(p.get("pane_id"), str) and p["pane_id"]:
-                by_id[p["pane_id"]] = p
-        return True, by_id
-    except Exception:
+    panes = (resp.get("result") or {}).get("panes")
+    if not isinstance(panes, list):
         return False, {}
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+    by_id: dict[str, dict] = {}
+    for p in panes:
+        if isinstance(p, dict) and isinstance(p.get("pane_id"), str) and p["pane_id"]:
+            by_id[p["pane_id"]] = p
+    return True, by_id
 
 
 def scan_active_herdr_panes(
@@ -772,78 +718,47 @@ def scan_active_herdr_panes(
     *,
     proc_root: str = "/proc",
     herdr_socket_path: str | None = None,
+    run_dir: str | None = None,
 ) -> dict[str, list[dict]]:
     """
-    Scans `/proc/[0-9]*` for live `agy-real` (or ELF `agy`) processes owned by current UID,
-    cross-references with Herdr UNIX socket (`pane.list`, timeout `0.06s`), discards dead panes,
-    deduplicates subprocesses per `pane_id`, and returns `dict[alias, list[dict]]` in `<8ms`.
+    Scans live `agy-real` / `agy` processes (via `/proc` on Linux or Toolhelp32 + `<pid>.json` on Windows),
+    cross-references with Herdr IPC (`pane.list`, timeout `0.06s`), discards dead panes,
+    deduplicates subprocesses per `pane_id`, and returns `dict[alias, list[dict]]`.
     """
+    plat = _plat()
     rh = _strip_agyc_homes(real_home) if real_home else resolve_real_home()
-    uid = os.getuid()
+    if run_dir is not None:
+        resolved_run_dir: str | None = run_dir
+    elif os.name == "nt":
+        resolved_run_dir = plat.get_run_dir(rh)
+    else:
+        resolved_run_dir = None
+
+    procs = plat.scan_agy_processes(proc_root=proc_root, run_dir=resolved_run_dir)
 
     # Map pane_id -> (priority_tuple, pid, env_alias_or_none)
-    live_by_pane: dict[str, tuple[tuple[int, int, int], int, str | None]] = {}
+    live_by_pane: dict[str, tuple[tuple[int, int, int, int], int, str | None]] = {}
+    for proc in procs:
+        pane_id = str(proc.get("herdr_pane_id") or "").strip()
+        if not pane_id:
+            continue
+        raw_alias = proc.get("alias")
+        env_alias: str | None = None
+        if isinstance(raw_alias, str) and raw_alias.strip():
+            try:
+                env_alias = validate_alias(raw_alias.strip())
+            except ValueError:
+                env_alias = extract_agy_alias(raw_alias)
 
-    try:
-        with os.scandir(proc_root) as it:
-            for entry in it:
-                name = entry.name
-                if not name.isdigit():
-                    continue
-                try:
-                    if entry.stat(follow_symlinks=False).st_uid != uid:
-                        continue
-                    pdir = entry.path
-                    fd_c = os.open(f"{pdir}/comm", os.O_RDONLY)
-                    try:
-                        comm = os.read(fd_c, 32).strip()
-                    finally:
-                        os.close(fd_c)
-                    if not _is_elf_agy_binary(pdir, comm):
-                        continue
-                    state = _read_proc_state_only(pdir)
-                    if state in (b"Z", b"X"):
-                        continue
+        pid = int(proc["pid"])
+        is_running = 1 if proc.get("is_running", True) else 0
+        has_explicit_alias = 1 if env_alias else 0
+        is_real = 1 if "agy-real" in str(proc.get("exe_name") or "").lower() else 0
+        prio = (is_running, has_explicit_alias, is_real, pid)
 
-                    fd_e = os.open(f"{pdir}/environ", os.O_RDONLY)
-                    try:
-                        env_raw = os.read(fd_e, 65536)
-                    finally:
-                        os.close(fd_e)
-                except OSError:
-                    continue
-
-                pane_id: str | None = None
-                env_alias: str | None = None
-                for item in env_raw.split(b"\x00"):
-                    if item.startswith(b"HERDR_PANE_ID="):
-                        pane_id = item[14:].decode("utf-8", errors="ignore").strip()
-                    elif item.startswith((b"HOME=", b"ANTIGRAVITY_APP_DATA_DIR=")):
-                        val = item.split(b"=", 1)[1].decode("utf-8", errors="ignore")
-                        cand = _extract_alias_from_home_path(val)
-                        if cand:
-                            env_alias = cand
-                    elif item.startswith((b"AGYC_ACCOUNT=", b"AGYC_ALIAS=")) and not env_alias:
-                        val = item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
-                        if val:
-                            try:
-                                env_alias = validate_alias(val)
-                            except ValueError:
-                                pass
-
-                if not pane_id:
-                    continue
-
-                pid = int(name)
-                is_running = 1 if state not in (b"T", b"t") else 0
-                has_explicit_alias = 1 if env_alias else 0
-                prio = (is_running, has_explicit_alias, pid)
-
-                prev = live_by_pane.get(pane_id)
-                if prev is None or prio > prev[0]:
-                    live_by_pane[pane_id] = (prio, pid, env_alias)
-    except OSError:
-        return {}
+        prev = live_by_pane.get(pane_id)
+        if prev is None or prio > prev[0]:
+            live_by_pane[pane_id] = (prio, pid, env_alias)
 
     if not live_by_pane:
         return {}
@@ -851,7 +766,7 @@ def scan_active_herdr_panes(
     sock_path = (
         herdr_socket_path
         if herdr_socket_path is not None
-        else (os.environ.get("HERDR_SOCKET_PATH") or os.path.join(rh, ".config", "herdr", "herdr.sock"))
+        else plat.default_herdr_socket_path(rh)
     )
     herdr_online, herdr_panes = _query_herdr_pane_list(sock_path, timeout=0.06)
     fallback_alias: str | None = None
@@ -1199,6 +1114,7 @@ __all__ = [
     "get_accounts_dir",
     "get_cache_dir",
     "get_locks_dir",
+    "get_run_dir",
     "normalize_alias",
     "validate_alias",
     "extract_agy_alias",

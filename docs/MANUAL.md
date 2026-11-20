@@ -4,7 +4,7 @@
 > **Versión:** v1.6 | **Fecha:** Noviembre 2026
 > **Motor soportado:** Google Antigravity CLI `1.5.10+` (binario nativo o Snap `antigravity-cli`)
 > **Suscripciones soportadas:** Google AI Pro (`PRO`) y Google AI Ultra (`ULTRA`)
-> **Plataforma:** Ubuntu Linux x86_64
+> **Plataforma:** Ubuntu Linux x86_64 y Windows 10/11 x86_64 (`lib/platform/`)
 > **Referencia técnica:** [Arquitectura y Funcionalidad Técnica](ARQUITECTURA_Y_FUNCIONALIDAD.md)
 
 ---
@@ -21,10 +21,10 @@
 8. [Uso en Múltiples Paneles y Detección `EN USO` (Anti-Colisión)](#8-uso-en-múltiples-paneles-y-detección-en-uso-anti-colisión)
 9. [Motor *"Reserva ULTRA + Burn-First"* (`agyc auto [--allow-ultra]`)](#9-motor-reserva-ultra--burn-first-agyc-auto---allow-ultra)
 10. [Diagnóstico y Auto-Reparación (`agyc doctor [--fix]`)](#10-diagnóstico-y-auto-reparación-agyc-doctor---fix)
-11. [Librería Núcleo `lib/agyc_core.py` y Suite de Tests](#11-librería-núcleo-libagyc_corepy-y-suite-de-tests)
+11. [Librería Núcleo `lib/agyc_core.py`, Capa `lib/platform/` y Suite de Tests](#11-librería-núcleo-libagyc_corepy-capa-libplatform-y-suite-de-tests)
 12. [Gestión de Tokens, Elegibilidad y Keyring](#12-gestión-de-tokens-elegibilidad-y-keyring)
 13. [Skill para el Agente de Antigravity](#13-skill-para-el-agente-de-antigravity)
-14. [`agyc wipe` y `agyc update`](#14-agyc-wipe-y-agyc-update)
+14. [Portabilidad entre Equipos (`agyc export` / `agyc import`), `agyc wipe` y `agyc update`](#14-portabilidad-entre-equipos-agyc-export--agyc-import-agyc-wipe-y-agyc-update)
 15. [Historia de Versiones y Decisiones de Diseño](#15-historia-de-versiones-y-decisiones-de-diseño)
 
 ---
@@ -39,7 +39,7 @@ Google Antigravity CLI (`agy`) opera por defecto con una única sesión OAuth ac
 - Detecta en vivo qué cuentas están **`EN USO`** en paneles activos (`▶ en p2`) y cuáles están **`🔒 RESERVADA`** (`agyc lock`), evitando choques al rotar.
 - Permite asignar **notas y reservas con motivo** por cuenta visibles en la segunda línea de cada fila de `agyc list` manteniendo **131 columnas** exactas.
 - Implementa el motor ***"Reserva ULTRA + Burn-First"*** en `agyc auto [--allow-ultra]` y dispara una **alerta visual + Toast único por ciclo en Herdr** cuando cualquier ventana cae a **`≤15%`**.
-- Incluye diagnóstico integral y auto-reparación con **`agyc doctor [--fix]`**, núcleo modular en **`lib/agyc_core.py`** y suite automatizada de pruebas unitarias.
+- Incluye diagnóstico integral y auto-reparación con **`agyc doctor [--fix]`**, migración portable entre equipos (**`agyc export` / `agyc import`**), núcleo modular en **`lib/agyc_core.py`**, capa multiplataforma **`lib/platform/`** (`linux.py` + `win32.py`) y suite automatizada de **38 pruebas unitarias** (`tests/test_agyc.py`).
 
 ---
 
@@ -68,7 +68,7 @@ Todas las cuotas de modelos se consolidan en **2 grupos unificados** por cuenta 
 
 ## 3. Instalación (`v1.6`)
 
-### Instalación automática desde el repositorio
+### Ubuntu Linux (`install.sh`)
 
 ```bash
 git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
@@ -78,12 +78,41 @@ chmod +x install.sh
 source ~/.bashrc
 ```
 
-### Qué realiza `install.sh` en `v1.6`
-
+Qué realiza `install.sh` en `v1.6`:
 1. **Endurecimiento de permisos (`0700` / `0600`) y deduplicación `.npm`:** Asegura permisos privados en `~/.agyc_homes`, `~/.gemini/antigravity-cli/accounts` y `~/.cache/agyc`, y enlaza `~/.agyc_homes/<alias>/.npm -> ~/.npm` para evitar duplicar cachés de servidores MCP/`npx`.
-2. **Librería núcleo `lib/agyc_core.py`:** Copia `lib/__init__.py` y `lib/agyc_core.py` hacia `~/.gemini/antigravity-cli/lib/` (`0755` / `0644`) y enlaza `lib/` en perfiles aislados.
+2. **Librería núcleo `lib/agyc_core.py` + `lib/platform/`:** Copia `lib/__init__.py`, `lib/agyc_core.py` y `lib/platform/{__init__.py,linux.py,win32.py}` hacia `~/.gemini/antigravity-cli/lib/` (`0755` / `0644`) y enlaza `lib/` en perfiles aislados.
 3. **Binarios, wrapper `agy` y barras en vivo:** Instala `agyc`, preserva `agy-real` + wrapper `bin/agy`, instala `agyc-statusline`, crea el symlink `agyc-titleline -> agyc-statusline` e instala `agyc-topbar` en `~/.gemini/antigravity-cli/bin/` y `~/.local/bin/`.
-4. **Hooks TUI, lanzadores `agy01..agy15` y verificación unitaria:** Activa `"statusLine"` y `"title"` en `settings.json` (`0600`), instala `skills/agyc/SKILL.md`, valida sintaxis Python y ejecuta `python3 -m unittest discover -s tests` si está presente.
+4. **Hooks TUI, lanzadores `agy01..agy15` y verificación unitaria:** Activa `"statusLine"` y `"title"` en `settings.json` (`0600`), instala `skills/agyc/SKILL.md`, valida sintaxis Python y ejecuta `python3 -m unittest discover -s tests`.
+
+### Windows 10/11 (`install.ps1` / `install.cmd`)
+
+```powershell
+git clone https://github.com/russbellc/agyc-antigravity-cli-switcher.git
+cd agyc-antigravity-cli-switcher
+.\install.ps1
+# o desde CMD / doble clic (ejecuta powershell.exe -ExecutionPolicy Bypass -File install.ps1):
+install.cmd
+```
+
+Qué realiza `install.ps1` en `v1.6` (admite `-SkipPath` y `-SkipTests`):
+1. **Detección de Python 3.10+ y motor Antigravity:** Busca `python`, `py -3` o `python3` (`>= 3.10`) y localiza `agy-real.exe` o `%LOCALAPPDATA%\agy\bin\agy.exe`.
+2. **Rutas Windows y seguridad NTFS:** Crea `%USERPROFILE%\.gemini\antigravity-cli`, `%LOCALAPPDATA%\agyc\{bin,lib,cache,cache\locks,cache\run}` y `%USERPROFILE%\.agyc_homes`. Endurece ACLs NTFS restringidas al SID del usuario actual (`harden_ntfs_acl()` vía `whoami /user` + `icacls`) y deduplica `.npm` mediante **NTFS Junctions** (`cmd /c mklink /J`, sin privilegios de Administrador).
+3. **Librería `lib/` y wrappers `.cmd`:** Instala `lib/__init__.py`, `lib/agyc_core.py` y `lib/platform/*` en `%USERPROFILE%\.gemini\antigravity-cli\lib` y `%LOCALAPPDATA%\agyc\lib`, enlaza `lib/` en perfiles aislados vía NTFS Junction, e instala `agyc.cmd`, `agy.cmd` (`bin/agy.cmd`), `agi.cmd`, `agyc-statusline.cmd`, `agyc-titleline.cmd` (`AGYC_INVOKED_AS=agyc-titleline`), `agyc-topbar.cmd` y los lanzadores directos `agy01.cmd..agy15.cmd` / `agi01.cmd..agi15.cmd` en `%LOCALAPPDATA%\agyc\bin` y `%USERPROFILE%\.gemini\antigravity-cli\bin`.
+4. **Hooks, Herdr, `User PATH` y verificación:** Configura `"statusLine": "agyc-statusline.cmd"` y `"title": "agyc-titleline.cmd"` en `settings.json`, autoconfigura `%APPDATA%\herdr\config.toml` (`show_agent_labels_on_pane_borders = true`, `[[ui.tab_bar_right]]` `agyc-topbar.cmd`, `[ui.toast]`) y ejecuta `herdr server reload-config`, antepone `%LOCALAPPDATA%\agyc\bin` al `User PATH` (para que `agy.cmd` preceda a `%LOCALAPPDATA%\agy\bin\agy.exe`), instala `skills/agyc/SKILL.md` si existe `.agents\skills`, ejecuta `py_compile` y corre `python -m unittest discover -s tests`.
+
+#### Post-instalación y Troubleshooting rápido en Windows
+- **El comando `agyc` no se reconoce tras instalar:** PowerShell/CMD no recarga automáticamente el `User PATH` en la sesión actual. Abre una **nueva terminal**, o recarga el `PATH` en la misma ventana de PowerShell:
+  ```powershell
+  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+  ```
+- **Error de `ExecutionPolicy` al ejecutar `.\install.ps1`:** usa `.\install.cmd`, que invoca `powershell.exe -NoProfile -ExecutionPolicy Bypass -File install.ps1` sin requerir cambios globales de política.
+- **No aparecen la barra superior derecha (`agyc-topbar`) o los bordes de panel en Herdr tras instalar:**
+  1. Primero recarga la configuración en caliente sin cerrar paneles:
+     ```powershell
+     herdr server reload-config
+     ```
+  2. Si el cliente gráfico de Herdr aún no refresca la barra o los bordes, haz detach o cierra **solo la ventana de Herdr** y vuelve a abrir `herdr` (tus sesiones y agentes siguen vivos en el servidor en segundo plano).
+- **Cuentas previas o reparación integral:** ejecuta `agyc doctor` para auditar `%LOCALAPPDATA%\agyc\bin`, ACLs NTFS y `%APPDATA%\herdr\config.toml`; usa `agyc doctor --fix` si necesitas crear perfiles aislados faltantes o reparar enlaces y configuración de Herdr.
 
 ---
 
@@ -161,13 +190,15 @@ agyc doctor                # Audita permisos, symlinks, caché .npm y configurac
 agyc doctor --fix          # Repara automáticamente todos los hallazgos detectados por doctor
 ```
 
-### Autenticación y mantenimiento
+### Autenticación, migración entre equipos y mantenimiento
 ```bash
-agyc add [alias]           # Registra nueva cuenta (PRO o ULTRA) vía OAuth en navegador
-agyc renew <alias>         # Re-vincula OAuth cuando Google pide re-autenticación (alias: reauth)
-agyc rm <alias>            # Elimina una cuenta y limpia su perfil aislado
-agyc wipe [--force]        # Vacía TODAS las credenciales registradas
-agyc update / agy update   # Sincroniza repo, lib/, binarios, barras y motor oficial de Antigravity
+agyc add [alias]                         # Registra nueva cuenta (PRO o ULTRA) vía OAuth en navegador
+agyc renew <alias>                       # Re-vincula OAuth cuando Google pide re-autenticación (alias: reauth)
+agyc export [alias] [-o <archivo>]       # Exporta una o todas las cuentas a un bundle agyc-bundle-v1 (0600)
+agyc import <archivo> [--alias <nuevo>] [--overwrite]  # Importa cuentas (Windows ↔ Linux), crea HOMEs y lanzadores
+agyc rm <alias>                          # Elimina una cuenta y limpia su perfil aislado
+agyc wipe [--force]                      # Vacía TODAS las credenciales registradas
+agyc update / agy update                 # Sincroniza repo, lib/, binarios, barras y motor oficial de Antigravity
 ```
 
 ---
@@ -190,14 +221,16 @@ Cuando la cuota efectiva del modelo activo cae a **`≤15%`** (`min(5H, Sem) <= 
 ⚠ ⚡ agy02 [PRO] · Claude Sonnet 5.5 · 5H:12% Ctx:36% Sem:84%
 ```
 
-### 6.2 Notificación Toast Única por Ciclo en Herdr (`maybe_notify_low_quota`)
+### 6.2 Notificación Toast Única por Ciclo en Herdr / Win32 (`maybe_notify_low_quota`)
 
-Al cruzar `≤15%` dentro de Herdr (`HERDR_ENV=1` o socket `~/.config/herdr/herdr.sock` + binario `~/.local/bin/herdr`):
-- **Cero spam (deduplicación estricta):** Registra `{"reset_key": "<reset_5h|reset_sem|active>", "notified_at": <ts>}` con permisos `0600` y `flock` atómico en `~/.cache/agyc/low_quota_alert_<alias>_<familia>.json`. Durante todo ese ciclo de reinicio (hasta 5 horas), **no vuelve a emitir otro toast**.
-- **Sugerencia inteligente en `<3ms`:** Escanea localmente `accounts/*.json`, `quota_cache_*.json` y `pane.list` del socket Herdr:
+Al cruzar `≤15%` dentro de Herdr (`HERDR_ENV=1`, `HERDR_PANE_ID`, socket `~/.config/herdr/herdr.sock` en Linux o `%APPDATA%\herdr\herdr.sock` en Windows):
+- **Cero spam (deduplicación estricta):** Registra `{"reset_key": "<reset_5h|reset_sem|active>", "notified_at": <ts>}` con permisos privados (`0600`) y lock atómico vía `acquire_file_lock()` (`fcntl.flock` en Linux / `msvcrt.locking` en Windows) en `~/.cache/agyc/low_quota_alert_<alias>_<familia>.json` (o `%LOCALAPPDATA%\agyc\cache\...` en Windows). Durante todo ese ciclo de reinicio (hasta 5 horas), **no vuelve a emitir otro toast**.
+- **Sugerencia inteligente en `<3ms`:** Escanea localmente `accounts/*.json`, `quota_cache_*.json` y `pane.list` del IPC de Herdr (`AF_UNIX` en Linux; TCP `127.0.0.1:<port>` leyendo `<port>:<nonce>` en Windows):
   - Descarta la cuenta actual, cuentas con `is_revoked == True`, cuentas con `locked == True` (`🔒 RESERVADA`) y cuentas ocupadas en otros paneles de Herdr.
   - Si el modelo contiene `"carbon"`, exige `plan_type == "ULTRA"`; en caso contrario, prefiere cuentas **`PRO`** saludables (*Reserva ULTRA*).
-- **Ejecución desacoplada (`<1ms`):** Lanza `herdr notification show --position top-right --sound none --body ...` mediante `subprocess.Popen(..., start_new_session=True)` sin bloquear jamás el renderizado de la TUI:
+- **Ejecución desacoplada (`<1ms`):** A través de `platform.send_low_quota_toast()` y `platform.spawn_detached()` (`start_new_session=True` en Linux; `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` en Windows):
+  - Si existe `herdr` / `herdr.exe`, ejecuta `herdr notification show --position top-right --sound none --body ...` sin bloquear el renderizado de la TUI.
+  - En Windows, si `herdr.exe` no está en `PATH`, `win32.py` usa un fallback nativo con `powershell.exe` + `System.Windows.Forms.NotifyIcon` (`ShowBalloonTip(5000)`) pasando título y cuerpo por variables de entorno (`AGYC_TOAST_TITLE`, `AGYC_TOAST_BODY`).
   - Con reemplazo libre encontrado:
     - Título: `⚠ Cuota baja en agy02 (12%)`
     - Cuerpo: `Sugerida libre: agy04 [PRO] (100% 5H) · Ejecuta: agyc auto`
@@ -213,19 +246,19 @@ Al cruzar `≤15%` dentro de Herdr (`HERDR_ENV=1` o socket `~/.config/herdr/herd
 
 ## 7. Aislamiento de Perfiles HOME y Deduplicación `.npm`
 
-Cada lanzador `agy01`..`agy15` inyecta `HOME=~/.agyc_homes/<alias>` antes de `os.execv()` hacia `agy-real`:
+Cada lanzador (`agy01`..`agy15` en Linux, `agy01.cmd`..`agy15.cmd` en Windows) prepara el perfil aislado e inyecta `HOME=~/.agyc_homes/<alias>` (más `USERPROFILE=%USERPROFILE%\.agyc_homes\<alias>` y `AGYC_ACCOUNT=<alias>` en Windows) antes de lanzar `agy-real` (`os.execve` en Linux; `subprocess.Popen` con registro `<run_dir>\<pid>.json` en Windows):
 
 ```text
-~/.agyc_homes/<alias>/
-├── .npm                            ← 🔗 Symlink → ~/.npm (evita gigabytes duplicados en npx/MCP)
+~/.agyc_homes/<alias>/                     (Windows: %USERPROFILE%\.agyc_homes\<alias>\)
+├── .npm                            ← 🔗 Symlink / NTFS Junction → ~/.npm (%USERPROFILE%\.npm)
 └── .gemini/antigravity-cli/
-    ├── antigravity-oauth-token     ← 🔒 Copia exclusiva (0600) del alias
-    ├── bin/                        ← 🔗 Symlink → ~/.gemini/antigravity-cli/bin
-    ├── lib/                        ← 🔗 Symlink → ~/.gemini/antigravity-cli/lib
-    ├── settings.json               ← 🔗 Symlink → ~/.gemini/antigravity-cli/settings.json
-    ├── accounts/                   ← 🔗 Symlink → ~/.gemini/antigravity-cli/accounts
-    ├── conversations/              ← 🔗 Symlink → historial compartido para /resume entre cuentas
-    └── brain/                      ← 🔗 Symlink → artefactos y contexto compartido
+    ├── antigravity-oauth-token     ← 🔒 Copia exclusiva (0600 / NTFS ACL) del alias
+    ├── bin/                        ← 🔗 Symlink / NTFS Junction → base\bin
+    ├── lib/                        ← 🔗 Symlink / NTFS Junction → base\lib
+    ├── settings.json               ← 🔒 Archivo propio por perfil (statusLine + title)
+    ├── accounts/                   ← 🔗 Symlink / NTFS Junction → base\accounts
+    ├── conversations/              ← 🔗 Symlink / NTFS Junction → historial compartido (/resume)
+    └── brain/                      ← 🔗 Symlink / NTFS Junction → artefactos y contexto compartido
 ```
 
 ---
@@ -233,7 +266,7 @@ Cada lanzador `agy01`..`agy15` inyecta `HOME=~/.agyc_homes/<alias>` antes de `os
 ## 8. Uso en Múltiples Paneles y Detección `EN USO` (Anti-Colisión)
 
 Cuando trabajas con varios paneles abiertos en Herdr, tmux o terminales paralelas:
-1. `agyc` inspecciona los procesos `agy-real` en ejecución (`/proc`) y los paneles reportados por el socket de Herdr (`pane.list`).
+1. `agyc` inspecciona los procesos `agy-real` en ejecución (`/proc` en Linux, o `CreateToolhelp32Snapshot` + `<run_dir>\<pid>.json` vía `lib/platform/win32.py` en Windows) y los paneles reportados por Herdr (`pane.list`).
 2. `agyc list` marca automáticamente esas cuentas como **`EN USO`** e indica en qué panel corren (`▶ en p1`, `▶ en p2`).
 3. Cuando ejecutas `agyc auto` en un panel cuya cuota se agotó, el motor **descarta las cuentas `EN USO` en otros paneles** y las cuentas **`🔒 RESERVADA`**, asignándote siempre una cuenta libre para evitar desgastar la misma ventana `5H` desde dos sesiones pesadas simultáneas.
 
@@ -266,18 +299,25 @@ Al ejecutar `agyc doctor --fix`, repara permisos, recrea symlinks faltantes, ded
 
 ---
 
-## 11. Librería Núcleo `lib/agyc_core.py` y Suite de Tests
+## 11. Librería Núcleo `lib/agyc_core.py`, Capa `lib/platform/` y Suite de Tests
 
-En `v1.6`, la lógica de dominio reutilizable reside en `lib/agyc_core.py` (instalada en `~/.gemini/antigravity-cli/lib/agyc_core.py`):
+En `v1.6`, la lógica de dominio reutilizable reside en `lib/agyc_core.py` (instalada en `~/.gemini/antigravity-cli/lib/agyc_core.py`) apoyada por la capa de abstracción OS en `lib/platform/` (`__init__.py`, `linux.py`, `win32.py`):
 - Gestión atómica de metadatos por cuenta (`note`, `locked`, `lock_reason`).
-- Detección en vivo de procesos `agy-real` y paneles de Herdr (`EN USO` / `▶ en pX`).
+- Detección en vivo de procesos `agy-real` / `agy` y paneles de Herdr (`EN USO` / `▶ en pX`).
+- Primitivas POSIX/Win32 equivalentes (enlaces de directorio/archivo, locks concurrentes, lectura no bloqueante de `stdin`, IPC Herdr y notificaciones Toast).
 - Motor de ranking *Reserva ULTRA + Burn-First + Anti-Colisión*.
 - Auditoría y reparación de `agyc doctor [--fix]`.
 
-Para ejecutar la suite completa de pruebas unitarias sin generar bytecode residual:
+Para ejecutar la suite completa de **38 pruebas unitarias** (`tests/test_agyc.py`) sin generar bytecode residual:
 
 ```bash
+# Ubuntu Linux
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+```
+
+```powershell
+# Windows 10/11 (PowerShell / CMD)
+python -B -m unittest discover -s tests
 ```
 
 ---
@@ -285,7 +325,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 ## 12. Gestión de Tokens, Elegibilidad y Keyring
 
 - **Renovación OAuth (`invalid_grant` o `Eligibility check failed`):** Ejecuta `agyc renew <alias>` para re-autenticar en navegador.
-- **Bypass de GNOME Keyring:** `agyc` y `bin/agy` inyectan `SSH_TTY="${SSH_TTY:-/dev/pts/0}"` solo al invocar `agy-real` (sin contaminar `~/.bashrc`), asegurando lectura directa desde `antigravity-oauth-token`.
+- **Bypass de GNOME Keyring (Linux) y Windows Credential Manager (`wincred`):** `agyc`, `bin/agy` (Linux) y `bin/agy.cmd` (Windows) inyectan `SSH_TTY="${SSH_TTY:-/dev/pts/0}"` solo al invocar `agy-real` / `agy.exe` (sin contaminar el shell del usuario), evitando que Antigravity lea credenciales globales de GNOME Keyring o de Windows Credential Manager (`LegacyGeneric:target=gemini:antigravity`) y forzando lectura directa desde `antigravity-oauth-token` en cada perfil aislado.
 
 ---
 
@@ -298,10 +338,31 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
 
 ---
 
-## 14. `agyc wipe` y `agyc update`
+## 14. Portabilidad entre Equipos (`agyc export` / `agyc import`), `agyc wipe` y `agyc update`
+
+### Migración portable Windows ↔ Ubuntu Linux (`agyc export` / `agyc import`)
+
+Permite llevar tus vinculaciones OAuth ya autenticadas de un equipo a otro (por ejemplo, de **Ubuntu Linux a Windows 10/11** o viceversa) sin volver a abrir el navegador en cada máquina:
+
+1. **Exportar en el equipo origen:**
+   - `agyc export`: exporta todas las cuentas válidas registradas en `accounts/` (excluyendo `config.json` y archivos prefijados con `_`) en `agyc-accounts-bundle.json`.
+   - `agyc export agy01`: exporta solo `agy01` (por defecto en `agyc-agy01.json`, o en la ruta indicada con `-o <archivo>`).
+   - El bundle se escribe atómicamente con formato `agyc-bundle-v1` y permisos privados (`0600`).
+2. **Transferencia segura y limpieza:**
+   - Como el archivo contiene tokens OAuth activos (`access_token` y `refresh_token`), transfiérelo únicamente por un canal cifrado (por ejemplo `scp agyc-accounts-bundle.json usuario@otro-equipo:~/`).
+   - Elimina el archivo bundle tanto del origen como del destino inmediatamente después de completar la importación.
+3. **Importar en el equipo destino:**
+   - `agyc import <archivo>`: valida `format == "agyc-bundle-v1"`, guarda cada cuenta en `accounts/<alias>.json`, prepara su perfil aislado en `.agyc_homes/<alias>/`, sincroniza lanzadores (`agy01..15` / `.cmd`) y configura `active_account` / `default_account` si el equipo destino no tenía cuenta activa.
+   - `--alias <nuevo_alias>`: renombra la cuenta al importar (solo válido cuando el bundle contiene exactamente 1 cuenta).
+   - `--overwrite`: reemplaza cuentas existentes que coincidan por alias o email; sin `--overwrite`, omite los duplicados existentes.
+4. **Advertencia sobre uso simultáneo en paralelo:** Si mantienes la misma cuenta operando en ambos equipos a la vez, la rotación/renovación de `refresh_token` ejecutada por Google en una máquina puede revocar el token de la otra (`invalid_grant`, recuperable con `agyc renew <alias>`).
+
+### `agyc wipe` y `agyc update`
 
 - **`agyc wipe [--force]`:** Elimina credenciales `accounts/*.json` y tokens OAuth conservando `settings.json`, `conversations/` y `brain/`.
-- **`agyc update` (o `agy update`):** Sincroniza el repositorio, actualiza `lib/agyc_core.py`, binarios, wrappers, barras (`statusline`, `titleline`, `topbar`), lanzadores `agy01..15` y verifica actualizaciones oficiales de `agy-real`.
+- **`agyc update` (o `agy update`):** Sincroniza el repositorio (`git pull` o descarga HTTPS), actualiza `lib/` (incluyendo `lib/platform/`), binarios, wrappers (`bin/agy` en Linux; `bin/agy.cmd`, `agyc.cmd`, `agy01.cmd..15.cmd`, `agyc-statusline.cmd`, `agyc-titleline.cmd`, `agyc-topbar.cmd` en Windows) y descarga/actualiza el binario oficial de Google Antigravity CLI:
+  - En **Linux**: consulta `manifests/linux_amd64.json`, extrae `.tar.gz`, valida `_verify_sha512()` y reemplaza `agy-real` vía `os.replace()`.
+  - En **Windows**: consulta `manifests/windows_amd64.json`, reutiliza `%LOCALAPPDATA%\agy\bin\agy.exe` si coincide el SHA-512 o descarga/extrae el paquete `.zip` oficial, verifica `_verify_sha512()` y reemplaza `agy-real.exe` (renombrando a `.old` si está en uso por otro panel).
 
 ---
 

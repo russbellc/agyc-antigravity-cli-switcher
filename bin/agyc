@@ -18,7 +18,6 @@ Características:
 import sys
 import os
 import re
-import pwd
 import stat
 import glob
 import math
@@ -26,7 +25,6 @@ import json
 import time
 import hmac
 import html
-import fcntl
 import base64
 import socket
 import inspect
@@ -38,12 +36,30 @@ import urllib.parse
 import urllib.error
 import http.server
 import threading
-import select
 import argparse
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+
+if os.name == "nt":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        if sys.stdout is not None and sys.stdout.isatty():
+            import ctypes as _ctypes
+            _k32 = _ctypes.windll.kernel32
+            _h = _k32.GetStdHandle(-11)
+            _m = _ctypes.c_uint32(0)
+            if _k32.GetConsoleMode(_h, _ctypes.byref(_m)):
+                _k32.SetConsoleMode(_h, _m.value | 0x0004)
+    except Exception:
+        pass
 
 # Expresión regular para quitar secuencias de escape ANSI
 ANSI_REGEX = re.compile(r"\x1b\[[0-9;]*m")
@@ -85,6 +101,8 @@ RESERVED_ALIASES = {
     "purge",
     "update",
     "upgrade",
+    "export",
+    "import",
     "help",
 }
 
@@ -153,68 +171,326 @@ def pad_visible(s: str, width: int, align: str = "left") -> str:
         return s + (" " * pad)
 
 
-def _strip_agyc_homes(path: str) -> str:
+def _strip_agyc_homes_pre(path: str) -> str:
     p = (path or "").strip()
-    if "/.agyc_homes/" in p:
-        p = p.split("/.agyc_homes/")[0]
-    elif p.endswith("/.agyc_homes"):
-        p = p[: -len("/.agyc_homes")]
-    return p.rstrip("/") or "/"
+    if not p:
+        return ""
+    norm = p.replace("\\", "/")
+    if "/.agyc_homes/" in norm:
+        p = p[: norm.find("/.agyc_homes/")]
+    elif norm.rstrip("/").endswith("/.agyc_homes"):
+        p = p[: norm.rstrip("/").rfind("/.agyc_homes")]
+    if len(p) == 3 and p[1] == ":" and p[2] in ("/", "\\"):
+        return p
+    stripped = p.rstrip("/\\")
+    if not stripped:
+        return "/" if p.startswith("/") else p
+    if len(stripped) == 2 and stripped[1] == ":":
+        return stripped + os.sep
+    return stripped
+
+
+def _pre_resolve_home() -> str:
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME", "USERPROFILE", "HOME"):
+        val = os.environ.get(env_key, "").strip()
+        if val and val != "~":
+            cleaned = _strip_agyc_homes_pre(val)
+            if cleaned and os.path.isdir(cleaned):
+                return cleaned
+    try:
+        expanded = os.path.expanduser("~")
+        if expanded and expanded != "~":
+            cleaned_exp = _strip_agyc_homes_pre(expanded)
+            if cleaned_exp and os.path.isdir(cleaned_exp):
+                return cleaned_exp
+    except Exception:
+        pass
+    return os.environ.get("SystemDrive", "C:") + os.sep if os.name == "nt" else "/tmp"
+
+
+def _candidate_lib_dirs() -> list[str]:
+    pre_home = _pre_resolve_home()
+    cands = [
+        os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")),
+        os.path.join(pre_home, ".gemini", "antigravity-cli", "lib"),
+    ]
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            cands.insert(1, os.path.join(la, "agyc", "lib"))
+    else:
+        cands.append("/home/aidev/proyectos/agyc-antigravity-cli-switcher/lib")
+        cands.append(
+            os.path.join(
+                pre_home,
+                "snap",
+                "antigravity-cli",
+                "common",
+                ".gemini",
+                "antigravity-cli",
+                "lib",
+            )
+        )
+    return cands
+
+
+class _FallbackFileLock:
+    def __init__(self, fd: int) -> None:
+        self._fd: int | None = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd = self._fd
+        self._fd = None
+        try:
+            if os.name == "nt":
+                import msvcrt
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.release()
+
+
+class _FallbackPlatform:
+    IS_WINDOWS: bool = os.name == "nt"
+
+    @staticmethod
+    def _has_agyc_homes_segment(path: str) -> bool:
+        s = (path or "").strip().replace("\\", "/")
+        return bool(s) and ("/.agyc_homes/" in s or s.rstrip("/").endswith("/.agyc_homes") or s == ".agyc_homes")
+
+    @staticmethod
+    def _strip_agyc_homes(path: str) -> str:
+        return _strip_agyc_homes_pre(path)
+
+    @staticmethod
+    def resolve_real_home() -> str:
+        return _pre_resolve_home()
+
+    @staticmethod
+    def ensure_private_dir(path: str, mode: int = 0o700) -> str:
+        if os.name == "nt":
+            os.makedirs(path, exist_ok=True)
+        else:
+            os.makedirs(path, mode=mode, exist_ok=True)
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+        return path
+
+    @staticmethod
+    def ensure_private_file(path: str, mode: int = 0o600) -> str:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            _FallbackPlatform.ensure_private_dir(parent, 0o700)
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, mode)
+            os.close(fd)
+        if os.name != "nt":
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+        return path
+
+    @staticmethod
+    def harden_ntfs_acl(path: str) -> bool:
+        return os.path.exists(path)
+
+    @staticmethod
+    def get_base_dir(real_home: str | None = None) -> str:
+        rh = _strip_agyc_homes_pre(real_home) if real_home else _pre_resolve_home()
+        for c in (
+            os.environ.get("ANTIGRAVITY_HOME") if real_home is None else None,
+            os.environ.get("AGY_CONFIG_DIR") if real_home is None else None,
+            os.path.join(rh, ".gemini", "antigravity-cli"),
+        ):
+            if c and not _FallbackPlatform._has_agyc_homes_segment(c) and os.path.exists(c):
+                return _strip_agyc_homes_pre(c)
+        return _FallbackPlatform.ensure_private_dir(os.path.join(rh, ".gemini", "antigravity-cli"), 0o700)
+
+    @staticmethod
+    def get_cache_dir(real_home: str | None = None) -> str:
+        rh = _strip_agyc_homes_pre(real_home) if real_home else _pre_resolve_home()
+        if os.name == "nt":
+            la = os.environ.get("LOCALAPPDATA", "").strip()
+            if la and not _FallbackPlatform._has_agyc_homes_segment(la):
+                return _FallbackPlatform.ensure_private_dir(os.path.join(la, "agyc", "cache"), 0o700)
+        return _FallbackPlatform.ensure_private_dir(os.path.join(rh, ".cache", "agyc"), 0o700)
+
+    @staticmethod
+    def get_locks_dir(real_home: str | None = None) -> str:
+        return _FallbackPlatform.ensure_private_dir(os.path.join(_FallbackPlatform.get_cache_dir(real_home), "locks"), 0o700)
+
+    @staticmethod
+    def get_run_dir(real_home: str | None = None) -> str:
+        return _FallbackPlatform.ensure_private_dir(os.path.join(_FallbackPlatform.get_cache_dir(real_home), "run"), 0o700)
+
+    @staticmethod
+    def create_dir_link(src: str, dst: str) -> None:
+        parent = os.path.dirname(os.path.abspath(dst))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.name == "nt":
+            res = subprocess.run(["cmd", "/c", "mklink", "/J", os.path.abspath(dst), os.path.abspath(src)], capture_output=True)
+            if res.returncode != 0:
+                raise OSError("mklink /J failed")
+        else:
+            os.symlink(src, dst)
+
+    @staticmethod
+    def is_dir_link(path: str) -> bool:
+        is_junc = getattr(os.path, "isjunction", None)
+        return bool(os.path.islink(path) or (is_junc is not None and is_junc(path)))
+
+    @staticmethod
+    def read_dir_link(path: str) -> str:
+        t = os.readlink(path)
+        return t[4:] if t.startswith("\\\\?\\") else t
+
+    @staticmethod
+    def create_file_link(src: str, dst: str) -> None:
+        parent = os.path.dirname(os.path.abspath(dst))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if os.name == "nt":
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+        else:
+            os.symlink(src, dst)
+
+    @staticmethod
+    def acquire_file_lock(lock_path: str, blocking: bool = True) -> _FallbackFileLock:
+        parent = os.path.dirname(os.path.abspath(lock_path))
+        if parent:
+            _FallbackPlatform.ensure_private_dir(parent, 0o700)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(fd).st_size == 0:
+                    os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            return _FallbackFileLock(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def default_herdr_socket_path(real_home: str | None = None) -> str:
+        rh = _strip_agyc_homes_pre(real_home) if real_home else _pre_resolve_home()
+        if os.name == "nt":
+            ad = os.environ.get("APPDATA", "").strip()
+            if ad:
+                return os.path.join(ad, "herdr", "herdr.sock")
+        return os.environ.get("HERDR_SOCKET_PATH") or os.path.join(rh, ".config", "herdr", "herdr.sock")
+
+    @staticmethod
+    def query_herdr_ipc(sock_path: str | None, payload_dict: dict, timeout: float = 0.06) -> dict | None:
+        del sock_path, payload_dict, timeout
+        return None
+
+    @staticmethod
+    def scan_agy_processes(proc_root: str = "/proc", run_dir: str | None = None) -> list[dict]:
+        del proc_root, run_dir
+        return []
+
+
+def _load_platform_and_core():
+    plat_mod = None
+    core_mod = None
+    for lib_dir in _candidate_lib_dirs():
+        if not lib_dir or not os.path.isdir(lib_dir):
+            continue
+        parent_dir = os.path.dirname(lib_dir)
+        if parent_dir and parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        if plat_mod is None and os.path.isfile(os.path.join(lib_dir, "platform", "__init__.py")):
+            try:
+                from lib import platform as p_cand  # type: ignore
+                if hasattr(p_cand, "resolve_real_home"):
+                    plat_mod = p_cand
+            except Exception:
+                pass
+            if plat_mod is None:
+                try:
+                    import importlib.util
+                    plat_dir = os.path.join(lib_dir, "platform")
+                    spec = importlib.util.spec_from_file_location(
+                        "_agyc_platform",
+                        os.path.join(plat_dir, "__init__.py"),
+                        submodule_search_locations=[plat_dir],
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        sys.modules["_agyc_platform"] = mod
+                        spec.loader.exec_module(mod)
+                        plat_mod = mod
+                except Exception:
+                    pass
+        if core_mod is None and os.path.isfile(os.path.join(lib_dir, "agyc_core.py")):
+            try:
+                from lib import agyc_core as c_cand  # type: ignore
+                if hasattr(c_cand, "compute_smart_auto_choice"):
+                    core_mod = c_cand
+            except Exception:
+                pass
+            if core_mod is None:
+                try:
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location(
+                        "agyc_core",
+                        os.path.join(lib_dir, "agyc_core.py"),
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        sys.modules["agyc_core"] = mod
+                        spec.loader.exec_module(mod)
+                        core_mod = mod
+                except Exception:
+                    pass
+        if plat_mod is not None and core_mod is not None:
+            break
+    if plat_mod is None:
+        plat_mod = _FallbackPlatform()
+    return plat_mod, core_mod
+
+
+platform, _agyc_core = _load_platform_and_core()
+
+
+def _strip_agyc_homes(path: str) -> str:
+    return platform._strip_agyc_homes(path)
 
 
 def resolve_real_home() -> str:
     """Resuelve el HOME real del usuario dinámicamente, inmune a sesiones con HOME aislado en ~/.agyc_homes/."""
-    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
-        val = os.environ.get(env_key, "").strip()
-        if val:
-            cleaned = _strip_agyc_homes(val)
-            if cleaned and os.path.isdir(cleaned):
-                return cleaned
-    expanded = os.path.expanduser("~")
-    if expanded and expanded != "~":
-        cleaned_exp = _strip_agyc_homes(expanded)
-        if cleaned_exp and os.path.isdir(cleaned_exp):
-            return cleaned_exp
-    try:
-        pw_dir = _strip_agyc_homes(pwd.getpwuid(os.getuid()).pw_dir)
-        if pw_dir and os.path.isdir(pw_dir):
-            return pw_dir
-    except Exception:
-        pass
-    return "/tmp"
+    return platform.resolve_real_home()
 
 
 REAL_HOME = resolve_real_home()
-CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
-
-
-def _load_agyc_core():
-    """Carga lib/agyc_core.py con búsqueda determinista en repo, desarrollo e instalación global."""
-    lib_candidates = [
-        os.path.normpath(os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")),
-        "/home/aidev/proyectos/agyc-antigravity-cli-switcher/lib",
-        os.path.join(resolve_real_home(), ".gemini", "antigravity-cli", "lib"),
-        os.path.join(
-            resolve_real_home(),
-            "snap",
-            "antigravity-cli",
-            "common",
-            ".gemini",
-            "antigravity-cli",
-            "lib",
-        ),
-    ]
-    for lib_dir in reversed(lib_candidates):
-        if lib_dir and os.path.isdir(lib_dir) and lib_dir not in sys.path:
-            sys.path.insert(0, lib_dir)
-    try:
-        import agyc_core  # type: ignore
-        return agyc_core
-    except Exception:
-        return None
-
-
-_agyc_core = _load_agyc_core()
+CACHE_DIR = platform.get_cache_dir(REAL_HOME)
 
 # User-Agent oficial Antigravity 1.5.10 que habilita ambos grupos unificados en CloudCode PA
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
@@ -277,36 +553,19 @@ def validate_alias(alias: str | None) -> str:
 
 
 def _ensure_private_dir(path: str, mode: int = 0o700) -> str:
-    os.makedirs(path, mode=mode, exist_ok=True)
-    try:
-        os.chmod(path, mode)
-    except Exception:
-        pass
-    return path
+    return platform.ensure_private_dir(path, mode)
 
 
 def get_cache_dir() -> str:
-    return _ensure_private_dir(os.path.join(resolve_real_home(), ".cache", "agyc"), 0o700)
+    return platform.get_cache_dir()
 
 
 def get_locks_dir() -> str:
-    return _ensure_private_dir(os.path.join(get_cache_dir(), "locks"), 0o700)
+    return platform.get_locks_dir()
 
 
 def get_base_dir() -> str:
-    real_home = resolve_real_home()
-    candidates = [
-        os.environ.get("ANTIGRAVITY_HOME"),
-        os.environ.get("AGY_CONFIG_DIR"),
-        os.path.join(real_home, ".gemini", "antigravity-cli"),
-        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
-    ]
-    for c in candidates:
-        if c and "/.agyc_homes/" not in c and not c.endswith("/.agyc_homes") and os.path.exists(c):
-            return c
-    default_path = os.path.join(real_home, ".gemini", "antigravity-cli")
-    os.makedirs(default_path, exist_ok=True)
-    return default_path
+    return platform.get_base_dir()
 
 
 def get_bin_dir() -> str:
@@ -330,17 +589,31 @@ def get_config_path() -> str:
 
 
 def _atomic_write_json(path: str, payload: dict, mode: int | None = None, indent: int | None = 2):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.exists(parent):
+        _ensure_private_dir(parent, 0o700)
     tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         if mode is not None:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=indent)
-            os.chmod(tmp, mode)
+                json.dump(payload, f, indent=indent, ensure_ascii=False)
+            if not platform.IS_WINDOWS:
+                os.chmod(tmp, mode)
         else:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=indent)
-        os.replace(tmp, path)
+                json.dump(payload, f, indent=indent, ensure_ascii=False)
+        if not platform.IS_WINDOWS:
+            os.replace(tmp, path)
+        else:
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.005)
     except Exception:
         try:
             if os.path.exists(tmp):
@@ -439,7 +712,9 @@ def read_quota_cache(alias: str, max_age: float = 60.0) -> dict | None:
         return None
     primary = os.path.join(get_cache_dir(), f"quota_cache_{safe_alias}.json")
     legacy = f"/tmp/agyc_quota_cache_{safe_alias}.json"
-    cache_file = primary if os.path.exists(primary) else (legacy if os.path.exists(legacy) else None)
+    cache_file = primary if os.path.exists(primary) else (
+        legacy if (not platform.IS_WINDOWS and os.path.exists(legacy)) else None
+    )
     if not cache_file:
         return None
     try:
@@ -477,8 +752,366 @@ def get_next_correlative_alias() -> str:
     return f"agy{next_num:02d}"
 
 
-def sync_account_symlinks():
-    """Crea symlinks en el directorio bin para que el usuario pueda escribir 'agy01', 'agy02', etc."""
+def _safe_unlink_link(path: str) -> None:
+    """Elimina de forma segura un symlink, NTFS junction o archivo sin tocar el destino."""
+    if platform.is_dir_link(path) or os.path.islink(path):
+        try:
+            os.unlink(path)
+            return
+        except OSError:
+            pass
+        if os.path.isdir(path):
+            try:
+                os.rmdir(path)
+                return
+            except OSError:
+                pass
+    if os.path.isfile(path):
+        os.unlink(path)
+
+
+def _safe_rmtree(path: str) -> None:
+    """Elimina un árbol de directorios sin descender jamás en symlinks ni NTFS junctions."""
+    if not os.path.lexists(path) and not platform.is_dir_link(path):
+        return
+    if platform.is_dir_link(path) or os.path.islink(path):
+        _safe_unlink_link(path)
+        return
+    if not os.path.isdir(path):
+        os.unlink(path)
+        return
+    with os.scandir(path) as it:
+        for entry in it:
+            ep = entry.path
+            if entry.is_symlink() or platform.is_dir_link(ep):
+                _safe_unlink_link(ep)
+            elif entry.is_dir(follow_symlinks=False):
+                _safe_rmtree(ep)
+            else:
+                os.unlink(ep)
+    os.rmdir(path)
+
+
+def _same_link_target(a: str, b: str) -> bool:
+    if platform.IS_WINDOWS:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    return os.path.abspath(a) == os.path.abspath(b)
+
+
+def _ensure_dir_link(src: str, dst: str, replace_existing_dir: bool = False) -> bool:
+    """Crea o verifica un symlink (Linux) o NTFS Junction (Windows) `dst` -> `src`."""
+    if not os.path.isdir(src):
+        return False
+    if _same_link_target(src, dst):
+        return True
+    if platform.is_dir_link(dst) or os.path.islink(dst):
+        try:
+            if _same_link_target(platform.read_dir_link(dst), src) and os.path.exists(dst):
+                return True
+        except OSError:
+            pass
+        try:
+            _safe_unlink_link(dst)
+        except OSError:
+            return False
+    elif os.path.isdir(dst):
+        try:
+            is_empty = not os.listdir(dst)
+        except OSError:
+            is_empty = False
+        if replace_existing_dir or is_empty:
+            try:
+                _safe_rmtree(dst)
+            except OSError:
+                return False
+        else:
+            return False
+    elif os.path.isfile(dst):
+        try:
+            os.unlink(dst)
+        except OSError:
+            return False
+    try:
+        _ensure_private_dir(os.path.dirname(os.path.abspath(dst)), 0o700)
+        platform.create_dir_link(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_file_link(src: str, dst: str) -> bool:
+    """Crea un enlace de archivo (symlink POSIX o NTFS hardlink/copia en Windows)."""
+    if not os.path.isfile(src):
+        return False
+    try:
+        if os.path.exists(dst) and os.path.samefile(src, dst):
+            return True
+    except OSError:
+        pass
+    if os.path.islink(dst):
+        try:
+            os.unlink(dst)
+        except OSError:
+            return False
+    if os.path.exists(dst):
+        return True
+    try:
+        _ensure_private_dir(os.path.dirname(os.path.abspath(dst)), 0o700)
+        platform.create_file_link(src, dst)
+        return True
+    except OSError:
+        return False
+
+
+def _find_repo_dir(real_home: str) -> str:
+    self_repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    candidates = [
+        self_repo,
+        os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher"),
+        os.path.join(real_home, "proyectos", "agyc"),
+    ]
+    if not platform.IS_WINDOWS:
+        candidates.append("/home/aidev/proyectos/agyc-antigravity-cli-switcher")
+    for cand in candidates:
+        if cand and (os.path.isdir(os.path.join(cand, ".git")) or os.path.isdir(os.path.join(cand, "bin"))):
+            return cand
+    return os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher")
+
+
+def _use_real_localappdata(real_home: str) -> str | None:
+    la = os.environ.get("LOCALAPPDATA", "").strip()
+    if not la or platform._has_agyc_homes_segment(la):
+        return None
+    rh_norm = os.path.normcase(os.path.abspath(real_home)).rstrip("\\/")
+    la_norm = os.path.normcase(os.path.abspath(la))
+    if la_norm.startswith(rh_norm + os.sep) or la_norm == rh_norm:
+        return la
+    for env_k in ("AGYC_REAL_HOME", "REAL_HOME"):
+        ev = os.environ.get(env_k, "").strip()
+        if ev:
+            ev_norm = os.path.normcase(os.path.abspath(_strip_agyc_homes(ev))).rstrip("\\/")
+            if ev_norm != rh_norm:
+                return None
+    up = os.environ.get("USERPROFILE", "").strip()
+    if up:
+        up_norm = os.path.normcase(os.path.abspath(up)).rstrip("\\/")
+        if rh_norm == up_norm:
+            for env_k in ("AGYC_REAL_HOME", "REAL_HOME"):
+                ev = os.environ.get(env_k, "").strip()
+                if ev and os.path.normcase(os.path.abspath(_strip_agyc_homes(ev))).rstrip("\\/") != up_norm:
+                    return None
+            return la
+    return None
+
+
+def _windows_bin_dirs(real_home: str | None = None) -> list[str]:
+    rh = real_home or resolve_real_home()
+    dirs: list[str] = []
+    la = _use_real_localappdata(rh)
+    if la:
+        dirs.append(os.path.join(la, "agyc", "bin"))
+    gemini_bin = os.path.join(rh, ".gemini", "antigravity-cli", "bin")
+    if os.path.normcase(os.path.abspath(gemini_bin)) not in {os.path.normcase(os.path.abspath(d)) for d in dirs}:
+        dirs.append(gemini_bin)
+    base_bin = os.path.join(get_base_dir(), "bin")
+    if os.path.normcase(os.path.abspath(base_bin)) not in {os.path.normcase(os.path.abspath(d)) for d in dirs}:
+        dirs.append(base_bin)
+    return dirs
+
+
+def _write_cmd_file(path: str, content: str, force: bool = False) -> bool:
+    norm_content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+    if not force and os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                if f.read().replace("\r\n", "\n") == content.replace("\r\n", "\n"):
+                    return False
+        except OSError:
+            pass
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(norm_content)
+        return True
+    except OSError:
+        return False
+
+
+def _default_agy_cmd_content() -> str:
+    return (
+        "@echo off\n"
+        "setlocal\n"
+        "if /i \"%~1\"==\"update\" goto :do_update\n"
+        "if /i \"%~1\"==\"upgrade\" goto :do_update\n"
+        "set \"REAL_AGY=\"\n"
+        "if defined AGYC_REAL_HOME if exist \"%AGYC_REAL_HOME%\\.gemini\\antigravity-cli\\bin\\agy-real.exe\" set \"REAL_AGY=%AGYC_REAL_HOME%\\.gemini\\antigravity-cli\\bin\\agy-real.exe\"\n"
+        "if not defined REAL_AGY if exist \"%USERPROFILE%\\.gemini\\antigravity-cli\\bin\\agy-real.exe\" set \"REAL_AGY=%USERPROFILE%\\.gemini\\antigravity-cli\\bin\\agy-real.exe\"\n"
+        "if not defined REAL_AGY if exist \"%LOCALAPPDATA%\\agyc\\bin\\agy-real.exe\" set \"REAL_AGY=%LOCALAPPDATA%\\agyc\\bin\\agy-real.exe\"\n"
+        "if not defined REAL_AGY if exist \"%LOCALAPPDATA%\\agy\\bin\\agy-real.exe\" set \"REAL_AGY=%LOCALAPPDATA%\\agy\\bin\\agy-real.exe\"\n"
+        "if not defined REAL_AGY if exist \"%LOCALAPPDATA%\\agy\\bin\\agy.exe\" set \"REAL_AGY=%LOCALAPPDATA%\\agy\\bin\\agy.exe\"\n"
+        "if not defined REAL_AGY (\n"
+        "  echo Error: No se encontro el motor nativo de Google Antigravity ^('agy-real.exe' / 'agy.exe'^). 1>&2\n"
+        "  echo Ejecuta 'agyc update' para descargar e instalar el binario oficial. 1>&2\n"
+        "  exit /b 1\n"
+        ")\n"
+        "set \"HAS_FLAG=0\"\n"
+        ":chk_flag\n"
+        "if \"%~1\"==\"\" goto :run_agy\n"
+        "if \"%~1\"==\"--dangerously-skip-permissions\" set \"HAS_FLAG=1\"\n"
+        "shift\n"
+        "goto :chk_flag\n"
+        "if not defined SSH_TTY if not defined SSH_CLIENT set \"SSH_TTY=/dev/pts/0\"\n"
+        ":run_agy\n"
+        "if \"%HAS_FLAG%\"==\"0\" (\n"
+        "  \"%REAL_AGY%\" --dangerously-skip-permissions %*\n"
+        ") else (\n"
+        "  \"%REAL_AGY%\" %*\n"
+        ")\n"
+        "exit /b %ERRORLEVEL%\n"
+        ":do_update\n"
+        "shift\n"
+        "set \"UPD_ARGS=\"\n"
+        ":collect_upd\n"
+        "if \"%~1\"==\"\" goto :run_upd\n"
+        "set \"UPD_ARGS=%UPD_ARGS% %1\"\n"
+        "shift\n"
+        "goto :collect_upd\n"
+        ":run_upd\n"
+        "if exist \"%~dp0agyc.cmd\" (\n"
+        "  call \"%~dp0agyc.cmd\" update%UPD_ARGS%\n"
+        ") else (\n"
+        "  python \"%~dp0agyc\" update%UPD_ARGS%\n"
+        ")\n"
+        "exit /b %ERRORLEVEL%\n"
+    )
+
+
+def _py_cmd_wrapper(script_name: str, extra_flags: str = "", invoked_as: str | None = None) -> str:
+    py_exe = sys.executable or "python"
+    lines = [
+        "@echo off",
+        "setlocal",
+        'set "PYTHONIOENCODING=utf-8"',
+    ]
+    if invoked_as:
+        lines.append(f'set "AGYC_INVOKED_AS={invoked_as}"')
+    lines.extend([
+        f'set "AGYC_PY={py_exe}"',
+        'if not exist "%AGYC_PY%" set "AGYC_PY=python"',
+        f'set "AGYC_SCRIPT=%USERPROFILE%\\.gemini\\antigravity-cli\\bin\\{script_name}"',
+        f'if not exist "%AGYC_SCRIPT%" set "AGYC_SCRIPT=%~dp0{script_name}"',
+        f'"%AGYC_PY%" {extra_flags}"%AGYC_SCRIPT%" %*'.replace("  ", " "),
+        "exit /b %ERRORLEVEL%",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def _find_real_agy_binary(real_home: str) -> str | None:
+    if platform.IS_WINDOWS:
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        cands = [
+            os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real.exe"),
+            os.path.join(la, "agyc", "bin", "agy-real.exe") if la else "",
+            os.path.join(la, "agy", "bin", "agy-real.exe") if la else "",
+            os.path.join(la, "agy", "bin", "agy.exe") if la else "",
+        ]
+        for c in cands:
+            if c and os.path.isfile(c):
+                return c
+        own_dirs = {os.path.normcase(os.path.abspath(d)) for d in _windows_bin_dirs(real_home)}
+        for exe_name in ("agy-real.exe", "agy.exe"):
+            found = shutil.which(exe_name)
+            if found and os.path.isfile(found) and found.lower().endswith(".exe"):
+                parent_norm = os.path.normcase(os.path.abspath(os.path.dirname(found)))
+                if parent_norm not in own_dirs or exe_name == "agy-real.exe":
+                    return found
+        return None
+
+    candidates = [
+        os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real"),
+        "/snap/antigravity-cli/current/bin/agy",
+        "/snap/antigravity-cli/23/bin/agy",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    for snap_c in sorted(glob.glob("/snap/antigravity-cli/*/bin/agy"), reverse=True):
+        if os.path.isfile(snap_c) and os.access(snap_c, os.X_OK):
+            return snap_c
+    return None
+
+
+def sync_launchers(force: bool = False):
+    """Genera launchers: symlinks en Linux y wrappers `.cmd` en Windows (sin `.ps1`)."""
+    if platform.IS_WINDOWS:
+        real_home = resolve_real_home()
+        repo_bin = os.path.join(_find_repo_dir(real_home), "bin")
+        self_bin = os.path.dirname(os.path.realpath(__file__))
+        aliases = list_account_aliases()
+        all_to_wrap = set(aliases)
+        for i in range(1, 16):
+            all_to_wrap.add(f"agy{i:02d}")
+            all_to_wrap.add(f"agi{i:02d}")
+
+        agy_cmd_src = os.path.join(repo_bin, "agy.cmd")
+        if os.path.isfile(agy_cmd_src):
+            try:
+                with open(agy_cmd_src, "r", encoding="utf-8", errors="ignore") as f:
+                    agy_cmd_txt = f.read()
+            except OSError:
+                agy_cmd_txt = _default_agy_cmd_content()
+        else:
+            agy_cmd_txt = _default_agy_cmd_content()
+
+        for bdir in _windows_bin_dirs(real_home):
+            try:
+                os.makedirs(bdir, exist_ok=True)
+            except OSError:
+                continue
+            for py_script in ("agyc", "agyc-statusline", "agyc-topbar"):
+                dst_s = os.path.join(bdir, py_script)
+                if force or not os.path.isfile(dst_s):
+                    src_s = os.path.join(repo_bin, py_script)
+                    if not os.path.isfile(src_s):
+                        src_s = os.path.join(self_bin, py_script)
+                    if os.path.isfile(src_s) and not _same_link_target(src_s, dst_s):
+                        try:
+                            shutil.copy2(src_s, dst_s)
+                        except OSError:
+                            pass
+
+            _write_cmd_file(os.path.join(bdir, "agyc.cmd"), _py_cmd_wrapper("agyc"), force=force)
+            _write_cmd_file(os.path.join(bdir, "agy.cmd"), agy_cmd_txt, force=force)
+            _write_cmd_file(
+                os.path.join(bdir, "agi.cmd"),
+                '@echo off\nsetlocal\ncall "%~dp0agy.cmd" %*\nexit /b %ERRORLEVEL%\n',
+                force=force,
+            )
+            _write_cmd_file(
+                os.path.join(bdir, "agyc-statusline.cmd"),
+                _py_cmd_wrapper("agyc-statusline", extra_flags="-S "),
+                force=force,
+            )
+            _write_cmd_file(
+                os.path.join(bdir, "agyc-titleline.cmd"),
+                _py_cmd_wrapper("agyc-statusline", extra_flags="-S ", invoked_as="agyc-titleline"),
+                force=force,
+            )
+            _write_cmd_file(
+                os.path.join(bdir, "agyc-topbar.cmd"),
+                _py_cmd_wrapper("agyc-topbar", extra_flags="-S "),
+                force=force,
+            )
+            for al in sorted(all_to_wrap):
+                _write_cmd_file(
+                    os.path.join(bdir, f"{al}.cmd"),
+                    _py_cmd_wrapper("agyc", invoked_as=al),
+                    force=force,
+                )
+
+        ensure_statusline_configured()
+        return
+
     bin_dir = get_bin_dir()
     agyc_path = os.path.join(bin_dir, "agyc")
     if not os.path.exists(agyc_path):
@@ -509,35 +1142,50 @@ def sync_account_symlinks():
     ensure_statusline_configured()
 
 
+def sync_account_symlinks(force: bool = False):
+    """Sincroniza lanzadores (symlinks en Linux, wrappers `.cmd` en Windows) y hooks statusLine/title."""
+    sync_launchers(force=force)
+
+
 def ensure_statusline_configured():
-    """Garantiza que agyc-statusline y agyc-titleline estén configurados y activos en settings.json (0600)."""
+    """Garantiza que agyc-statusline y agyc-titleline estén configurados y activos en settings.json."""
     real_home = resolve_real_home()
     bin_dir = get_bin_dir()
     script_bin_dir = os.path.dirname(os.path.abspath(__file__))
     statusline_bin = os.path.join(bin_dir, "agyc-statusline")
     if not os.path.exists(statusline_bin):
-        for cand in [
+        cands = [
             os.path.join(script_bin_dir, "agyc-statusline"),
             os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher", "bin", "agyc-statusline"),
-            os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
-            os.path.join(real_home, ".local", "bin", "agyc-statusline"),
-        ]:
+        ]
+        if platform.IS_WINDOWS:
+            la = os.environ.get("LOCALAPPDATA", "").strip()
+            if la:
+                cands.append(os.path.join(la, "agyc", "bin", "agyc-statusline"))
+        else:
+            cands.extend([
+                os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin", "agyc-statusline"),
+                os.path.join(real_home, ".local", "bin", "agyc-statusline"),
+            ])
+        for cand in cands:
             if os.path.exists(cand):
                 try:
                     shutil.copy2(cand, statusline_bin)
-                    os.chmod(statusline_bin, 0o755)
+                    if not platform.IS_WINDOWS:
+                        os.chmod(statusline_bin, 0o755)
                     break
                 except Exception:
                     pass
 
-    titleline_bin = os.path.join(bin_dir, "agyc-titleline")
-    if os.path.exists(statusline_bin) and not os.path.exists(titleline_bin):
-        try:
-            if os.path.lexists(titleline_bin):
-                os.unlink(titleline_bin)
-            os.symlink(statusline_bin, titleline_bin)
-        except Exception:
-            pass
+    if not platform.IS_WINDOWS:
+        titleline_bin = os.path.join(bin_dir, "agyc-titleline")
+        if os.path.exists(statusline_bin) and not os.path.exists(titleline_bin):
+            try:
+                if os.path.lexists(titleline_bin):
+                    os.unlink(titleline_bin)
+                os.symlink(statusline_bin, titleline_bin)
+            except Exception:
+                pass
 
     base_paths = [
         get_base_dir(),
@@ -545,14 +1193,15 @@ def ensure_statusline_configured():
     ]
     homes_base = os.path.join(real_home, ".agyc_homes")
     if os.path.exists(homes_base):
-        try:
-            os.chmod(homes_base, 0o700)
-        except Exception:
-            pass
+        if not platform.IS_WINDOWS:
+            try:
+                os.chmod(homes_base, 0o700)
+            except Exception:
+                pass
         try:
             for h in os.listdir(homes_base):
                 iso_dir = os.path.join(homes_base, h)
-                if os.path.isdir(iso_dir) and not os.path.islink(iso_dir):
+                if not platform.IS_WINDOWS and os.path.isdir(iso_dir) and not os.path.islink(iso_dir):
                     try:
                         os.chmod(iso_dir, 0o700)
                     except Exception:
@@ -563,8 +1212,12 @@ def ensure_statusline_configured():
         except Exception:
             pass
 
-    desired_sl = {"type": "command", "command": "agyc-statusline", "enabled": True}
-    desired_tl = {"type": "command", "command": "agyc-titleline", "enabled": True}
+    sl_cmd = "agyc-statusline.cmd" if platform.IS_WINDOWS else "agyc-statusline"
+    tl_cmd = "agyc-titleline.cmd" if platform.IS_WINDOWS else "agyc-titleline"
+    desired_sl = {"type": "command", "command": sl_cmd, "enabled": True}
+    desired_tl = {"type": "command", "command": tl_cmd, "enabled": True}
+    valid_sl = ("agyc-statusline.cmd", "agyc-statusline") if platform.IS_WINDOWS else ("agyc-statusline",)
+    valid_tl = ("agyc-titleline.cmd", "agyc-titleline") if platform.IS_WINDOWS else ("agyc-titleline",)
 
     seen_real_files = set()
     for bp in base_paths:
@@ -583,15 +1236,15 @@ def ensure_statusline_configured():
             cur_sl = s.get("statusLine", {})
             cur_tl = s.get("title", {})
             changed = False
-            if cur_sl.get("command") != "agyc-statusline" or not cur_sl.get("enabled") or cur_sl.get("type") != "command":
+            if (not isinstance(cur_sl, dict)) or (cur_sl.get("command") not in valid_sl) or not cur_sl.get("enabled") or cur_sl.get("type") != "command":
                 s["statusLine"] = desired_sl
                 changed = True
-            if cur_tl.get("command") != "agyc-titleline" or not cur_tl.get("enabled") or cur_tl.get("type") != "command":
+            if (not isinstance(cur_tl, dict)) or (cur_tl.get("command") not in valid_tl) or not cur_tl.get("enabled") or cur_tl.get("type") != "command":
                 s["title"] = desired_tl
                 changed = True
             if changed:
                 _atomic_write_json(real_sp, s, mode=0o600, indent=2)
-            else:
+            elif not platform.IS_WINDOWS:
                 try:
                     os.chmod(real_sp, 0o600)
                 except Exception:
@@ -809,8 +1462,8 @@ def refresh_token_if_needed(
 ) -> tuple[dict, bool]:
     """
     Renueva el token OAuth solo cuando expira en <300s (o force=True).
-    Cuando se indica alias, protege la operación con fcntl.flock exclusivo sobre
-    ~/.cache/agyc/locks/{alias}.oauth.lock (0600), relee accounts/{alias}.json
+    Cuando se indica alias, protege la operación con `platform.acquire_file_lock` sobre
+    `<locks_dir>/{alias}.oauth.lock`, relee accounts/{alias}.json
     (double-checked locking) y sincroniza antigravity-oauth-token aislado antes de soltar el lock.
     """
     if not force and not _token_needs_refresh(token_data, margin_seconds=300):
@@ -821,15 +1474,7 @@ def refresh_token_if_needed(
 
     safe_alias = validate_alias(alias)
     lock_path = os.path.join(get_locks_dir(), f"{safe_alias}.oauth.lock")
-    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        os.chmod(lock_path, 0o600)
-    except Exception:
-        pass
-
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
+    with platform.acquire_file_lock(lock_path, blocking=True):
         # Double-checked locking: releer accounts/{alias}.json por si otro panel ya renovó el token
         disk_acc = load_account(safe_alias)
         working_td = token_data
@@ -863,12 +1508,6 @@ def refresh_token_if_needed(
             return new_td, True
 
         return working_td, False
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except Exception:
-            pass
-        os.close(lock_fd)
 
 
 def _post_cloudcode_json(url: str, body: dict, access_token: str, timeout: int = 5) -> dict | None:
@@ -934,7 +1573,7 @@ def fetch_quota_summary(access_token: str) -> dict | None:
     lca_payload = {
         "metadata": {
             "ideType": "ANTIGRAVITY",
-            "platform": "LINUX_AMD64",
+            "platform": "WINDOWS_AMD64" if platform.IS_WINDOWS else "LINUX_AMD64",
             "pluginType": "GEMINI",
         }
     }
@@ -1463,54 +2102,86 @@ def switch_active_account(alias: str, silent: bool = False) -> dict:
 def launch_real_agy(extra_args: list[str], alias: str | None = None):
     """Ejecuta el binario oficial de agy con --dangerously-skip-permissions por defecto."""
     real_home = resolve_real_home()
-    candidates = [
-        os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real"),
-        "/snap/antigravity-cli/current/bin/agy",
-        "/snap/antigravity-cli/23/bin/agy",
-    ]
-    real_agy = None
-    for c in candidates:
-        if os.path.isfile(c) and os.access(c, os.X_OK):
-            real_agy = c
-            break
+    real_agy = _find_real_agy_binary(real_home)
 
     if not real_agy:
-        for snap_c in sorted(glob.glob("/snap/antigravity-cli/*/bin/agy"), reverse=True):
-            if os.path.isfile(snap_c) and os.access(snap_c, os.X_OK):
-                real_agy = snap_c
-                break
-
-    if not real_agy:
+        if platform.IS_WINDOWS:
+            hint_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe")
+        else:
+            hint_path = os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agy-real")
         print(
-            f"{C_RED}Error:{C_RESET} No se encontró el binario nativo 'agy-real' en "
-            f"{os.path.join(real_home, '.gemini', 'antigravity-cli', 'bin', 'agy-real')} ni en /snap/antigravity-cli/current/bin/agy.",
+            f"{C_RED}Error:{C_RESET} No se encontró el binario nativo 'agy-real' en {hint_path}.",
             file=sys.stderr,
         )
         print(f"Ejecuta {C_CYAN}agyc update{C_RESET} para descargar e instalar el motor oficial.", file=sys.stderr)
         sys.exit(1)
 
-    if not os.environ.get("SSH_TTY") and not os.environ.get("SSH_CLIENT"):
-        os.environ["SSH_TTY"] = "/dev/pts/0"
-
-    os.environ["AGYC_REAL_HOME"] = real_home
+    env = os.environ.copy()
+    env["AGYC_REAL_HOME"] = real_home
+    isolated_home: str | None = None
     if alias:
         isolated_home = prepare_isolated_home(alias)
-        os.environ["HOME"] = isolated_home
+        env["HOME"] = isolated_home
+        if platform.IS_WINDOWS:
+            env["USERPROFILE"] = isolated_home
+            env["AGYC_ACCOUNT"] = alias
 
     cmd_args = [real_agy]
     if "--dangerously-skip-permissions" not in extra_args:
         cmd_args.append("--dangerously-skip-permissions")
     cmd_args.extend(extra_args)
 
-    os.execv(real_agy, cmd_args)
+    if not env.get("SSH_TTY") and not env.get("SSH_CLIENT"):
+        env["SSH_TTY"] = "/dev/pts/0"
+
+    if platform.IS_WINDOWS:
+        run_dir = platform.get_run_dir(real_home)
+        pid_file: str | None = None
+        proc = subprocess.Popen(cmd_args, env=env)
+        try:
+            pid_file = os.path.join(run_dir, f"{proc.pid}.json")
+            _atomic_write_json(
+                pid_file,
+                {
+                    "pid": proc.pid,
+                    "alias": alias or "",
+                    "home": isolated_home or real_home,
+                    "herdr_pane_id": env.get("HERDR_PANE_ID") or "",
+                    "started_at": time.time(),
+                },
+                mode=0o600,
+                indent=None,
+            )
+        except Exception:
+            pass
+        rc = 1
+        try:
+            while True:
+                try:
+                    rc = proc.wait()
+                    break
+                except KeyboardInterrupt:
+                    if proc.poll() is not None:
+                        rc = proc.returncode if proc.returncode is not None else 130
+                        break
+        finally:
+            if pid_file and os.path.exists(pid_file):
+                try:
+                    os.unlink(pid_file)
+                except OSError:
+                    pass
+        sys.exit(rc)
+
+    os.execve(real_agy, cmd_args, env)
 
 
 def prepare_isolated_home(alias: str) -> str:
     """
-    Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/ (0700).
-    - Enlaza dotfiles esenciales (.gitconfig, .git-credentials, .ssh, .config/gh, .config/herdr) desde real_home.
-    - Escribe directamente acc["token_data"] de forma atómica (0600) en isolated_gemini/antigravity-oauth-token.
-    - Fuerza que builtin y mcp en isolated_gemini sean siempre symlinks hacia shared_base.
+    Crea y prepara el HOME aislado para el alias dado en ~/.agyc_homes/<alias>/.
+    - Enlaza dotfiles/directorios esenciales (junctions NTFS en Windows, symlinks en Linux).
+    - Escribe directamente acc["token_data"] de forma atómica en isolated_gemini/antigravity-oauth-token.
+    - Enlaza carpetas compartidas (`accounts`, `conversations`, `brain`, `projects`, `annotations`,
+      `skills`, `builtin`, `mcp`, `bin`, `lib`) y archivos (`history.jsonl`, etc.).
     """
     alias = validate_alias(alias)
     real_home = resolve_real_home()
@@ -1520,37 +2191,31 @@ def prepare_isolated_home(alias: str) -> str:
 
     shared_base = get_base_dir()
 
-    # ── Enlazar dotfiles esenciales del usuario si existen en real_home y no existen en isolated_home ──
-    essential_dotfiles = (
-        ".gitconfig",
-        ".git-credentials",
-        ".ssh",
-        ".npm",
-        os.path.join(".config", "gh"),
-        os.path.join(".config", "herdr"),
-    )
-    for rel_dot in essential_dotfiles:
-        src_dot = os.path.join(real_home, rel_dot)
-        dst_dot = os.path.join(isolated_home, rel_dot)
-        if os.path.exists(src_dot) and not os.path.exists(dst_dot):
-            try:
-                if os.path.islink(dst_dot):
-                    os.unlink(dst_dot)
-                _ensure_private_dir(os.path.dirname(dst_dot), 0o700)
-                os.symlink(src_dot, dst_dot)
-            except Exception:
-                pass
+    # ── Enlazar dotfiles/carpetas esenciales del usuario ──
+    for rel_file in (".gitconfig", ".git-credentials"):
+        _ensure_file_link(os.path.join(real_home, rel_file), os.path.join(isolated_home, rel_file))
+
+    for rel_dir in (".ssh", ".npm", os.path.join(".config", "gh"), os.path.join(".config", "herdr")):
+        _ensure_dir_link(os.path.join(real_home, rel_dir), os.path.join(isolated_home, rel_dir))
+
+    if platform.IS_WINDOWS:
+        # Enlazar %APPDATA%\herdr si existe hacia <isolated_home>\AppData\Roaming\herdr
+        real_appdata = os.environ.get("APPDATA", "").strip()
+        if real_appdata and not platform._has_agyc_homes_segment(real_appdata):
+            src_herdr = os.path.join(real_appdata, "herdr")
+        else:
+            src_herdr = os.path.join(real_home, "AppData", "Roaming", "herdr")
+        if os.path.isdir(src_herdr):
+            dst_herdr = os.path.join(isolated_home, "AppData", "Roaming", "herdr")
+            _ensure_dir_link(src_herdr, dst_herdr)
 
     # ── Enlazar .gemini/config para compartir servidores MCP globales ──
     user_gemini_config = os.path.join(real_home, ".gemini", "config")
     iso_gemini_config = os.path.join(isolated_home, ".gemini", "config")
-    if os.path.exists(user_gemini_config) and not os.path.exists(iso_gemini_config):
-        try:
-            if os.path.islink(iso_gemini_config):
-                os.unlink(iso_gemini_config)
-            os.symlink(user_gemini_config, iso_gemini_config)
-        except Exception:
-            pass
+    if os.path.isdir(user_gemini_config):
+        _ensure_dir_link(user_gemini_config, iso_gemini_config)
+    elif os.path.isfile(user_gemini_config):
+        _ensure_file_link(user_gemini_config, iso_gemini_config)
 
     # ── Token aislado: escribir acc["token_data"] del alias de forma atómica (0600) ──
     acc = load_account(alias)
@@ -1566,30 +2231,22 @@ def prepare_isolated_home(alias: str) -> str:
         except Exception:
             pass
 
-    # ── Enlazar bin para compartir binarios ──
+    # ── Enlazar bin y lib compartidos ──
+    # Nota: en perfil aislado sólo copiamos/enlazamos bin si tiene contenido propio, evitando
+    # que `sync_launchers` cree binarios/wrappers antes de tiempo.
     user_gemini_bin = os.path.join(shared_base, "bin")
     if not os.path.exists(user_gemini_bin):
         user_gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
     iso_gemini_bin = os.path.join(isolated_gemini, "bin")
-    if os.path.exists(user_gemini_bin) and os.path.abspath(iso_gemini_bin) != os.path.abspath(user_gemini_bin):
-        if os.path.islink(iso_gemini_bin):
-            if os.readlink(iso_gemini_bin) != user_gemini_bin:
-                try:
-                    os.unlink(iso_gemini_bin)
-                    os.symlink(user_gemini_bin, iso_gemini_bin)
-                except Exception:
-                    pass
-        elif os.path.isdir(iso_gemini_bin):
-            try:
-                shutil.rmtree(iso_gemini_bin)
-                os.symlink(user_gemini_bin, iso_gemini_bin)
-            except Exception:
-                pass
-        elif not os.path.exists(iso_gemini_bin):
-            try:
-                os.symlink(user_gemini_bin, iso_gemini_bin)
-            except Exception:
-                pass
+    if os.path.isdir(user_gemini_bin):
+        _ensure_dir_link(user_gemini_bin, iso_gemini_bin, replace_existing_dir=True)
+
+    user_gemini_lib = os.path.join(shared_base, "lib")
+    if not os.path.exists(user_gemini_lib):
+        user_gemini_lib = os.path.join(real_home, ".gemini", "antigravity-cli", "lib")
+    iso_gemini_lib = os.path.join(isolated_gemini, "lib")
+    if os.path.isdir(user_gemini_lib):
+        _ensure_dir_link(user_gemini_lib, iso_gemini_lib, replace_existing_dir=True)
 
     # ── settings.json por perfil (0600): preserva el modelo elegido en cada cuenta (PRO vs ULTRA) ──
     iso_settings = os.path.join(isolated_gemini, "settings.json")
@@ -1611,74 +2268,51 @@ def prepare_isolated_home(alias: str) -> str:
         cur_mod = str(base_s.get("model") or "")
         if p_type in ("PRO", "FREE") and "carbon" in cur_mod.lower():
             base_s["model"] = "Gemini 4 Argon (High)"
-        base_s["statusLine"] = {"type": "command", "command": "agyc-statusline", "enabled": True}
-        base_s["title"] = {"type": "command", "command": "agyc-titleline", "enabled": True}
+        sl_cmd = "agyc-statusline.cmd" if platform.IS_WINDOWS else "agyc-statusline"
+        tl_cmd = "agyc-titleline.cmd" if platform.IS_WINDOWS else "agyc-titleline"
+        base_s["statusLine"] = {"type": "command", "command": sl_cmd, "enabled": True}
+        base_s["title"] = {"type": "command", "command": tl_cmd, "enabled": True}
         _atomic_write_json(iso_settings, base_s, mode=0o600, indent=2)
     except Exception:
         pass
 
-    # Garantizar que shared_base/mcp exista para que el symlink siempre apunte a un directorio válido
+    # Garantizar que shared_base/mcp exista para que el enlace siempre apunte a un directorio válido
     os.makedirs(os.path.join(shared_base, "mcp"), exist_ok=True)
 
     # ── Recursos compartidos para unificar conversaciones, memoria, skills, builtin y mcp ──
-    shared_items = [
+    shared_dirs = (
         "accounts",
         "projects",
         "brain",
         "conversations",
+        "annotations",
+        "skills",
+        "builtin",
+        "mcp",
+    )
+    force_link_dirs = {"builtin", "mcp"}
+    shared_files = (
         "conversation_summaries.db",
         "conversation_summaries.db-wal",
         "conversation_summaries.db-shm",
-        "annotations",
         "history.jsonl",
         "installation_id",
         "jetbox_summaries_proto.pb",
         "jetski_state.pbtxt",
-        "skills",
-        "builtin",
-        "mcp",
-    ]
-    force_symlink_dirs = {"builtin", "mcp"}
+    )
 
-    if os.path.abspath(isolated_gemini) != os.path.abspath(shared_base):
-        for item in shared_items:
-            target = os.path.join(shared_base, item)
-            link = os.path.join(isolated_gemini, item)
-            if not os.path.exists(target):
-                continue
-
-            if os.path.islink(link):
-                try:
-                    if os.readlink(link) == target:
-                        continue
-                    os.unlink(link)
-                except Exception:
-                    pass
-
-            if os.path.isdir(link) and not os.path.islink(link):
-                if item in force_symlink_dirs:
-                    try:
-                        shutil.rmtree(link)
-                    except Exception:
-                        continue
-                elif not os.listdir(link):
-                    try:
-                        os.rmdir(link)
-                    except Exception:
-                        continue
-                else:
-                    continue
-
-            if os.path.isfile(link) and not os.path.islink(link):
-                try:
-                    os.remove(link)
-                except Exception:
-                    continue
-
-            try:
-                os.symlink(target, link)
-            except Exception:
-                pass
+    if not _same_link_target(isolated_gemini, shared_base):
+        for item in shared_dirs:
+            _ensure_dir_link(
+                os.path.join(shared_base, item),
+                os.path.join(isolated_gemini, item),
+                replace_existing_dir=(item in force_link_dirs),
+            )
+        for item in shared_files:
+            _ensure_file_link(
+                os.path.join(shared_base, item),
+                os.path.join(isolated_gemini, item),
+            )
 
     return isolated_home
 
@@ -1738,37 +2372,18 @@ def _extract_agy_alias_fast(text: str | None) -> str | None:
 
 
 def _query_herdr_panes_fast(real_home: str, timeout: float = 0.06) -> tuple[list[dict], float | None, str]:
-    sock_path = os.environ.get("HERDR_SOCKET_PATH") or os.path.join(real_home, ".config", "herdr", "herdr.sock")
-    if not os.path.exists(sock_path):
-        return [], None, sock_path
+    sock_path = platform.default_herdr_socket_path(real_home)
     t0 = time.monotonic()
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    try:
-        s.connect(sock_path)
-        s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
-        chunks: list[bytes] = []
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-        raw = b"".join(chunks).split(b"\n", 1)[0]
-        if not raw:
-            return [], None, sock_path
-        resp = json.loads(raw.decode("utf-8", errors="replace"))
-        panes = (resp.get("result") or {}).get("panes") or []
-        elapsed_ms = (time.monotonic() - t0) * 1000.0
-        return (panes if isinstance(panes, list) else []), elapsed_ms, sock_path
-    except Exception:
+    resp = platform.query_herdr_ipc(
+        sock_path,
+        {"id": "1", "method": "pane.list", "params": {}},
+        timeout=timeout,
+    )
+    if not isinstance(resp, dict):
         return [], None, sock_path
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
+    panes = (resp.get("result") or {}).get("panes") or []
+    elapsed_ms = (time.monotonic() - t0) * 1000.0
+    return (panes if isinstance(panes, list) else []), elapsed_ms, sock_path
 
 
 def _short_pane_label(pane_id: str) -> str:
@@ -1780,17 +2395,18 @@ def _short_pane_label(pane_id: str) -> str:
 
 def _builtin_scan_active_herdr_panes(real_home: str | None = None) -> dict[str, list[dict]]:
     """
-    Escanea en <8ms los procesos vivos 'agy-real' en /proc y cruza con pane.list de Herdr
+    Delega el escaneo de procesos vivos a `platform.scan_agy_processes()` y cruza con `pane.list` de Herdr
     para mapear alias -> [{'pane_id': 'w3:p2', 'short_pane': 'p2', 'pid': ...}, ...].
     """
     rh = _strip_agyc_homes(real_home) if real_home else resolve_real_home()
-    rh_prefix = rh.rstrip("/") + "/"
 
     default_active = None
-    for cp in (
-        os.path.join(rh, ".gemini", "antigravity-cli", "accounts", "config.json"),
-        os.path.join(rh, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
-    ):
+    cfg_cands = [os.path.join(rh, ".gemini", "antigravity-cli", "accounts", "config.json")]
+    if not platform.IS_WINDOWS:
+        cfg_cands.append(
+            os.path.join(rh, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json")
+        )
+    for cp in cfg_cands:
         if os.path.exists(cp):
             try:
                 with open(cp, "r", encoding="utf-8") as f:
@@ -1801,88 +2417,32 @@ def _builtin_scan_active_herdr_panes(real_home: str | None = None) -> dict[str, 
             except Exception:
                 pass
 
-    herdr_panes, _, _ = _query_herdr_panes_fast(rh, timeout=0.06)
+    herdr_panes, h_lat_ms, _ = _query_herdr_panes_fast(rh, timeout=0.06)
+    herdr_online = h_lat_ms is not None
     live_pane_map: dict[str, dict] = {}
     for hp in herdr_panes:
         if isinstance(hp, dict) and hp.get("pane_id"):
             live_pane_map[str(hp["pane_id"])] = hp
 
-    # Por cada HERDR_PANE_ID elegir el proceso agy-real activo (ignorando procesos detenidos Ctrl+Z o zombies)
-    pane_best_proc: dict[str, tuple[tuple[int, int, int], str | None, int]] = {}
-    try:
-        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
-    except Exception:
-        pids = []
-
-    for pid in pids:
-        try:
-            with open(f"/proc/{pid}/comm", "rb") as cf:
-                if cf.read().strip() != b"agy-real":
-                    continue
-
-            state_active = 1
-            is_fg = 0
-            try:
-                with open(f"/proc/{pid}/stat", "rb") as sf:
-                    st_raw = sf.read().decode("utf-8", errors="ignore")
-                rp = st_raw.rfind(")")
-                if rp != -1:
-                    sfields = st_raw[rp + 2 :].split()
-                    if sfields:
-                        st_ch = sfields[0]
-                        if st_ch in ("Z", "X"):
-                            continue
-                        if st_ch in ("T", "t"):
-                            state_active = 0
-                        if len(sfields) >= 6 and sfields[2] == sfields[5]:
-                            is_fg = 1
-            except Exception:
-                pass
-
-            with open(f"/proc/{pid}/environ", "rb") as ef:
-                env_bytes = ef.read()
-
-            pane_id = None
-            home_val = ""
-            env_real_home = ""
-            alias_from_env = None
-            for item in env_bytes.split(b"\x00"):
-                if item.startswith(b"HERDR_PANE_ID="):
-                    pane_id = item[14:].decode("utf-8", errors="ignore").strip()
-                elif item.startswith(b"HOME="):
-                    home_val = item[5:].decode("utf-8", errors="ignore").strip()
-                    found = _extract_agy_alias_fast(home_val)
-                    if found:
-                        alias_from_env = found
-                elif item.startswith(b"ANTIGRAVITY_APP_DATA_DIR="):
-                    app_dir = item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
-                    found = _extract_agy_alias_fast(app_dir)
-                    if found and not alias_from_env:
-                        alias_from_env = found
-                elif item.startswith(b"AGYC_REAL_HOME="):
-                    env_real_home = item.split(b"=", 1)[1].decode("utf-8", errors="ignore").strip()
-
-            if not pane_id:
-                continue
-
-            # Aislar procesos pertenecientes a otro REAL_HOME (útil en tests con AGYC_REAL_HOME temporal)
-            belongs_to_rh = (
-                home_val == rh
-                or home_val.startswith(rh_prefix)
-                or (env_real_home and _strip_agyc_homes(env_real_home) == rh)
-            )
-            if not belongs_to_rh:
-                continue
-
-            if live_pane_map and pane_id not in live_pane_map:
-                continue
-
-            rank = (state_active, is_fg, pid)
-            prev = pane_best_proc.get(pane_id)
-            if prev is None or rank > prev[0]:
-                pane_best_proc[pane_id] = (rank, alias_from_env, pid)
-        except Exception:
+    run_dir = platform.get_run_dir(rh) if platform.IS_WINDOWS else None
+    procs = platform.scan_agy_processes(run_dir=run_dir)
+    pane_best_proc: dict[str, tuple[tuple[int, int, int, int], str | None, int]] = {}
+    for proc in procs:
+        pane_id = str(proc.get("herdr_pane_id") or "").strip()
+        if not pane_id:
             continue
+        if herdr_online and pane_id not in live_pane_map:
+            continue
+        raw_alias = proc.get("alias")
+        alias_env = normalize_alias(str(raw_alias)) if isinstance(raw_alias, str) and raw_alias.strip() else None
+        pid = int(proc.get("pid") or 0)
+        is_running = 1 if proc.get("is_running", True) else 0
+        has_alias = 1 if alias_env else 0
+        is_real = 1 if "agy-real" in str(proc.get("exe_name") or "").lower() else 0
+        rank = (is_running, has_alias, is_real, pid)
+        prev = pane_best_proc.get(pane_id)
+        if prev is None or rank > prev[0]:
+            pane_best_proc[pane_id] = (rank, alias_env, pid)
 
     result: dict[str, list[dict]] = {}
     for pane_id, (_, alias_env, pid) in pane_best_proc.items():
@@ -2500,9 +3060,25 @@ def cmd_add(args):
     except Exception:
         pass
 
+    def _parse_manual_oauth_input(raw_val: str) -> str | None:
+        if "code=" in raw_val:
+            parsed = urllib.parse.urlparse(raw_val)
+            p_qs = urllib.parse.parse_qs(parsed.query)
+            if "state" in p_qs and p_qs["state"][0] != oauth_state:
+                print(f"\n{C_RED}Error de seguridad:{C_RESET} El parámetro state de la URL no coincide.")
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+                sys.exit(1)
+            return p_qs.get("code", [raw_val])[0]
+        return raw_val
+
     auth_code = None
     start_t = time.time()
     is_tty = sys.stdin.isatty()
+    win_buf: list[str] = []
 
     while time.time() - start_t < 180:
         if OAuthCallbackHandler.auth_code:
@@ -2518,28 +3094,51 @@ def cmd_add(args):
             sys.exit(1)
 
         if is_tty:
-            try:
-                rlist, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if rlist:
-                    raw_val = sys.stdin.readline().strip()
-                    if raw_val:
-                        if "code=" in raw_val:
-                            parsed = urllib.parse.urlparse(raw_val)
-                            p_qs = urllib.parse.parse_qs(parsed.query)
-                            if "state" in p_qs and p_qs["state"][0] != oauth_state:
-                                print(f"\n{C_RED}Error de seguridad:{C_RESET} El parámetro state de la URL no coincide.")
-                                try:
-                                    server.shutdown()
-                                    server.server_close()
-                                except Exception:
-                                    pass
-                                sys.exit(1)
-                            auth_code = p_qs.get("code", [raw_val])[0]
+            if platform.IS_WINDOWS:
+                try:
+                    import msvcrt
+                    raw_val = None
+                    while msvcrt.kbhit():
+                        ch = msvcrt.getwch()
+                        if ch in ("\r", "\n"):
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            raw_val = "".join(win_buf).strip()
+                            win_buf.clear()
+                            break
+                        if ch == "\x03":
+                            raise KeyboardInterrupt
+                        if ch == "\x08":
+                            if win_buf:
+                                win_buf.pop()
+                                sys.stdout.write("\b \b")
+                                sys.stdout.flush()
+                        elif ch in ("\x00", "\xe0"):
+                            if msvcrt.kbhit():
+                                msvcrt.getwch()
                         else:
-                            auth_code = raw_val
+                            win_buf.append(ch)
+                            sys.stdout.write(ch)
+                            sys.stdout.flush()
+                    if raw_val:
+                        auth_code = _parse_manual_oauth_input(raw_val)
                         break
-            except Exception:
-                time.sleep(0.5)
+                    time.sleep(0.1)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    time.sleep(0.5)
+            else:
+                import select as _select
+                try:
+                    rlist, _, _ = _select.select([sys.stdin], [], [], 0.5)
+                    if rlist:
+                        raw_val = sys.stdin.readline().strip()
+                        if raw_val:
+                            auth_code = _parse_manual_oauth_input(raw_val)
+                            break
+                except Exception:
+                    time.sleep(0.5)
         else:
             time.sleep(0.5)
 
@@ -2775,23 +3374,35 @@ def cmd_remove(args):
     if os.path.exists(p):
         os.remove(p)
 
-    # Limpiar HOME aislado de este alias (~/.agyc_homes/{alias})
+    # Limpiar HOME aislado de este alias (~/.agyc_homes/{alias}) sin seguir junctions/symlinks
     iso_home = os.path.join(resolve_real_home(), ".agyc_homes", alias)
-    if os.path.exists(iso_home) and not os.path.islink(iso_home):
+    if (os.path.exists(iso_home) or platform.is_dir_link(iso_home)) and not os.path.islink(iso_home) and not platform.is_dir_link(iso_home):
         try:
-            shutil.rmtree(iso_home)
+            _safe_rmtree(iso_home)
         except Exception:
             pass
 
-    # Limpiar caché privada (~/.cache/agyc) y caché legacy (/tmp) del alias
+    if platform.IS_WINDOWS and not re.match(r"^(?:agy|agi)(?:0[1-9]|1[0-5])$", alias, re.IGNORECASE):
+        for bdir in _windows_bin_dirs():
+            cmd_p = os.path.join(bdir, f"{alias}.cmd")
+            if os.path.isfile(cmd_p):
+                try:
+                    os.unlink(cmd_p)
+                except OSError:
+                    pass
+
+    # Limpiar caché privada y caché legacy (/tmp en Linux) del alias
     priv_cache = get_cache_dir()
     cache_patterns = (
         glob.glob(os.path.join(priv_cache, f"quota_cache_{alias}.json*"))
         + glob.glob(os.path.join(priv_cache, f"*{alias}*.lock"))
         + glob.glob(os.path.join(priv_cache, "locks", f"{alias}.*lock*"))
-        + glob.glob(f"/tmp/agyc_quota_cache_{alias}.json*")
-        + glob.glob(f"/tmp/agyc_quota_refreshing_{alias}.lock")
     )
+    if not platform.IS_WINDOWS:
+        cache_patterns += (
+            glob.glob(f"/tmp/agyc_quota_cache_{alias}.json*")
+            + glob.glob(f"/tmp/agyc_quota_refreshing_{alias}.lock")
+        )
     for tmp_p in cache_patterns:
         try:
             os.remove(tmp_p)
@@ -2877,8 +3488,11 @@ def cmd_wipe(args):
     token_candidates = [
         token_path,
         os.path.join(real_home, ".gemini", "antigravity-cli", "antigravity-oauth-token"),
-        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token"),
     ]
+    if not platform.IS_WINDOWS:
+        token_candidates.append(
+            os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token")
+        )
     for base_tp in set(token_candidates):
         for p in [base_tp] + glob.glob(f"{base_tp}.tmp*"):
             if os.path.lexists(p):
@@ -2905,14 +3519,17 @@ def cmd_wipe(args):
         except Exception:
             pass
 
-    # 5. Limpiar cachés de cuotas y locks en ~/.cache/agyc y /tmp/agyc_quota_*
+    # 5. Limpiar cachés de cuotas, locks y run dir
     wipe_cache_patterns = (
         glob.glob(os.path.join(priv_cache_dir, "quota_cache_*.json*"))
         + glob.glob(os.path.join(priv_cache_dir, "*.lock"))
         + glob.glob(os.path.join(priv_cache_dir, "locks", "*.lock*"))
-        + glob.glob("/tmp/agyc_quota_cache_*.json*")
-        + glob.glob("/tmp/agyc_quota_refreshing_*.lock")
     )
+    if not platform.IS_WINDOWS:
+        wipe_cache_patterns += (
+            glob.glob("/tmp/agyc_quota_cache_*.json*")
+            + glob.glob("/tmp/agyc_quota_refreshing_*.lock")
+        )
     for cp in wipe_cache_patterns:
         try:
             os.remove(cp)
@@ -3074,8 +3691,8 @@ def cmd_quota(args):
 
 def get_active_model_name() -> str:
     candidate_paths = []
-    cur_home = os.environ.get("HOME", "").strip()
-    if cur_home and ("/.agyc_homes/" in cur_home or cur_home.endswith("/.agyc_homes")):
+    cur_home = (os.environ.get("HOME") or os.environ.get("USERPROFILE") or "").strip()
+    if cur_home and platform._has_agyc_homes_segment(cur_home):
         candidate_paths.append(os.path.join(cur_home, ".gemini", "antigravity-cli", "settings.json"))
     base = get_base_dir()
     candidate_paths.append(os.path.join(base, "settings.json"))
@@ -3601,7 +4218,7 @@ def cmd_note(args):
 def _copy_executable(src: str, dst: str) -> bool:
     if not os.path.exists(src):
         return False
-    if os.path.abspath(src) == os.path.abspath(dst):
+    if _same_link_target(src, dst):
         return True
     parent = os.path.dirname(dst)
     if not os.path.exists(parent):
@@ -3611,8 +4228,18 @@ def _copy_executable(src: str, dst: str) -> bool:
             os.unlink(dst)
         tmp = f"{dst}.tmp.{os.getpid()}"
         shutil.copy2(src, tmp)
-        os.chmod(tmp, 0o755)
-        os.replace(tmp, dst)
+        if not platform.IS_WINDOWS:
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dst)
+        else:
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, dst)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.005)
         return True
     except Exception:
         return False
@@ -3621,7 +4248,7 @@ def _copy_executable(src: str, dst: str) -> bool:
 def _copy_regular_file(src: str, dst: str, mode: int = 0o644) -> bool:
     if not os.path.isfile(src):
         return False
-    if os.path.abspath(src) == os.path.abspath(dst):
+    if _same_link_target(src, dst):
         return True
     parent = os.path.dirname(dst)
     try:
@@ -3630,48 +4257,58 @@ def _copy_regular_file(src: str, dst: str, mode: int = 0o644) -> bool:
             os.unlink(dst)
         tmp = f"{dst}.tmp.{os.getpid()}"
         shutil.copy2(src, tmp)
-        os.chmod(tmp, mode)
-        os.replace(tmp, dst)
+        if not platform.IS_WINDOWS:
+            os.chmod(tmp, mode)
+            os.replace(tmp, dst)
+        else:
+            for attempt in range(4):
+                try:
+                    os.replace(tmp, dst)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.005)
         return True
     except Exception:
         return False
 
 
-def _find_repo_dir(real_home: str) -> str:
-    self_repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-    candidates = [
-        self_repo,
-        os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher"),
-        "/home/aidev/proyectos/agyc-antigravity-cli-switcher",
-        os.path.join(real_home, "proyectos", "agyc"),
-    ]
-    for cand in candidates:
-        if cand and (os.path.isdir(os.path.join(cand, ".git")) or os.path.isdir(os.path.join(cand, "bin"))):
-            return cand
-    return os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher")
-
-
 def _sync_agyc_lib_dirs(repo_dir: str, real_home: str) -> list[str]:
-    """Sincroniza lib/agyc_core.py y lib/__init__.py hacia ~/.gemini/antigravity-cli/lib, snap lib/ y backup_agyc/lib/."""
+    """Sincroniza lib/agyc_core.py, lib/__init__.py y lib/platform/* hacia los directorios lib/ instalados."""
     synced: list[str] = []
     repo_lib = os.path.join(repo_dir, "lib")
     if not os.path.isdir(repo_lib):
         return synced
 
     target_libs = [os.path.join(real_home, ".gemini", "antigravity-cli", "lib")]
-    snap_base = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli")
-    if os.path.isdir(snap_base):
-        target_libs.append(os.path.join(snap_base, "lib"))
-    for bkp_root in (
-        os.path.join(real_home, "proyectos", "backup_agyc"),
-        "/home/aidev/proyectos/backup_agyc",
-    ):
-        if os.path.isdir(bkp_root):
-            cand_bkp = os.path.join(bkp_root, "lib")
-            if cand_bkp not in target_libs:
-                target_libs.append(cand_bkp)
+    if platform.IS_WINDOWS:
+        la = _use_real_localappdata(real_home)
+        if la:
+            la_lib = os.path.join(la, "agyc", "lib")
+            if la_lib not in target_libs:
+                target_libs.append(la_lib)
+    else:
+        snap_base = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli")
+        if os.path.isdir(snap_base):
+            target_libs.append(os.path.join(snap_base, "lib"))
+        for bkp_root in (
+            os.path.join(real_home, "proyectos", "backup_agyc"),
+            "/home/aidev/proyectos/backup_agyc",
+        ):
+            if os.path.isdir(bkp_root):
+                cand_bkp = os.path.join(bkp_root, "lib")
+                if cand_bkp not in target_libs:
+                    target_libs.append(cand_bkp)
 
-    for fname in ("agyc_core.py", "__init__.py"):
+    lib_rel_files = (
+        "agyc_core.py",
+        "__init__.py",
+        os.path.join("platform", "__init__.py"),
+        os.path.join("platform", "linux.py"),
+        os.path.join("platform", "win32.py"),
+    )
+    for fname in lib_rel_files:
         src_f = os.path.join(repo_lib, fname)
         if not os.path.isfile(src_f):
             continue
@@ -3688,7 +4325,8 @@ def _sync_agyc_lib_dirs(repo_dir: str, real_home: str) -> list[str]:
                 try:
                     with open(init_f, "w", encoding="utf-8") as f:
                         f.write("")
-                    os.chmod(init_f, 0o644)
+                    if not platform.IS_WINDOWS:
+                        os.chmod(init_f, 0o644)
                 except Exception:
                     pass
 
@@ -3713,7 +4351,7 @@ def _dir_size_bytes(root_path: str) -> int:
             with os.scandir(cur) as it:
                 for entry in it:
                     try:
-                        if entry.is_symlink():
+                        if entry.is_symlink() or platform.is_dir_link(entry.path):
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
@@ -3731,10 +4369,13 @@ def _resolve_base_dir_readonly(real_home: str) -> str:
         os.environ.get("ANTIGRAVITY_HOME"),
         os.environ.get("AGY_CONFIG_DIR"),
         os.path.join(real_home, ".gemini", "antigravity-cli"),
-        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli"),
     ]
+    if not platform.IS_WINDOWS:
+        candidates.append(
+            os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli")
+        )
     for c in candidates:
-        if c and "/.agyc_homes/" not in c and not c.endswith("/.agyc_homes") and os.path.exists(c):
+        if c and not platform._has_agyc_homes_segment(c) and os.path.exists(c):
             return c
     return os.path.join(real_home, ".gemini", "antigravity-cli")
 
@@ -3760,10 +4401,15 @@ def cmd_doctor(args):
     real_home = resolve_real_home()
     base_dir = _resolve_base_dir_readonly(real_home)
     bin_dir = os.path.join(base_dir, "bin")
-    local_bin = os.path.join(real_home, ".local", "bin")
+    local_la = _use_real_localappdata(real_home) if platform.IS_WINDOWS else None
+    local_bin = (
+        os.path.join(local_la, "agyc", "bin")
+        if local_la
+        else (bin_dir if platform.IS_WINDOWS else os.path.join(real_home, ".local", "bin"))
+    )
     accounts_dir = os.path.join(base_dir, "accounts")
     homes_base = os.path.join(real_home, ".agyc_homes")
-    cache_dir = os.path.join(real_home, ".cache", "agyc")
+    cache_dir = platform.get_cache_dir(real_home)
     locks_dir = os.path.join(cache_dir, "locks")
     repo_dir = _find_repo_dir(real_home)
     repo_bin = os.path.join(repo_dir, "bin")
@@ -3781,11 +4427,7 @@ def cmd_doctor(args):
     # ── [1/6] Binarios, Librería y PATH ──────────────────────────────────────────
     print(f"\n[{C_BOLD}{C_CYAN}1/6{C_RESET}] {C_BOLD}Binarios, Librería y PATH{C_RESET}")
 
-    agy_real_candidates = [
-        os.path.join(bin_dir, "agy-real"),
-        "/snap/antigravity-cli/current/bin/agy",
-    ] + sorted(glob.glob("/snap/antigravity-cli/*/bin/agy"), reverse=True)
-    agy_real_path = next((p for p in agy_real_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    agy_real_path = _find_real_agy_binary(real_home)
     if agy_real_path:
         ver_str = ""
         try:
@@ -3801,16 +4443,25 @@ def cmd_doctor(args):
             print(f"  {C_YELLOW}⚠{C_RESET} Motor agy-real versión '{ver_str or 'desconocida'}' (< 1.5.10) en {agy_real_path} — ejecuta 'agyc update'")
     else:
         issues_found += 1
-        print(f"  {C_RED}✗{C_RESET} Motor nativo 'agy-real' no encontrado en {bin_dir} ni en /snap — ejecuta 'agyc update'")
+        print(f"  {C_RED}✗{C_RESET} Motor nativo 'agy-real' / 'agy' no encontrado — ejecuta 'agyc update'")
 
     def _check_agy_wrapper(wpath: str) -> tuple[bool, str]:
         if not os.path.exists(wpath):
             return False, "faltante"
-        if not os.access(wpath, os.X_OK):
+        if not platform.IS_WINDOWS and not os.access(wpath, os.X_OK):
             return False, "sin permiso +x"
         try:
             with open(wpath, "rb") as wf:
                 head = wf.read(4096)
+            if platform.IS_WINDOWS:
+                if head.startswith(b"MZ"):
+                    return False, "es ejecutable nativo en vez de wrapper .cmd"
+                txt = head.decode("utf-8", errors="ignore")
+                if "agy-real.exe" not in txt or "--dangerously-skip-permissions" not in txt:
+                    return False, "contenido inesperado en wrapper .cmd"
+                if "agyc\\bin\\agy.cmd" in txt.lower():
+                    return False, "riesgo de recursión en wrapper .cmd"
+                return True, "wrapper .cmd seguro sin recursión"
             if head.startswith(b"\x7fELF"):
                 return False, "es binario ELF directo en vez de wrapper"
             txt = head.decode("utf-8", errors="ignore")
@@ -3826,89 +4477,110 @@ def cmd_doctor(args):
         except Exception as e:
             return False, f"error lectura ({e})"
 
+    def _is_bin_ready(bp: str) -> bool:
+        if platform.IS_WINDOWS:
+            return os.path.isfile(bp)
+        return os.path.exists(bp) and os.access(bp, os.X_OK)
+
+    win_bdirs = _windows_bin_dirs(real_home) if platform.IS_WINDOWS else [bin_dir, local_bin]
+    wrapper_targets = (
+        [os.path.join(d, "agy.cmd") for d in win_bdirs]
+        if platform.IS_WINDOWS
+        else [os.path.join(bin_dir, "agy"), os.path.join(local_bin, "agy")]
+    )
     wrapper_missing_or_bad = []
-    for wloc in (os.path.join(bin_dir, "agy"), os.path.join(local_bin, "agy")):
+    for wloc in wrapper_targets:
         ok_w, msg_w = _check_agy_wrapper(wloc)
         if not ok_w:
             wrapper_missing_or_bad.append((wloc, msg_w))
 
-    required_bins = ("agyc", "agyc-statusline", "agyc-titleline", "agyc-topbar")
+    required_bins = (
+        ("agyc.cmd", "agyc-statusline.cmd", "agyc-titleline.cmd", "agyc-topbar.cmd", "agyc", "agyc-statusline", "agyc-topbar")
+        if platform.IS_WINDOWS
+        else ("agyc", "agyc-statusline", "agyc-titleline", "agyc-topbar")
+    )
     missing_tools: list[str] = []
     for bname in required_bins:
-        for dloc in (bin_dir, local_bin):
+        for dloc in win_bdirs:
             bp = os.path.join(dloc, bname)
-            if not (os.path.exists(bp) and os.access(bp, os.X_OK)):
+            if not _is_bin_ready(bp):
                 missing_tools.append(bp)
 
     missing_launchers: list[str] = []
     for al in aliases:
-        for dloc in (bin_dir, local_bin):
-            lp = os.path.join(dloc, al)
-            if not (os.path.exists(lp) and os.access(lp, os.X_OK)):
+        lname = f"{al}.cmd" if platform.IS_WINDOWS else al
+        for dloc in win_bdirs:
+            lp = os.path.join(dloc, lname)
+            if not _is_bin_ready(lp):
                 missing_launchers.append(lp)
 
     installed_core = os.path.join(base_dir, "lib", "agyc_core.py")
+    installed_plat = os.path.join(base_dir, "lib", "platform", "__init__.py")
     repo_core = os.path.join(repo_dir, "lib", "agyc_core.py")
-    core_present = os.path.isfile(installed_core)
+    core_present = os.path.isfile(installed_core) and os.path.isfile(installed_plat)
 
     if fix and (wrapper_missing_or_bad or missing_tools or missing_launchers or (not core_present and os.path.isfile(repo_core))):
-        os.makedirs(bin_dir, exist_ok=True)
-        os.makedirs(local_bin, exist_ok=True)
-        src_agyc = os.path.join(repo_bin, "agyc") if os.path.isfile(os.path.join(repo_bin, "agyc")) else os.path.realpath(__file__)
-        for bname in ("agyc", "agy", "agyc-statusline", "agyc-topbar"):
-            src_b = src_agyc if bname == "agyc" else os.path.join(repo_bin, bname)
-            if not os.path.isfile(src_b):
-                alt_b = os.path.join(bin_dir, bname)
-                src_b = alt_b if os.path.isfile(alt_b) else src_b
-            if os.path.isfile(src_b):
-                for dloc in (bin_dir, local_bin):
-                    if _copy_executable(src_b, os.path.join(dloc, bname)):
+        if platform.IS_WINDOWS:
+            sync_launchers(force=True)
+            fixes_applied += len(wrapper_missing_or_bad) + len(missing_tools) + len(missing_launchers)
+        else:
+            os.makedirs(bin_dir, exist_ok=True)
+            os.makedirs(local_bin, exist_ok=True)
+            src_agyc = os.path.join(repo_bin, "agyc") if os.path.isfile(os.path.join(repo_bin, "agyc")) else os.path.realpath(__file__)
+            for bname in ("agyc", "agy", "agyc-statusline", "agyc-topbar"):
+                src_b = src_agyc if bname == "agyc" else os.path.join(repo_bin, bname)
+                if not os.path.isfile(src_b):
+                    alt_b = os.path.join(bin_dir, bname)
+                    src_b = alt_b if os.path.isfile(alt_b) else src_b
+                if os.path.isfile(src_b):
+                    for dloc in (bin_dir, local_bin):
+                        if _copy_executable(src_b, os.path.join(dloc, bname)):
+                            fixes_applied += 1
+            for dloc in (bin_dir, local_bin):
+                sl_p = os.path.join(dloc, "agyc-statusline")
+                tl_p = os.path.join(dloc, "agyc-titleline")
+                if os.path.exists(sl_p) and not os.path.exists(tl_p):
+                    try:
+                        if os.path.lexists(tl_p):
+                            os.unlink(tl_p)
+                        os.symlink(sl_p, tl_p)
                         fixes_applied += 1
-        for dloc in (bin_dir, local_bin):
-            sl_p = os.path.join(dloc, "agyc-statusline")
-            tl_p = os.path.join(dloc, "agyc-titleline")
-            if os.path.exists(sl_p) and not os.path.exists(tl_p):
-                try:
-                    if os.path.lexists(tl_p):
-                        os.unlink(tl_p)
-                    os.symlink(sl_p, tl_p)
-                    fixes_applied += 1
-                except Exception:
-                    pass
-        sync_account_symlinks()
-        canonical_agyc = os.path.join(bin_dir, "agyc")
-        all_ln = set(aliases) | {f"agy{i:02d}" for i in range(1, 16)} | {f"agi{i:02d}" for i in range(1, 16)}
-        for al in sorted(all_ln):
-            lp = os.path.join(local_bin, al)
-            if not os.path.exists(lp):
-                try:
-                    if os.path.lexists(lp):
-                        os.unlink(lp)
-                    os.symlink(canonical_agyc, lp)
-                    fixes_applied += 1
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
+            sync_launchers(force=True)
+            canonical_agyc = os.path.join(bin_dir, "agyc")
+            all_ln = set(aliases) | {f"agy{i:02d}" for i in range(1, 16)} | {f"agi{i:02d}" for i in range(1, 16)}
+            for al in sorted(all_ln):
+                lp = os.path.join(local_bin, al)
+                if not os.path.exists(lp):
+                    try:
+                        if os.path.lexists(lp):
+                            os.unlink(lp)
+                        os.symlink(canonical_agyc, lp)
+                        fixes_applied += 1
+                    except Exception:
+                        pass
         synced_libs = _sync_agyc_lib_dirs(repo_dir, real_home)
         fixes_applied += len(synced_libs)
         wrapper_missing_or_bad = [
             (wloc, _check_agy_wrapper(wloc)[1])
-            for wloc in (os.path.join(bin_dir, "agy"), os.path.join(local_bin, "agy"))
+            for wloc in wrapper_targets
             if not _check_agy_wrapper(wloc)[0]
         ]
         missing_tools = [
             os.path.join(dloc, bname)
             for bname in required_bins
-            for dloc in (bin_dir, local_bin)
-            if not (os.path.exists(os.path.join(dloc, bname)) and os.access(os.path.join(dloc, bname), os.X_OK))
+            for dloc in win_bdirs
+            if not _is_bin_ready(os.path.join(dloc, bname))
         ]
         missing_launchers = [
-            os.path.join(dloc, al)
+            os.path.join(dloc, f"{al}.cmd" if platform.IS_WINDOWS else al)
             for al in aliases
-            for dloc in (bin_dir, local_bin)
-            if not (os.path.exists(os.path.join(dloc, al)) and os.access(os.path.join(dloc, al), os.X_OK))
+            for dloc in win_bdirs
+            if not _is_bin_ready(os.path.join(dloc, f"{al}.cmd" if platform.IS_WINDOWS else al))
         ]
-        core_present = os.path.isfile(installed_core)
-        print(f"  {C_CYAN}🔧 Wrappers, binarios y symlinks resincronizados.{C_RESET}")
+        core_present = os.path.isfile(installed_core) and os.path.isfile(installed_plat)
+        print(f"  {C_CYAN}🔧 Wrappers, binarios y enlaces resincronizados.{C_RESET}")
 
     if not wrapper_missing_or_bad:
         print(f"  {C_GREEN}✓{C_RESET} Wrapper 'agy' verificado sin recursión en {bin_dir} y {local_bin}")
@@ -3922,34 +4594,46 @@ def cmd_doctor(args):
     else:
         issues_found += len(missing_tools) + (1 if missing_launchers else 0)
         if missing_tools:
-            print(f"  {C_YELLOW}⚠{C_RESET} Binarios/symlinks faltantes: {', '.join(missing_tools[:4])}")
+            print(f"  {C_YELLOW}⚠{C_RESET} Binarios/wrappers faltantes: {', '.join(missing_tools[:4])}")
         if missing_launchers:
             print(f"  {C_YELLOW}⚠{C_RESET} Lanzadores faltantes ({len(missing_launchers)}): {', '.join(missing_launchers[:4])}")
 
     if core_present:
-        print(f"  {C_GREEN}✓{C_RESET} Librería compartida instalada: {installed_core}")
+        print(f"  {C_GREEN}✓{C_RESET} Librería compartida y lib/platform instaladas en: {os.path.dirname(installed_core)}")
     elif os.path.isfile(repo_core):
         issues_found += 1
-        print(f"  {C_YELLOW}⚠{C_RESET} lib/agyc_core.py presente en repo pero aún no sincronizada en {installed_core}")
+        print(f"  {C_YELLOW}⚠{C_RESET} lib/agyc_core.py o lib/platform/ presente en repo pero aún no sincronizada en {os.path.dirname(installed_core)}")
     else:
         print(f"  {C_DIM}ℹ{C_RESET} lib/agyc_core.py no instalada aún en {installed_core} (usando motor interno integrado)")
 
-    env_path_dirs = [os.path.abspath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
-    if os.path.abspath(local_bin) in env_path_dirs or os.path.abspath(bin_dir) in env_path_dirs:
+    if platform.IS_WINDOWS:
+        env_path_dirs = {os.path.normcase(os.path.abspath(p)) for p in os.environ.get("PATH", "").split(os.pathsep) if p}
+        target_path_dirs = {os.path.normcase(os.path.abspath(d)) for d in win_bdirs}
+        path_ok = bool(env_path_dirs & target_path_dirs)
+    else:
+        env_path_dirs = [os.path.abspath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+        path_ok = os.path.abspath(local_bin) in env_path_dirs or os.path.abspath(bin_dir) in env_path_dirs
+
+    if path_ok:
         print(f"  {C_GREEN}✓{C_RESET} PATH incluye directorios ejecutables de agyc")
     else:
         issues_found += 1
         print(f"  {C_YELLOW}⚠{C_RESET} PATH actual no contiene {local_bin} ni {bin_dir}")
 
-    # ── [2/6] Permisos de Seguridad (0700 / 0600) ────────────────────────────────
-    print(f"\n[{C_BOLD}{C_CYAN}2/6{C_RESET}] {C_BOLD}Permisos de Seguridad (0700 / 0600){C_RESET}")
+    # ── [2/6] Permisos de Seguridad (0700 / 0600 en Linux; NTFS en Windows) ─────
+    if platform.IS_WINDOWS:
+        print(f"\n[{C_BOLD}{C_CYAN}2/6{C_RESET}] {C_BOLD}Seguridad NTFS y Directorios Privados{C_RESET}")
+    else:
+        print(f"\n[{C_BOLD}{C_CYAN}2/6{C_RESET}] {C_BOLD}Permisos de Seguridad (0700 / 0600){C_RESET}")
 
     expected_700_dirs = [accounts_dir, homes_base, cache_dir, locks_dir]
+    if platform.IS_WINDOWS:
+        expected_700_dirs.append(platform.get_run_dir(real_home))
     if os.path.isdir(homes_base):
         try:
             for h in sorted(os.listdir(homes_base)):
                 hp = os.path.join(homes_base, h)
-                if os.path.isdir(hp) and not os.path.islink(hp):
+                if os.path.isdir(hp) and not os.path.islink(hp) and not platform.is_dir_link(hp):
                     expected_700_dirs.append(hp)
         except Exception:
             pass
@@ -3965,11 +4649,15 @@ def cmd_doctor(args):
         except Exception:
             pass
 
-    for global_sec in (
+    global_sec_cands = [
         os.path.join(base_dir, "antigravity-oauth-token"),
         os.path.join(base_dir, "settings.json"),
-        os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token"),
-    ):
+    ]
+    if not platform.IS_WINDOWS:
+        global_sec_cands.append(
+            os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "antigravity-oauth-token")
+        )
+    for global_sec in global_sec_cands:
         if os.path.isfile(global_sec) and not os.path.islink(global_sec) and global_sec not in expected_600_files:
             expected_600_files.append(global_sec)
 
@@ -3989,51 +4677,75 @@ def cmd_doctor(args):
             if os.path.isfile(qcf) and not os.path.islink(qcf):
                 expected_600_files.append(qcf)
 
-    perm_issues: list[tuple[str, int, int | None]] = []
-    for dp in expected_700_dirs:
-        if not os.path.exists(dp):
-            if dp in (accounts_dir, homes_base, cache_dir, locks_dir):
-                perm_issues.append((dp, 0o700, None))
-            continue
-        cur_m = stat.S_IMODE(os.lstat(dp).st_mode)
-        if cur_m != 0o700:
-            perm_issues.append((dp, 0o700, cur_m))
-
-    for fp in expected_600_files:
-        cur_m = stat.S_IMODE(os.lstat(fp).st_mode)
-        if cur_m != 0o600:
-            perm_issues.append((fp, 0o600, cur_m))
-
-    if perm_issues and fix:
-        repaired_perms = 0
-        for p_item, exp_mode, cur_mode in perm_issues:
-            try:
-                if cur_mode is None:
-                    os.makedirs(p_item, mode=exp_mode, exist_ok=True)
-                os.chmod(p_item, exp_mode)
-                repaired_perms += 1
+    if platform.IS_WINDOWS:
+        missing_priv_dirs = [dp for dp in (accounts_dir, homes_base, cache_dir, locks_dir) if not os.path.isdir(dp)]
+        if fix:
+            for dp in missing_priv_dirs:
+                platform.ensure_private_dir(dp, 0o700)
                 fixes_applied += 1
-            except Exception as e:
-                issues_found += 1
-                print(f"  {C_RED}✗{C_RESET} No se pudo ajustar {oct(exp_mode)} en {p_item}: {e}")
-        print(f"  {C_CYAN}🔧 Permisos endurecidos automáticamente en {repaired_perms} ruta(s) (0700/0600).{C_RESET}")
-        perm_issues = []
-
-    if not perm_issues:
-        print(
-            f"  {C_GREEN}✓{C_RESET} {len(expected_700_dirs)} directorios en 0700 y "
-            f"{len(expected_600_files)} archivos sensibles en 0600 verificados"
-        )
+            hardened = 0
+            for dp in (accounts_dir, homes_base, cache_dir):
+                if os.path.isdir(dp) and platform.harden_ntfs_acl(dp):
+                    hardened += 1
+            if hardened:
+                fixes_applied += hardened
+                print(f"  {C_CYAN}🔧 ACLs NTFS endurecidas para el usuario actual en {hardened} directorio(s) privado(s).{C_RESET}")
+            missing_priv_dirs = [dp for dp in (accounts_dir, homes_base, cache_dir, locks_dir) if not os.path.isdir(dp)]
+        if not missing_priv_dirs:
+            print(
+                f"  {C_GREEN}✓{C_RESET} {len(expected_700_dirs)} directorios privados y "
+                f"{len(expected_600_files)} archivos sensibles verificados en NTFS"
+            )
+        else:
+            issues_found += len(missing_priv_dirs)
+            for dp in missing_priv_dirs:
+                print(f"  {C_YELLOW}⚠{C_RESET} Directorio privado faltante: {dp}")
     else:
-        issues_found += len(perm_issues)
-        for p_item, exp_mode, cur_mode in perm_issues[:6]:
-            cur_s = f"0{cur_mode:03o}" if cur_mode is not None else "no existe"
-            print(f"  {C_YELLOW}⚠{C_RESET} {p_item}: actual={cur_s}, esperado=0{exp_mode:03o}")
-        if len(perm_issues) > 6:
-            print(f"  {C_DIM}  ... y {len(perm_issues) - 6} ruta(s) adicional(es) por endurecer con --fix{C_RESET}")
+        perm_issues: list[tuple[str, int, int | None]] = []
+        for dp in expected_700_dirs:
+            if not os.path.exists(dp):
+                if dp in (accounts_dir, homes_base, cache_dir, locks_dir):
+                    perm_issues.append((dp, 0o700, None))
+                continue
+            cur_m = stat.S_IMODE(os.lstat(dp).st_mode)
+            if cur_m != 0o700:
+                perm_issues.append((dp, 0o700, cur_m))
 
-    # ── [3/6] Aislamiento de Perfiles, Symlinks y Duplicados ─────────────────────
-    print(f"\n[{C_BOLD}{C_CYAN}3/6{C_RESET}] {C_BOLD}Aislamiento de Perfiles, Symlinks y Duplicados{C_RESET}")
+        for fp in expected_600_files:
+            cur_m = stat.S_IMODE(os.lstat(fp).st_mode)
+            if cur_m != 0o600:
+                perm_issues.append((fp, 0o600, cur_m))
+
+        if perm_issues and fix:
+            repaired_perms = 0
+            for p_item, exp_mode, cur_mode in perm_issues:
+                try:
+                    if cur_mode is None:
+                        os.makedirs(p_item, mode=exp_mode, exist_ok=True)
+                    os.chmod(p_item, exp_mode)
+                    repaired_perms += 1
+                    fixes_applied += 1
+                except Exception as e:
+                    issues_found += 1
+                    print(f"  {C_RED}✗{C_RESET} No se pudo ajustar {oct(exp_mode)} en {p_item}: {e}")
+            print(f"  {C_CYAN}🔧 Permisos endurecidos automáticamente en {repaired_perms} ruta(s) (0700/0600).{C_RESET}")
+            perm_issues = []
+
+        if not perm_issues:
+            print(
+                f"  {C_GREEN}✓{C_RESET} {len(expected_700_dirs)} directorios en 0700 y "
+                f"{len(expected_600_files)} archivos sensibles en 0600 verificados"
+            )
+        else:
+            issues_found += len(perm_issues)
+            for p_item, exp_mode, cur_mode in perm_issues[:6]:
+                cur_s = f"0{cur_mode:03o}" if cur_mode is not None else "no existe"
+                print(f"  {C_YELLOW}⚠{C_RESET} {p_item}: actual={cur_s}, esperado=0{exp_mode:03o}")
+            if len(perm_issues) > 6:
+                print(f"  {C_DIM}  ... y {len(perm_issues) - 6} ruta(s) adicional(es) por endurecer con --fix{C_RESET}")
+
+    # ── [3/6] Aislamiento de Perfiles, Enlaces y Duplicados ─────────────────────
+    print(f"\n[{C_BOLD}{C_CYAN}3/6{C_RESET}] {C_BOLD}Aislamiento de Perfiles, Enlaces y Duplicados{C_RESET}")
 
     email_map: dict[str, list[str]] = {}
     revoked_aliases: list[str] = []
@@ -4071,18 +4783,25 @@ def cmd_doctor(args):
             except Exception:
                 reasons.append("token aislado corrupto")
 
-        for req_gem_link in ("builtin", "mcp"):
+        for req_gem_link in ("builtin", "mcp", "lib"):
             src_t = os.path.join(base_dir, req_gem_link)
             dst_l = os.path.join(iso_g, req_gem_link)
             if os.path.exists(src_t) or req_gem_link == "mcp":
-                if not os.path.islink(dst_l) or not os.path.exists(dst_l):
-                    reasons.append(f"symlink '{req_gem_link}' faltante/roto")
+                if not platform.is_dir_link(dst_l) or not os.path.exists(dst_l):
+                    reasons.append(f"enlace '{req_gem_link}' faltante/roto")
 
         for req_dot in (".gitconfig", ".ssh", os.path.join(".config", "herdr")):
             src_d = os.path.join(real_home, req_dot)
             dst_d = os.path.join(iso_h, req_dot)
             if os.path.exists(src_d) and not os.path.exists(dst_d):
                 reasons.append(f"enlace '{req_dot}' faltante")
+
+        if platform.IS_WINDOWS:
+            real_ad = os.environ.get("APPDATA", "").strip()
+            src_wh = os.path.join(real_ad, "herdr") if (real_ad and not platform._has_agyc_homes_segment(real_ad)) else os.path.join(real_home, "AppData", "Roaming", "herdr")
+            dst_wh = os.path.join(iso_h, "AppData", "Roaming", "herdr")
+            if os.path.isdir(src_wh) and (not platform.is_dir_link(dst_wh) or not os.path.isdir(dst_wh)):
+                reasons.append("junction 'AppData/Roaming/herdr' faltante")
 
         return acc_d, reasons
 
@@ -4116,7 +4835,8 @@ def cmd_doctor(args):
                 profile_drift_aliases.append((al, post_reasons))
 
     if not profile_drift_aliases:
-        print(f"  {C_GREEN}✓{C_RESET} {len(aliases)} perfil(es) aislados con tokens sincronizados y symlinks (builtin, mcp, dotfiles) OK")
+        link_kind = "junctions" if platform.IS_WINDOWS else "symlinks"
+        print(f"  {C_GREEN}✓{C_RESET} {len(aliases)} perfil(es) aislados con tokens sincronizados y {link_kind} (builtin, mcp, lib, dotfiles) OK")
     else:
         issues_found += len(profile_drift_aliases)
         for al, rlist in profile_drift_aliases:
@@ -4145,15 +4865,17 @@ def cmd_doctor(args):
     if os.path.isdir(homes_base):
         profile_dirs = [
             h for h in sorted(os.listdir(homes_base))
-            if os.path.isdir(os.path.join(homes_base, h)) and not os.path.islink(os.path.join(homes_base, h))
+            if os.path.isdir(os.path.join(homes_base, h))
+            and not os.path.islink(os.path.join(homes_base, h))
+            and not platform.is_dir_link(os.path.join(homes_base, h))
         ]
         size_jobs: list[tuple[str, str, str]] = []
         for h in profile_dirs:
             hp = os.path.join(homes_base, h)
             npm_p = os.path.join(hp, ".npm")
-            if os.path.islink(npm_p) and os.path.exists(npm_p):
+            if platform.is_dir_link(npm_p) and os.path.exists(npm_p):
                 linked_npm_count += 1
-            elif os.path.isdir(npm_p) and not os.path.islink(npm_p):
+            elif os.path.isdir(npm_p) and not platform.is_dir_link(npm_p):
                 size_jobs.append(("npm", h, npm_p))
             else:
                 unlinked_npm_profiles.append((h, npm_p))
@@ -4163,7 +4885,7 @@ def cmd_doctor(args):
                     if sub in (".gemini", ".npm", ".ssh", ".gitconfig", ".git-credentials"):
                         continue
                     sp = os.path.join(hp, sub)
-                    if os.path.isdir(sp) and not os.path.islink(sp):
+                    if os.path.isdir(sp) and not platform.is_dir_link(sp):
                         size_jobs.append(("other", f"{h}/{sub}", sp))
             except Exception:
                 pass
@@ -4177,25 +4899,26 @@ def cmd_doctor(args):
                 elif sz >= 5 * 1024 * 1024:
                     info_large_dirs.append((label, sz))
 
-    my_uid = os.getuid()
-    real_home_abs = os.path.abspath(real_home)
     stale_tmp_files: list[str] = []
-    for tp in sorted(glob.glob("/tmp/agyc_*")):
-        try:
-            tp_abs = os.path.abspath(tp)
-            if real_home_abs == tp_abs or real_home_abs.startswith(tp_abs + "/"):
-                continue
-            lst = os.lstat(tp)
-            if lst.st_uid == my_uid and not stat.S_ISDIR(lst.st_mode):
-                stale_tmp_files.append(tp)
-        except Exception:
-            pass
+    if not platform.IS_WINDOWS:
+        my_uid = os.getuid()
+        real_home_abs = os.path.abspath(real_home)
+        for tp in sorted(glob.glob("/tmp/agyc_*")):
+            try:
+                tp_abs = os.path.abspath(tp)
+                if real_home_abs == tp_abs or real_home_abs.startswith(tp_abs + "/"):
+                    continue
+                lst = os.lstat(tp)
+                if lst.st_uid == my_uid and not stat.S_ISDIR(lst.st_mode):
+                    stale_tmp_files.append(tp)
+            except Exception:
+                pass
 
     if fix and (dup_npm_entries or unlinked_npm_profiles or stale_tmp_files):
         real_npm = os.path.join(real_home, ".npm")
-        if os.path.islink(real_npm) and not os.path.exists(real_npm):
+        if (os.path.islink(real_npm) or platform.is_dir_link(real_npm)) and not os.path.exists(real_npm):
             try:
-                os.unlink(real_npm)
+                _safe_unlink_link(real_npm)
             except Exception:
                 pass
         os.makedirs(real_npm, exist_ok=True)
@@ -4203,9 +4926,9 @@ def cmd_doctor(args):
         unified_count = 0
         for h, npm_p, sz in dup_npm_entries:
             try:
-                if os.path.realpath(npm_p) != os.path.realpath(real_npm) and not os.path.islink(npm_p):
-                    shutil.rmtree(npm_p)
-                    os.symlink(real_npm, npm_p)
+                if not _same_link_target(os.path.realpath(npm_p), os.path.realpath(real_npm)) and not platform.is_dir_link(npm_p):
+                    _safe_rmtree(npm_p)
+                    platform.create_dir_link(real_npm, npm_p)
                     freed_npm_bytes += sz
                     unified_count += 1
                     linked_npm_count += 1
@@ -4216,10 +4939,10 @@ def cmd_doctor(args):
 
         for h, npm_p in unlinked_npm_profiles:
             try:
-                if os.path.islink(npm_p):
-                    os.unlink(npm_p)
+                if platform.is_dir_link(npm_p) or os.path.islink(npm_p):
+                    _safe_unlink_link(npm_p)
                 if not os.path.exists(npm_p):
-                    os.symlink(real_npm, npm_p)
+                    platform.create_dir_link(real_npm, npm_p)
                     linked_npm_count += 1
                     fixes_applied += 1
             except Exception:
@@ -4247,7 +4970,7 @@ def cmd_doctor(args):
         stale_tmp_files = []
 
     if not dup_npm_entries:
-        print(f"  {C_GREEN}✓{C_RESET} Cachés .npm unificadas por symlink ({linked_npm_count} perfil(es) -> {os.path.join(real_home, '.npm')})")
+        print(f"  {C_GREEN}✓{C_RESET} Cachés .npm unificadas por enlace ({linked_npm_count} perfil(es) -> {os.path.join(real_home, '.npm')})")
     else:
         issues_found += 1
         total_npm_mb = sum(x[2] for x in dup_npm_entries) / (1024.0 * 1024.0)
@@ -4256,11 +4979,12 @@ def cmd_doctor(args):
             f"(usa 'agyc doctor --fix' para unificar a ~/.npm)"
         )
 
-    if stale_tmp_files:
-        issues_found += 1
-        print(f"  {C_YELLOW}⚠{C_RESET} {len(stale_tmp_files)} archivo(s) legacy en /tmp/agyc_* pendientes de limpieza")
-    else:
-        print(f"  {C_GREEN}✓{C_RESET} 0 archivos legacy en /tmp/agyc_*")
+    if not platform.IS_WINDOWS:
+        if stale_tmp_files:
+            issues_found += 1
+            print(f"  {C_YELLOW}⚠{C_RESET} {len(stale_tmp_files)} archivo(s) legacy en /tmp/agyc_* pendientes de limpieza")
+        else:
+            print(f"  {C_GREEN}✓{C_RESET} 0 archivos legacy en /tmp/agyc_*")
 
     if info_large_dirs:
         info_large_dirs.sort(key=lambda x: x[1], reverse=True)
@@ -4276,6 +5000,9 @@ def cmd_doctor(args):
         if os.path.isdir(os.path.dirname(iso_sp)):
             settings_targets.append(iso_sp)
 
+    valid_sl_cmds = ("agyc-statusline", "agyc-statusline.cmd") if platform.IS_WINDOWS else ("agyc-statusline",)
+    valid_tl_cmds = ("agyc-titleline", "agyc-titleline.cmd") if platform.IS_WINDOWS else ("agyc-titleline",)
+
     def _check_settings_hooks(paths: list[str]) -> list[str]:
         bad: list[str] = []
         for sp in paths:
@@ -4288,10 +5015,10 @@ def cmd_doctor(args):
                 sl = s.get("statusLine") or {}
                 tl = s.get("title") or {}
                 if (
-                    sl.get("command") != "agyc-statusline"
+                    sl.get("command") not in valid_sl_cmds
                     or not sl.get("enabled")
                     or sl.get("type") != "command"
-                    or tl.get("command") != "agyc-titleline"
+                    or tl.get("command") not in valid_tl_cmds
                     or not tl.get("enabled")
                     or tl.get("type") != "command"
                 ):
@@ -4327,16 +5054,106 @@ def cmd_doctor(args):
         issues_found += len(bad_settings)
         print(f"  {C_YELLOW}⚠{C_RESET} {len(bad_settings)} archivo(s) settings.json sin hooks completos (agyc-statusline / agyc-titleline)")
 
-    herdr_toml = os.path.join(real_home, ".config", "herdr", "config.toml")
+    herdr_toml_cands = []
+    if platform.IS_WINDOWS:
+        real_ad = os.environ.get("APPDATA", "").strip()
+        if real_ad and not platform._has_agyc_homes_segment(real_ad):
+            herdr_toml_cands.append(os.path.join(real_ad, "herdr", "config.toml"))
+        herdr_toml_cands.append(os.path.join(real_home, "AppData", "Roaming", "herdr", "config.toml"))
+    herdr_toml_cands.append(os.path.join(real_home, ".config", "herdr", "config.toml"))
+    herdr_toml = next((p for p in herdr_toml_cands if os.path.isfile(p)), herdr_toml_cands[0])
     if os.path.isfile(herdr_toml):
         try:
             with open(herdr_toml, "r", encoding="utf-8", errors="ignore") as f:
                 toml_txt = f.read()
-            if "agyc-topbar" in toml_txt:
-                print(f"  {C_GREEN}✓{C_RESET} Widget global 'agyc-topbar' configurado en {herdr_toml}")
+            has_topbar = "agyc-topbar" in toml_txt
+            has_borders = bool(re.search(r"(?m)^\s*show_agent_labels_on_pane_borders\s*=\s*true\b", toml_txt))
+            has_toast = "[ui.toast]" in toml_txt
+
+            if has_topbar and has_borders:
+                print(f"  {C_GREEN}✓{C_RESET} Widget global 'agyc-topbar' y bordes de panel configurados en {herdr_toml}")
+            elif fix:
+                new_txt = toml_txt
+                if not has_borders:
+                    if re.search(r"(?m)^\s*show_agent_labels_on_pane_borders\s*=", new_txt):
+                        new_txt = re.sub(
+                            r"(?m)^\s*show_agent_labels_on_pane_borders\s*=.*$",
+                            "show_agent_labels_on_pane_borders = true",
+                            new_txt,
+                            count=1,
+                        )
+                    elif re.search(r"(?m)^\[ui\]\s*$", new_txt):
+                        new_txt = re.sub(
+                            r"(?m)^(\[ui\]\s*)$",
+                            "\\1\nshow_agent_labels_on_pane_borders = true",
+                            new_txt,
+                            count=1,
+                        )
+                    else:
+                        if new_txt and not new_txt.endswith("\n"):
+                            new_txt += "\n"
+                        new_txt += '\n[ui]\nshow_agent_labels_on_pane_borders = true\ntab_bar_position = "top"\n'
+
+                if not has_topbar:
+                    if platform.IS_WINDOWS:
+                        topbar_cmd = os.path.join(real_home, ".gemini", "antigravity-cli", "bin", "agyc-topbar.cmd")
+                    else:
+                        topbar_cmd = os.path.join(real_home, ".local", "bin", "agyc-topbar")
+                    if new_txt and not new_txt.endswith("\n"):
+                        new_txt += "\n"
+                    new_txt += (
+                        "\n[[ui.tab_bar_right]]\n"
+                        'type = "command"\n'
+                        f"command = {json.dumps(topbar_cmd)}\n"
+                        "interval_seconds = 10\n"
+                        "timeout_seconds = 2\n"
+                    )
+
+                if not has_toast:
+                    if new_txt and not new_txt.endswith("\n"):
+                        new_txt += "\n"
+                    new_txt += '\n[ui.toast]\ndelivery = "herdr"\n'
+
+                try:
+                    import tomllib  # Python 3.11+
+                    tomllib.loads(new_txt)
+                except ImportError:
+                    pass
+                tmp_toml = f"{herdr_toml}.tmp.{os.getpid()}"
+                with open(tmp_toml, "w", encoding="utf-8") as tf:
+                    tf.write(new_txt)
+                os.replace(tmp_toml, herdr_toml)
+                repairs_applied += 1
+                print(
+                    f"  {C_CYAN}🔧{C_RESET} Configurado Herdr (show_agent_labels_on_pane_borders + agyc-topbar) en {herdr_toml}"
+                )
+                herdr_exe = None
+                for h_cand in (
+                    os.environ.get("HERDR_BIN_PATH", "").strip(),
+                    shutil.which("herdr.exe" if platform.IS_WINDOWS else "herdr"),
+                    shutil.which("herdr"),
+                ):
+                    if h_cand and os.path.isfile(h_cand):
+                        herdr_exe = h_cand
+                        break
+                if herdr_exe:
+                    try:
+                        subprocess.run(
+                            [herdr_exe, "server", "reload-config"],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2,
+                        )
+                    except Exception:
+                        pass
             else:
                 issues_found += 1
-                print(f"  {C_YELLOW}⚠{C_RESET} 'agyc-topbar' no aparece en {herdr_toml}")
+                missing_parts = []
+                if not has_borders:
+                    missing_parts.append("show_agent_labels_on_pane_borders")
+                if not has_topbar:
+                    missing_parts.append("agyc-topbar")
+                print(f"  {C_YELLOW}⚠{C_RESET} Falta {', '.join(missing_parts)} en {herdr_toml}")
         except Exception:
             print(f"  {C_YELLOW}⚠{C_RESET} No se pudo leer {herdr_toml}")
     else:
@@ -4429,7 +5246,7 @@ def cmd_update(args):
     print(f"\n{C_BOLD}{C_WHITE}ACTUALIZADOR DE AGYC Y ANTIGRAVITY (v1.6){C_RESET}")
     print(f"{C_DIM}{'=' * 68}{C_RESET}\n")
 
-    self_repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    self_repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     repo_candidates = [
         self_repo,
         os.path.join(real_home, "proyectos", "agyc-antigravity-cli-switcher"),
@@ -4469,95 +5286,116 @@ def cmd_update(args):
                     tmp_self = f"{self_path}.tmp.{os.getpid()}"
                     with open(tmp_self, "w", encoding="utf-8") as f:
                         f.write(code)
-                    os.chmod(tmp_self, 0o755)
+                    if not platform.IS_WINDOWS:
+                        os.chmod(tmp_self, 0o755)
                     os.replace(tmp_self, self_path)
                     print(f"  {C_GREEN}✓ Binario agyc actualizado desde GitHub.{C_RESET}")
         except Exception as e:
             print(f"  {C_YELLOW}⚠ Descarga omitida: {e}{C_RESET}")
 
-    # 2. Sincronizar agyc, agy (wrapper), agyc-statusline, agyc-topbar, lib/agyc_core.py y symlink agyc-titleline
+    # 2. Sincronizar agyc, wrappers, statusline, titleline, topbar y lib/ (incl. lib/platform/)
     print(f"\n[{C_CYAN}2/4{C_RESET}] Sincronizando binarios, librería core, wrappers, statusline, titleline y topbar...")
     gemini_bin = os.path.join(real_home, ".gemini", "antigravity-cli", "bin")
-    snap_bin = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin")
-    local_bin = os.path.join(real_home, ".local", "bin")
-    backup_bin = os.path.join(real_home, "proyectos", "backup_agyc", "bin")
-
     os.makedirs(gemini_bin, exist_ok=True)
-    os.makedirs(local_bin, exist_ok=True)
 
-    target_bin_dirs = [gemini_bin, snap_bin, local_bin, backup_bin]
-    managed_bins = ["agyc", "agy", "agyc-statusline", "agyc-topbar"]
+    if platform.IS_WINDOWS:
+        for bdir in _windows_bin_dirs(real_home):
+            os.makedirs(bdir, exist_ok=True)
+        for synced_lib in _sync_agyc_lib_dirs(repo_dir, real_home):
+            print(f"  {C_GREEN}✓{C_RESET} {synced_lib}")
+        sync_launchers(force=True)
+        for bdir in _windows_bin_dirs(real_home):
+            print(f"  {C_GREEN}✓{C_RESET} Wrappers .cmd sincronizados en {bdir}")
+    else:
+        snap_bin = os.path.join(real_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "bin")
+        local_bin = os.path.join(real_home, ".local", "bin")
+        backup_bin = os.path.join(real_home, "proyectos", "backup_agyc", "bin")
 
-    for bname in managed_bins:
-        src_path = os.path.join(repo_bin, bname)
-        if bname == "agyc" and not os.path.exists(src_path):
-            src_path = bin_src
-        if not os.path.exists(src_path):
-            continue
-        for tdir in target_bin_dirs:
-            if os.path.isdir(tdir):
-                dst_path = os.path.join(tdir, bname)
-                if _copy_executable(src_path, dst_path):
-                    print(f"  {C_GREEN}✓{C_RESET} {dst_path}")
+        os.makedirs(local_bin, exist_ok=True)
 
-    for synced_lib in _sync_agyc_lib_dirs(repo_dir, real_home):
-        print(f"  {C_GREEN}✓{C_RESET} {synced_lib}")
+        target_bin_dirs = [gemini_bin, snap_bin, local_bin, backup_bin]
+        managed_bins = ["agyc", "agy", "agyc-statusline", "agyc-topbar"]
 
-    # Symlink agyc-titleline -> agyc-statusline en ~/.gemini/antigravity-cli/bin, snap y ~/.local/bin
-    for tdir in [gemini_bin, snap_bin, local_bin]:
-        if not os.path.isdir(tdir):
-            continue
-        sl_path = os.path.join(tdir, "agyc-statusline")
-        tl_path = os.path.join(tdir, "agyc-titleline")
-        if os.path.exists(sl_path):
+        for bname in managed_bins:
+            src_path = os.path.join(repo_bin, bname)
+            if bname == "agyc" and not os.path.exists(src_path):
+                src_path = bin_src
+            if not os.path.exists(src_path):
+                continue
+            for tdir in target_bin_dirs:
+                if os.path.isdir(tdir):
+                    dst_path = os.path.join(tdir, bname)
+                    if _copy_executable(src_path, dst_path):
+                        print(f"  {C_GREEN}✓{C_RESET} {dst_path}")
+
+        for synced_lib in _sync_agyc_lib_dirs(repo_dir, real_home):
+            print(f"  {C_GREEN}✓{C_RESET} {synced_lib}")
+
+        # Symlink agyc-titleline -> agyc-statusline en ~/.gemini/antigravity-cli/bin, snap y ~/.local/bin
+        for tdir in [gemini_bin, snap_bin, local_bin]:
+            if not os.path.isdir(tdir):
+                continue
+            sl_path = os.path.join(tdir, "agyc-statusline")
+            tl_path = os.path.join(tdir, "agyc-titleline")
+            if os.path.exists(sl_path):
+                try:
+                    if os.path.lexists(tl_path):
+                        os.unlink(tl_path)
+                    os.symlink(sl_path, tl_path)
+                    print(f"  {C_GREEN}✓{C_RESET} {tl_path} -> {sl_path}")
+                except Exception:
+                    pass
+
+        # Sincronizar lanzadores agy01..agy15 y agi01..agi15 en ~/.local/bin y ~/.gemini/antigravity-cli/bin
+        canonical_agyc = os.path.join(gemini_bin, "agyc")
+        all_aliases = set(list_account_aliases())
+        for i in range(1, 16):
+            all_aliases.add(f"agy{i:02d}")
+            all_aliases.add(f"agi{i:02d}")
+
+        for al in sorted(all_aliases):
+            lp = os.path.join(local_bin, al)
             try:
-                if os.path.lexists(tl_path):
-                    os.unlink(tl_path)
-                os.symlink(sl_path, tl_path)
-                print(f"  {C_GREEN}✓{C_RESET} {tl_path} -> {sl_path}")
+                if os.path.lexists(lp):
+                    os.unlink(lp)
+                os.symlink(canonical_agyc, lp)
+            except Exception:
+                _copy_executable(bin_src, lp)
+        agi_local = os.path.join(local_bin, "agi")
+        agy_local = os.path.join(local_bin, "agy")
+        if os.path.exists(agy_local):
+            try:
+                if os.path.lexists(agi_local):
+                    os.unlink(agi_local)
+                os.symlink(agy_local, agi_local)
             except Exception:
                 pass
-
-    # Sincronizar lanzadores agy01..agy15 y agi01..agi15 en ~/.local/bin y ~/.gemini/antigravity-cli/bin
-    canonical_agyc = os.path.join(gemini_bin, "agyc")
-    all_aliases = set(list_account_aliases())
-    for i in range(1, 16):
-        all_aliases.add(f"agy{i:02d}")
-        all_aliases.add(f"agi{i:02d}")
-
-    for al in sorted(all_aliases):
-        lp = os.path.join(local_bin, al)
-        try:
-            if os.path.lexists(lp):
-                os.unlink(lp)
-            os.symlink(canonical_agyc, lp)
-        except Exception:
-            _copy_executable(bin_src, lp)
-    agi_local = os.path.join(local_bin, "agi")
-    agy_local = os.path.join(local_bin, "agy")
-    if os.path.exists(agy_local):
-        try:
-            if os.path.lexists(agi_local):
-                os.unlink(agi_local)
-            os.symlink(agy_local, agi_local)
-        except Exception:
-            pass
-    print(f"  {C_GREEN}✓{C_RESET} Lanzadores directos sincronizados en {local_bin}")
+        print(f"  {C_GREEN}✓{C_RESET} Lanzadores directos sincronizados en {local_bin}")
 
     # 3. Comprobar motor oficial de Google Antigravity CLI (agy-real)
-    # IMPORTANTE: jamás sobrescribir ~/.local/bin/agy con native_bin; ~/.local/bin/agy usa el wrapper bin/agy.
+    # IMPORTANTE: jamás sobrescribir ~/.local/bin/agy ni wrappers .cmd propios con el binario nativo.
     print(f"\n[{C_CYAN}3/4{C_RESET}] Comprobando motor oficial de Google Antigravity CLI...")
-    native_bin = os.path.join(gemini_bin, "agy-real")
+    native_bin = os.path.join(gemini_bin, "agy-real.exe" if platform.IS_WINDOWS else "agy-real")
     current_ver = None
-    if os.path.exists(native_bin):
+    ver_probe_bin = native_bin if os.path.isfile(native_bin) else _find_real_agy_binary(real_home)
+    if ver_probe_bin and os.path.exists(ver_probe_bin):
         try:
-            ver_res = subprocess.run([native_bin, "--version"], capture_output=True, text=True, timeout=5)
-            current_ver = ver_res.stdout.strip()
+            ver_res = subprocess.run([ver_probe_bin, "--version"], capture_output=True, text=True, timeout=5)
+            current_ver = (ver_res.stdout or ver_res.stderr or "").strip().splitlines()[0].strip()
         except Exception:
             pass
 
+    if platform.IS_WINDOWS:
+        # Limpiar cualquier agy-real.exe.old previo si ya no está bloqueado
+        for old_cand in glob.glob(f"{native_bin}*.old"):
+            try:
+                os.unlink(old_cand)
+            except OSError:
+                pass
+
     try:
-        manifest_url = "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/linux_amd64.json"
+        manifest_name = "windows_amd64.json" if platform.IS_WINDOWS else "linux_amd64.json"
+        manifest_url = f"https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/{manifest_name}"
         req = urllib.request.Request(manifest_url, headers={"User-Agent": "curl/7.88.1"})
         with urllib.request.urlopen(req, timeout=8) as resp:
             mani = json.loads(resp.read().decode("utf-8"))
@@ -4565,41 +5403,98 @@ def cmd_update(args):
             download_url = mani.get("url")
             expected_sha512 = str(mani.get("sha512") or mani.get("sha512sum") or "").strip()
 
-        if (not current_ver or current_ver != latest_ver) and download_url:
-            print(f"  {C_CYAN}→ Descargando release oficial de Google Antigravity CLI v{latest_ver}...{C_RESET}")
-            import tarfile
+        needs_install = (not os.path.isfile(native_bin)) or (not current_ver or current_ver != latest_ver)
+        if needs_install and download_url:
             native_parent = os.path.dirname(native_bin)
             os.makedirs(native_parent, exist_ok=True)
             tmp_update_dir = tempfile.mkdtemp(prefix=".agy-update-", dir=native_parent)
             try:
-                scratch_tar = os.path.join(tmp_update_dir, "antigravity_cli.tar.gz")
-                dl_req = urllib.request.Request(download_url, headers={"User-Agent": "curl/7.88.1"})
-                with urllib.request.urlopen(dl_req, timeout=60) as dl_resp, open(scratch_tar, "wb") as out_f:
-                    shutil.copyfileobj(dl_resp, out_f)
+                tmp_bin = os.path.join(tmp_update_dir, f"agy-real.tmp.{os.getpid()}{'.exe' if platform.IS_WINDOWS else ''}")
 
-                tmp_bin = os.path.join(tmp_update_dir, f"agy-real.tmp.{os.getpid()}")
-                with tarfile.open(scratch_tar, "r:gz") as tar:
-                    target_member = None
-                    for member in tar.getmembers():
-                        if os.path.basename(member.name) == "antigravity" and member.isfile():
-                            target_member = member
-                            break
-                    if not target_member:
-                        raise RuntimeError("No se encontró el binario 'antigravity' dentro del paquete oficial.")
-                    extracted_stream = tar.extractfile(target_member)
-                    if extracted_stream is None:
-                        raise RuntimeError("No se pudo extraer el flujo del binario 'antigravity'.")
-                    with extracted_stream, open(tmp_bin, "wb") as bin_f:
-                        shutil.copyfileobj(extracted_stream, bin_f)
+                if platform.IS_WINDOWS:
+                    import zipfile
+                    reused_local = False
+                    local_agy_exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe")
+                    if expected_sha512 and local_agy_exe and os.path.isfile(local_agy_exe):
+                        try:
+                            if _verify_sha512(local_agy_exe, expected_sha512):
+                                shutil.copy2(local_agy_exe, tmp_bin)
+                                reused_local = True
+                                print(f"  {C_GREEN}✓ Integridad SHA-512 verificada desde binario local v{latest_ver}.{C_RESET}")
+                        except Exception:
+                            reused_local = False
 
-                if expected_sha512:
-                    if not (_verify_sha512(scratch_tar, expected_sha512) or _verify_sha512(tmp_bin, expected_sha512)):
-                        raise RuntimeError("Verificación de integridad SHA-512 fallida; actualización abortada.")
-                    print(f"  {C_GREEN}✓ Integridad SHA-512 verificada.{C_RESET}")
+                    if not reused_local:
+                        print(f"  {C_CYAN}→ Descargando release oficial de Google Antigravity CLI v{latest_ver}...{C_RESET}")
+                        scratch_dl = os.path.join(tmp_update_dir, "antigravity_cli_pkg")
+                        dl_req = urllib.request.Request(download_url, headers={"User-Agent": "curl/7.88.1"})
+                        with urllib.request.urlopen(dl_req, timeout=60) as dl_resp, open(scratch_dl, "wb") as out_f:
+                            shutil.copyfileobj(dl_resp, out_f)
 
-                os.chmod(tmp_bin, 0o755)
-                os.replace(tmp_bin, native_bin)
-                print(f"  {C_GREEN}✓ Antigravity CLI actualizado atómicamente a v{latest_ver} ({native_bin}){C_RESET}")
+                        if download_url.lower().endswith(".zip") or zipfile.is_zipfile(scratch_dl):
+                            with zipfile.ZipFile(scratch_dl, "r") as zf:
+                                exe_members = [m for m in zf.infolist() if not m.is_dir() and m.filename.lower().endswith(".exe")]
+                                target_m = next(
+                                    (
+                                        m for m in exe_members
+                                        if os.path.basename(m.filename).lower() in ("antigravity.exe", "agy.exe", "agy-real.exe", "cli_windows_x64.exe")
+                                    ),
+                                    exe_members[0] if exe_members else None,
+                                )
+                                if not target_m:
+                                    raise RuntimeError("No se encontró el binario '.exe' dentro del paquete ZIP oficial.")
+                                with zf.open(target_m, "r") as zstream, open(tmp_bin, "wb") as bin_f:
+                                    shutil.copyfileobj(zstream, bin_f)
+                        else:
+                            shutil.move(scratch_dl, tmp_bin)
+
+                        if expected_sha512:
+                            if not ((os.path.exists(scratch_dl) and _verify_sha512(scratch_dl, expected_sha512)) or _verify_sha512(tmp_bin, expected_sha512)):
+                                raise RuntimeError("Verificación de integridad SHA-512 fallida; actualización abortada.")
+                            print(f"  {C_GREEN}✓ Integridad SHA-512 verificada.{C_RESET}")
+
+                    try:
+                        os.replace(tmp_bin, native_bin)
+                    except PermissionError:
+                        old_bin = f"{native_bin}.old"
+                        if os.path.exists(old_bin):
+                            try:
+                                os.unlink(old_bin)
+                            except OSError:
+                                old_bin = f"{native_bin}.{time.time_ns()}.old"
+                        os.replace(native_bin, old_bin)
+                        os.replace(tmp_bin, native_bin)
+                    print(f"  {C_GREEN}✓ Antigravity CLI actualizado a v{latest_ver} ({native_bin}){C_RESET}")
+                else:
+                    print(f"  {C_CYAN}→ Descargando release oficial de Google Antigravity CLI v{latest_ver}...{C_RESET}")
+                    import tarfile
+                    scratch_tar = os.path.join(tmp_update_dir, "antigravity_cli.tar.gz")
+                    dl_req = urllib.request.Request(download_url, headers={"User-Agent": "curl/7.88.1"})
+                    with urllib.request.urlopen(dl_req, timeout=60) as dl_resp, open(scratch_tar, "wb") as out_f:
+                        shutil.copyfileobj(dl_resp, out_f)
+
+                    with tarfile.open(scratch_tar, "r:gz") as tar:
+                        target_member = None
+                        for member in tar.getmembers():
+                            if os.path.basename(member.name) == "antigravity" and member.isfile():
+                                target_member = member
+                                break
+                        if not target_member:
+                            raise RuntimeError("No se encontró el binario 'antigravity' dentro del paquete oficial.")
+                        extracted_stream = tar.extractfile(target_member)
+                        if extracted_stream is None:
+                            raise RuntimeError("No se pudo extraer el flujo del binario 'antigravity'.")
+                        with extracted_stream, open(tmp_bin, "wb") as bin_f:
+                            shutil.copyfileobj(extracted_stream, bin_f)
+
+                    if expected_sha512:
+                        if not (_verify_sha512(scratch_tar, expected_sha512) or _verify_sha512(tmp_bin, expected_sha512)):
+                            raise RuntimeError("Verificación de integridad SHA-512 fallida; actualización abortada.")
+                        print(f"  {C_GREEN}✓ Integridad SHA-512 verificada.{C_RESET}")
+
+                    os.chmod(tmp_bin, 0o755)
+                    os.replace(tmp_bin, native_bin)
+                    print(f"  {C_GREEN}✓ Antigravity CLI actualizado atómicamente a v{latest_ver} ({native_bin}){C_RESET}")
             finally:
                 shutil.rmtree(tmp_update_dir, ignore_errors=True)
         else:
@@ -4629,13 +5524,185 @@ def cmd_update(args):
     print(f"• Diagnóstico de flota:     {C_CYAN}agyc doctor [--fix]{C_RESET}\n")
 
 
+BUNDLE_FORMAT_V1 = "agyc-bundle-v1"
+
+
+def cmd_export(args):
+    """Exporta una o todas las cuentas registradas a un bundle JSON portable (0600)."""
+    raw_alias = getattr(args, "alias", None)
+    accounts_dir = get_accounts_dir()
+    exported_entries: list[dict] = []
+
+    if raw_alias:
+        try:
+            alias = validate_alias(raw_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+        acc_path = os.path.join(accounts_dir, f"{alias}.json")
+        if not os.path.isfile(acc_path):
+            print(f"{C_RED}Error:{C_RESET} La cuenta '{alias}' no existe en {accounts_dir}.")
+            sys.exit(1)
+        acc_data = load_account(alias)
+        if not isinstance(acc_data, dict):
+            print(f"{C_RED}Error:{C_RESET} No se pudo leer la cuenta '{alias}' (JSON inválido).")
+            sys.exit(1)
+        exported_entries.append({"alias": alias, "account_data": acc_data})
+    else:
+        for fname in sorted(os.listdir(accounts_dir)):
+            if not fname.endswith(".json") or fname == "config.json" or fname.startswith("_"):
+                continue
+            stem = fname[:-5]
+            try:
+                safe_alias = validate_alias(stem)
+            except ValueError:
+                continue
+            acc_data = load_account(safe_alias)
+            if isinstance(acc_data, dict):
+                exported_entries.append({"alias": safe_alias, "account_data": acc_data})
+
+        if not exported_entries:
+            print(f"{C_RED}Error:{C_RESET} No hay cuentas válidas registradas para exportar.")
+            sys.exit(1)
+
+    out_path = getattr(args, "output", None)
+    if not out_path:
+        if len(exported_entries) == 1:
+            out_path = f"agyc-{exported_entries[0]['alias']}.json"
+        else:
+            out_path = "agyc-accounts-bundle.json"
+
+    bundle = {
+        "format": BUNDLE_FORMAT_V1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "accounts": exported_entries,
+    }
+    _atomic_write_json(out_path, bundle, mode=0o600, indent=2)
+
+    aliases_str = ", ".join(e["alias"] for e in exported_entries)
+    print(f"{C_BOLD}{C_GREEN}✓ Exportadas {len(exported_entries)} cuenta(s) ({aliases_str}) -> {out_path}{C_RESET}")
+    print(
+        f"{C_YELLOW}⚠ ADVERTENCIA DE SEGURIDAD:{C_RESET} Este archivo contiene tokens OAuth activos.\n"
+        f"  Transfiérelo únicamente por un canal cifrado (ej. scp) y bórralo tras importarlo."
+    )
+
+
+def _activate_imported_account_if_needed(alias: str, acc_data: dict):
+    """Configura active_account/default_account y token activo si no había cuenta activa."""
+    cfg = load_config()
+    if cfg.get("active_account"):
+        return
+    cfg["active_account"] = alias
+    if not cfg.get("default_account"):
+        cfg["default_account"] = alias
+    save_config(cfg)
+    token_data = acc_data.get("token_data")
+    if isinstance(token_data, dict) and token_data:
+        _atomic_write_json(get_active_token_path(), token_data, mode=0o600, indent=2)
+
+
+def cmd_import(args):
+    """Importa cuentas desde un bundle agyc-bundle-v1 y prepara sus HOMEs aislados."""
+    bundle_path = args.file
+    if not os.path.isfile(bundle_path):
+        print(f"{C_RED}Error:{C_RESET} El archivo '{bundle_path}' no existe.")
+        sys.exit(1)
+
+    try:
+        with open(bundle_path, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except Exception as e:
+        print(f"{C_RED}Error:{C_RESET} No se pudo leer el bundle '{bundle_path}': {e}")
+        sys.exit(1)
+
+    if not isinstance(bundle, dict) or bundle.get("format") != BUNDLE_FORMAT_V1:
+        print(f"{C_RED}Error:{C_RESET} Formato de bundle inválido (se esperaba '{BUNDLE_FORMAT_V1}').")
+        sys.exit(1)
+
+    entries = bundle.get("accounts")
+    if not isinstance(entries, list) or not entries:
+        print(f"{C_RED}Error:{C_RESET} El bundle no contiene cuentas para importar.")
+        sys.exit(1)
+
+    raw_override = getattr(args, "alias", None)
+    override_alias: str | None = None
+    if raw_override is not None:
+        try:
+            override_alias = validate_alias(raw_override)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+        if len(entries) != 1:
+            print(
+                f"{C_RED}Error:{C_RESET} --alias solo puede usarse cuando el bundle contiene "
+                f"exactamente 1 cuenta (tiene {len(entries)})."
+            )
+            sys.exit(1)
+
+    overwrite = bool(getattr(args, "overwrite", False))
+    imported: list[tuple[str, dict]] = []
+    skipped: list[str] = []
+
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("account_data"), dict):
+            print(f"{C_RED}Error:{C_RESET} Entrada de cuenta inválida dentro del bundle.")
+            sys.exit(1)
+
+        raw_entry_alias = override_alias if override_alias else entry.get("alias")
+        try:
+            target_alias = validate_alias(raw_entry_alias)
+        except ValueError as e:
+            print(f"{C_RED}Error:{C_RESET} {e}")
+            sys.exit(1)
+
+        acc_data = dict(entry["account_data"])
+        email = acc_data.get("email")
+
+        existing_by_alias = load_account(target_alias)
+        dup_email_alias = _find_alias_by_email(email)
+        has_conflict = (existing_by_alias is not None) or (
+            dup_email_alias is not None and dup_email_alias != target_alias
+        )
+
+        if has_conflict and not overwrite:
+            conflict_ref = target_alias if existing_by_alias is not None else dup_email_alias
+            print(
+                f"{C_YELLOW}Aviso:{C_RESET} Omitiendo '{target_alias}' ({email or 'sin email'}): "
+                f"ya existe como '{conflict_ref}'. Usa --overwrite para reemplazar."
+            )
+            skipped.append(target_alias)
+            continue
+
+        save_account(target_alias, acc_data, sync_links=False)
+        prepare_isolated_home(target_alias)
+        imported.append((target_alias, acc_data))
+        print(f"{C_GREEN}✓ Importada cuenta '{target_alias}' ({email or 'sin email'}).{C_RESET}")
+
+    if imported:
+        sync_launchers()
+        first_alias, first_data = imported[0]
+        _activate_imported_account_if_needed(first_alias, first_data)
+        print(f"{C_BOLD}{C_GREEN}✓ Importación completada: {len(imported)} cuenta(s) importada(s).{C_RESET}")
+
+    if not imported and skipped:
+        print(f"{C_RED}Error:{C_RESET} No se importó ninguna cuenta (duplicados omitidos sin --overwrite).")
+        sys.exit(1)
+
+
 def main():
     prog_name = os.path.basename(sys.argv[0])
+    for ext in (".cmd", ".exe", ".bat"):
+        if prog_name.lower().endswith(ext):
+            prog_name = prog_name[: -len(ext)]
+            break
+    invoked_as = os.environ.pop("AGYC_INVOKED_AS", "").strip()
+    if invoked_as:
+        prog_name = invoked_as
 
     # 1. Lanzamiento directo por alias invocado como comando: 'agy01', 'agy02', 'agi05', etc.
     #    Arranque instantáneo (<50ms): prepara HOME aislado y refresca token solo si expira en <300s,
     #    SIN mutar active_account global ni bloquear con fetch_quota_summary síncrono.
-    m_prog = re.match(r"^(?:agy|agi)(\d+)$", prog_name)
+    m_prog = re.match(r"^(?:agy|agi)(\d+)$", prog_name, re.IGNORECASE)
     if m_prog:
         alias = f"agy{int(m_prog.group(1)):02d}"
         data = load_account(alias)
@@ -4778,6 +5845,19 @@ def main():
     # update / upgrade
     p_update = subparsers.add_parser("update", aliases=["upgrade"], help="Actualiza agyc, librería core, wrappers y Antigravity CLI")
     p_update.set_defaults(func=cmd_update)
+
+    # export
+    p_export = subparsers.add_parser("export", help="Exporta una o todas las cuentas a un bundle JSON portable")
+    p_export.add_argument("alias", nargs="?", default=None, help="Alias opcional de la cuenta a exportar (por defecto todas)")
+    p_export.add_argument("-o", "--output", dest="output", default=None, help="Archivo de salida del bundle")
+    p_export.set_defaults(func=cmd_export)
+
+    # import
+    p_import = subparsers.add_parser("import", help="Importa cuentas desde un bundle JSON generado por 'agyc export'")
+    p_import.add_argument("file", help="Ruta al archivo bundle JSON")
+    p_import.add_argument("--alias", dest="alias", default=None, help="Nuevo alias (solo válido si el bundle contiene 1 cuenta)")
+    p_import.add_argument("--overwrite", action="store_true", help="Reemplazar cuentas existentes con el mismo alias o email")
+    p_import.set_defaults(func=cmd_import)
 
     args = parser.parse_args()
 

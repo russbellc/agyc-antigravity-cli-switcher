@@ -11,13 +11,86 @@ Modes:
 
 import sys
 import os
-import pwd
-import fcntl
 import json
 import math
 import time
-import select
 from datetime import datetime, timezone, timedelta
+
+if os.name == "nt":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def _strip_agyc_homes_pre(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    norm = s.replace("\\", "/")
+    if "/.agyc_homes/" in norm:
+        s = s[: norm.find("/.agyc_homes/")]
+    elif norm.rstrip("/").endswith("/.agyc_homes"):
+        s = s[: norm.rstrip("/").rfind("/.agyc_homes")]
+    return s.rstrip("/\\") or ("/" if s.startswith("/") else s)
+
+
+def _load_platform():
+    real_here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [os.path.normpath(os.path.join(real_here, "..", "lib"))]
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA", "").strip()
+        if la:
+            candidates.append(os.path.join(la, "agyc", "lib"))
+    for env_k in ("AGYC_REAL_HOME", "REAL_HOME", "USERPROFILE", "HOME"):
+        val = os.environ.get(env_k, "").strip()
+        if val and val != "~":
+            cleaned = _strip_agyc_homes_pre(val)
+            if cleaned:
+                candidates.append(os.path.join(cleaned, ".gemini", "antigravity-cli", "lib"))
+    if os.name != "nt":
+        exp = _strip_agyc_homes_pre(os.path.expanduser("~"))
+        if exp and exp != "~":
+            candidates.append(os.path.join(exp, ".gemini", "antigravity-cli", "lib"))
+            candidates.append(os.path.join(exp, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "lib"))
+        candidates.append("/home/aidev/proyectos/agyc-antigravity-cli-switcher/lib")
+
+    for lib_dir in candidates:
+        plat_init = os.path.join(lib_dir, "platform", "__init__.py")
+        if not os.path.isfile(plat_init):
+            continue
+        parent_dir = os.path.dirname(lib_dir)
+        if parent_dir and parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        try:
+            from lib import platform as mod  # type: ignore
+            if hasattr(mod, "resolve_real_home"):
+                return mod
+        except Exception:
+            pass
+        try:
+            import importlib.util
+            plat_dir = os.path.join(lib_dir, "platform")
+            spec = importlib.util.spec_from_file_location(
+                "_agyc_platform",
+                plat_init,
+                submodule_search_locations=[plat_dir],
+            )
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["_agyc_platform"] = mod
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception:
+            pass
+    return None
+
+
+platform = _load_platform()
+IS_WINDOWS: bool = bool(platform.IS_WINDOWS) if platform is not None else (os.name == "nt")
 
 # ANSI Colors
 C_RESET   = "\033[0m"
@@ -41,44 +114,21 @@ GOOGLE_CLIENT_SECRET = "fADq6z4CXs8BLm1JLdL684RWF85K-XPSCOG"[::-1]
 ANTIGRAVITY_UA = "antigravity/1.5.10 (aidev_client; os_type=linux; arch=amd64; cl=999999999)"
 
 
-def _clean_agyc_home_path(raw: str) -> str | None:
-    if not raw:
-        return None
-    s = raw.strip()
-    if not s or s == "~":
-        return None
-    if "/.agyc_homes/" in s:
-        s = s.split("/.agyc_homes/", 1)[0]
-    elif s.endswith("/.agyc_homes"):
-        s = s[: -len("/.agyc_homes")]
-    s = s.rstrip("/") or "/"
-    return s if os.path.isdir(s) else None
-
-
 def resolve_real_home() -> str:
     """Resolves real user HOME dynamically, immune to isolated ~/.agyc_homes/<alias> sessions."""
-    for env_key in ("AGYC_REAL_HOME", "REAL_HOME"):
+    if platform is not None:
+        return platform.resolve_real_home()
+    for env_key in ("AGYC_REAL_HOME", "REAL_HOME", "USERPROFILE", "HOME"):
         val = os.environ.get(env_key, "").strip()
-        if val and "/.agyc_homes/" not in val and not val.endswith("/.agyc_homes"):
-            cleaned = _clean_agyc_home_path(val)
-            if cleaned:
+        if val and val != "~":
+            cleaned = _strip_agyc_homes_pre(val)
+            if cleaned and os.path.isdir(cleaned):
                 return cleaned
-    try:
-        pw_dir = pwd.getpwuid(os.getuid()).pw_dir
-        cleaned = _clean_agyc_home_path(pw_dir)
-        if cleaned:
-            return cleaned
-    except Exception:
-        pass
-    for raw in (os.environ.get("HOME", ""), os.path.expanduser("~")):
-        cleaned = _clean_agyc_home_path(raw)
-        if cleaned:
-            return cleaned
-    return "/tmp"
+    return os.environ.get("SystemDrive", "C:") + os.sep if IS_WINDOWS else "/tmp"
 
 
 REAL_HOME = resolve_real_home()
-CACHE_DIR = os.path.join(REAL_HOME, ".cache", "agyc")
+CACHE_DIR = platform.get_cache_dir(REAL_HOME) if platform is not None else os.path.join(REAL_HOME, ".cache", "agyc")
 LOCKS_DIR = os.path.join(CACHE_DIR, "locks")
 
 # Live refresh & throttle parameters
@@ -91,7 +141,15 @@ LOW_QUOTA_DEDUP_SECONDS = 5 * 3600      # 5h deduplication per reset cycle
 
 
 def ensure_cache_dir(need_locks: bool = False) -> str:
-    """Ensures ~/.cache/agyc (and optionally locks/) exists with 0700 permissions."""
+    """Ensures cache dir (and optionally locks/) exists with private permissions."""
+    if platform is not None:
+        try:
+            platform.ensure_private_dir(CACHE_DIR, 0o700)
+            if need_locks:
+                platform.ensure_private_dir(LOCKS_DIR, 0o700)
+        except Exception:
+            pass
+        return CACHE_DIR
     try:
         os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
         if need_locks:
@@ -202,17 +260,30 @@ def normalize_quota_value(
 
 
 def atomic_write_json(path: str, data: dict, mode: int = 0o600, indent: int | None = None) -> None:
-    """Atomically writes JSON with strict permissions via .tmp.{pid} + os.replace."""
-    parent = os.path.dirname(path)
+    """Atomically writes JSON with strict permissions via .tmp.{pid}.{ns} + os.replace."""
+    parent = os.path.dirname(os.path.abspath(path))
     if parent:
-        os.makedirs(parent, mode=0o700, exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
+        if platform is not None:
+            platform.ensure_private_dir(parent, 0o700)
+        else:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{time.time_ns()}"
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=indent, ensure_ascii=False)
-        os.chmod(tmp_path, mode)
-        os.replace(tmp_path, path)
+        if not IS_WINDOWS:
+            os.chmod(tmp_path, mode)
+            os.replace(tmp_path, path)
+        else:
+            for attempt in range(4):
+                try:
+                    os.replace(tmp_path, path)
+                    break
+                except PermissionError:
+                    if attempt == 3:
+                        raise
+                    time.sleep(0.005)
     except Exception:
         try:
             if os.path.exists(tmp_path):
@@ -316,18 +387,32 @@ def detect_active_account(stdin_data: dict | None = None) -> str:
             except Exception:
                 pass
 
-    alias = extract_agy_alias(os.environ.get("HOME", ""))
-    if alias:
-        return alias
-
-    alias = extract_agy_alias(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", ""))
-    if alias:
-        return alias
+    for env_key in ("HOME", "USERPROFILE", "ANTIGRAVITY_APP_DATA_DIR", "AGYC_ACCOUNT"):
+        val = os.environ.get(env_key, "")
+        if not val:
+            continue
+        if env_key == "AGYC_ACCOUNT":
+            alias = extract_agy_alias(val) or (platform._normalize_alias_token(val) if platform is not None else val.strip())
+        else:
+            alias = (
+                platform._extract_alias_from_home_path(val)
+                if platform is not None
+                else extract_agy_alias(val)
+            )
+        if alias:
+            return alias
 
     config_paths = [
         os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "accounts", "config.json"),
-        os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json"),
     ]
+    if platform is not None:
+        base_cfg = os.path.join(platform.get_base_dir(REAL_HOME), "accounts", "config.json")
+        if base_cfg not in config_paths:
+            config_paths.insert(0, base_cfg)
+    if not IS_WINDOWS:
+        config_paths.append(
+            os.path.join(REAL_HOME, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts", "config.json")
+        )
     for cp in config_paths:
         if os.path.exists(cp):
             try:
@@ -484,11 +569,13 @@ def _merge_slot(
 
 
 def _read_cached_quota_file(alias: str) -> dict | None:
-    """Reads quota cache from ~/.cache/agyc with smooth fallback to legacy /tmp file."""
+    """Reads quota cache from cache dir with smooth fallback to legacy /tmp file on Linux."""
     ensure_cache_dir()
     primary = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
-    legacy = f"/tmp/agyc_quota_cache_{alias}.json"
-    for candidate in (primary, legacy):
+    candidates = [primary]
+    if not IS_WINDOWS:
+        candidates.append(f"/tmp/agyc_quota_cache_{alias}.json")
+    for candidate in candidates:
         if os.path.exists(candidate):
             try:
                 with open(candidate, "r", encoding="utf-8") as f:
@@ -502,7 +589,7 @@ def _read_cached_quota_file(alias: str) -> dict | None:
 
 def do_fetch_and_save_quota(alias: str) -> dict | None:
     """Unified 1.5.10 quota engine (--refresh-quota-bg <alias>).
-    1) Refreshes OAuth under non-blocking flock (~/.cache/agyc/locks/{alias}.oauth.lock) + syncs isolated HOME token.
+    1) Refreshes OAuth under non-blocking lock (<locks_dir>/{alias}.oauth.lock) + syncs isolated HOME token.
     2) Queries loadCodeAssist across daily & prod to obtain project_id and accurate plan_type (ULTRA/PRO/ENT/FREE).
     3) Queries retrieveUserQuotaSummary & retrieveUserQuota with {"project": project_id} in parallel across daily & prod.
     """
@@ -532,50 +619,42 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
 
     if _token_needs_refresh(token_data):
         oauth_lock_path = os.path.join(LOCKS_DIR, f"{safe_cache_key(alias)}.oauth.lock")
-        lock_fd = None
-        try:
-            lock_fd = os.open(oauth_lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if platform is not None:
             try:
-                os.chmod(oauth_lock_path, 0o600)
+                with platform.acquire_file_lock(oauth_lock_path, blocking=False):
+                    try:
+                        with open(acc_path, "r", encoding="utf-8") as f:
+                            latest_on_disk = json.load(f)
+                        if isinstance(latest_on_disk, dict) and isinstance(latest_on_disk.get("token_data"), dict):
+                            acc_data = latest_on_disk
+                            token_data = latest_on_disk["token_data"]
+                    except Exception:
+                        pass
+
+                    if _token_needs_refresh(token_data):
+                        token_data, refreshed = refresh_token_if_needed(token_data)
+                        if refreshed:
+                            try:
+                                acc_data["token_data"] = token_data
+                                acc_data["is_revoked"] = False
+                                atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
+                            except Exception:
+                                pass
+                            _sync_isolated_oauth_token(alias, token_data)
+            except BlockingIOError:
+                pass
             except Exception:
                 pass
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            try:
-                # Re-read account file inside lock in case another worker already refreshed it
+        else:
+            token_data, refreshed = refresh_token_if_needed(token_data)
+            if refreshed:
                 try:
-                    with open(acc_path, "r", encoding="utf-8") as f:
-                        latest_on_disk = json.load(f)
-                    if isinstance(latest_on_disk, dict) and isinstance(latest_on_disk.get("token_data"), dict):
-                        acc_data = latest_on_disk
-                        token_data = latest_on_disk["token_data"]
+                    acc_data["token_data"] = token_data
+                    acc_data["is_revoked"] = False
+                    atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
                 except Exception:
                     pass
-
-                if _token_needs_refresh(token_data):
-                    token_data, refreshed = refresh_token_if_needed(token_data)
-                    if refreshed:
-                        try:
-                            acc_data["token_data"] = token_data
-                            acc_data["is_revoked"] = False
-                            atomic_write_json(acc_path, acc_data, mode=0o600, indent=2)
-                        except Exception:
-                            pass
-                        _sync_isolated_oauth_token(alias, token_data)
-            finally:
-                try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                except Exception:
-                    pass
-        except BlockingIOError:
-            pass
-        except Exception:
-            pass
-        finally:
-            if lock_fd is not None:
-                try:
-                    os.close(lock_fd)
-                except Exception:
-                    pass
+                _sync_isolated_oauth_token(alias, token_data)
 
     token = (token_data.get("token") or {}).get("access_token") if isinstance(token_data, dict) else None
     if not token:
@@ -593,7 +672,7 @@ def do_fetch_and_save_quota(alias: str) -> dict | None:
     lca_payload = json.dumps({
         "metadata": {
             "ideType": "ANTIGRAVITY",
-            "platform": "LINUX_AMD64",
+            "platform": "WINDOWS_AMD64" if IS_WINDOWS else "LINUX_AMD64",
             "pluginType": "GEMINI",
         }
     }).encode("utf-8")
@@ -882,23 +961,33 @@ def spawn_background_refresh(alias: str) -> None:
         pass
 
     try:
-        import subprocess
         env = os.environ.copy()
         env["HOME"] = REAL_HOME
         env["AGYC_REAL_HOME"] = REAL_HOME
-        subprocess.Popen(
-            [sys.executable, "-S", os.path.abspath(__file__), "--refresh-quota-bg", alias],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            env=env,
-        )
+        if IS_WINDOWS:
+            env["USERPROFILE"] = REAL_HOME
+        py_exe = sys.executable
+        if IS_WINDOWS and (not py_exe or not os.path.exists(py_exe)):
+            import shutil
+            py_exe = shutil.which("python") or "python"
+        cmd = [py_exe, "-S", os.path.abspath(__file__), "--refresh-quota-bg", alias]
+        if platform is not None:
+            platform.spawn_detached(cmd, env=env)
+        else:
+            import subprocess
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=not IS_WINDOWS,
+                env=env,
+            )
     except Exception:
         pass
 
 
 def fetch_online_quota(alias: str) -> dict | None:
-    """Non-blocking quota reader from ~/.cache/agyc (fallback /tmp) with 20s background refresh TTL."""
+    """Non-blocking quota reader from cache dir (fallback /tmp on Linux) with 20s background refresh TTL."""
     ensure_cache_dir()
     primary_cache = os.path.join(CACHE_DIR, f"quota_cache_{alias}.json")
     legacy_cache = f"/tmp/agyc_quota_cache_{alias}.json"
@@ -912,7 +1001,7 @@ def fetch_online_quota(alias: str) -> dict | None:
                 cached = json.load(f)
         except Exception:
             cached = None
-    elif os.path.exists(legacy_cache):
+    elif not IS_WINDOWS and os.path.exists(legacy_cache):
         try:
             with open(legacy_cache, "r", encoding="utf-8") as f:
                 cached = json.load(f)
@@ -1162,7 +1251,16 @@ def get_model_and_effort(stdin_data: dict | None, account: str) -> tuple[str, st
         if not effort:
             effort = stdin_data.get("effort") or stdin_data.get("reasoning_effort")
 
-    if not model_name or not effort:
+    if not model_name:
+        env_model = os.environ.get("ANTIGRAVITY_CLI_MODEL") or os.environ.get("ANTIGRAVITY_MODEL")
+        if env_model and env_model.strip():
+            model_name = env_model.strip()
+    if not effort:
+        env_eff = os.environ.get("ANTIGRAVITY_CLI_EFFORT") or os.environ.get("ANTIGRAVITY_EFFORT")
+        if env_eff and env_eff.strip():
+            effort = env_eff.strip()
+
+    if (not model_name or not effort) and not IS_WINDOWS:
         try:
             pid = os.getppid()
             for _ in range(5):
@@ -1285,7 +1383,30 @@ def get_quota_for_model(quota: dict | None, model_name: str) -> tuple[float, str
 
 
 def find_parent_agy_pid() -> int | None:
-    """Climbs the process tree to find the parent agy CLI process (max 8 hops)."""
+    """Climbs the process tree to find the parent agy CLI process (Linux /proc; win32 PPID/run_dir on Windows)."""
+    if IS_WINDOWS:
+        if platform is not None and hasattr(platform, "find_ancestor_agy_pid"):
+            try:
+                anc_pid = platform.find_ancestor_agy_pid()
+                if anc_pid is not None:
+                    return int(anc_pid)
+            except Exception:
+                pass
+        pane_id = (os.environ.get("HERDR_PANE_ID") or "").strip()
+        if not pane_id or platform is None:
+            return None
+        try:
+            procs = platform.scan_agy_processes(run_dir=platform.get_run_dir(REAL_HOME))
+            ppid = os.getppid()
+            for p in procs:
+                if p.get("pid") == ppid:
+                    return ppid
+            for p in procs:
+                if p.get("herdr_pane_id") == pane_id:
+                    return int(p["pid"])
+        except Exception:
+            pass
+        return None
     try:
         pid = os.getppid()
         for _ in range(8):
@@ -1322,7 +1443,7 @@ def get_herdr_env() -> tuple[str | None, str | None]:
     sock_path = os.environ.get("HERDR_SOCKET_PATH")
     pane_id = os.environ.get("HERDR_PANE_ID")
 
-    if not sock_path or not pane_id:
+    if (not sock_path or not pane_id) and not IS_WINDOWS:
         pid = find_parent_agy_pid() or os.getppid()
         cur = pid
         for _ in range(4):
@@ -1358,8 +1479,12 @@ def get_herdr_env() -> tuple[str | None, str | None]:
             cur = nxt
 
     if pane_id and not sock_path:
-        default_sock = os.path.join(REAL_HOME, ".config", "herdr", "herdr.sock")
-        if os.path.exists(default_sock):
+        default_sock = (
+            platform.default_herdr_socket_path(REAL_HOME)
+            if platform is not None
+            else os.path.join(REAL_HOME, ".config", "herdr", "herdr.sock")
+        )
+        if default_sock and os.path.exists(default_sock):
             sock_path = default_sock
 
     return sock_path, pane_id
@@ -1411,31 +1536,18 @@ def build_low_quota_badge(eff_pct: int, quota_initialized: bool = True) -> str |
 
 
 def _query_herdr_busy_accounts(sock_path: str | None, exclude_pane_id: str | None = None) -> set[str]:
-    """Queries Herdr pane.list (<1ms local Unix socket) to detect accounts active in other panes."""
+    """Queries Herdr pane.list via lib.platform IPC to detect accounts active in other panes."""
     busy: set[str] = set()
-    if not sock_path or not os.path.exists(sock_path):
+    if platform is None:
         return busy
     try:
-        import _socket
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(0.03)
-        try:
-            s.connect(sock_path)
-            s.sendall(b'{"id":"1","method":"pane.list","params":{}}\n')
-            chunks: list[bytes] = []
-            while True:
-                chunk = s.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                if b"\n" in chunk:
-                    break
-        finally:
-            s.close()
-        raw = b"".join(chunks).split(b"\n", 1)[0]
-        if not raw:
+        resp = platform.query_herdr_ipc(
+            sock_path,
+            {"id": "1", "method": "pane.list", "params": {}},
+            timeout=0.03,
+        )
+        if not isinstance(resp, dict):
             return busy
-        resp = json.loads(raw.decode("utf-8", errors="replace"))
         panes = (resp.get("result") or {}).get("panes") or []
         for pane in panes:
             if not isinstance(pane, dict):
@@ -1480,12 +1592,15 @@ def find_suggested_replacement_account(
     Returns (alias, plan_type, p5, ps) or None.
     """
     base_home = real_home if real_home is not None else REAL_HOME
-    cdir = cache_dir if cache_dir is not None else (
-        os.path.join(base_home, ".cache", "agyc") if base_home != REAL_HOME else CACHE_DIR
-    )
+    if cache_dir is not None:
+        cdir = cache_dir
+    elif base_home != REAL_HOME:
+        cdir = platform.get_cache_dir(base_home) if platform is not None else os.path.join(base_home, ".cache", "agyc")
+    else:
+        cdir = CACHE_DIR
 
     acc_dirs = [os.path.join(base_home, ".gemini", "antigravity-cli", "accounts")]
-    if base_home == REAL_HOME:
+    if base_home == REAL_HOME and not IS_WINDOWS:
         acc_dirs.append(
             os.path.join(base_home, "snap", "antigravity-cli", "common", ".gemini", "antigravity-cli", "accounts")
         )
@@ -1636,7 +1751,7 @@ def maybe_notify_low_quota(
     if cache_dir is not None:
         cdir = cache_dir
     elif base_home != REAL_HOME:
-        cdir = os.path.join(base_home, ".cache", "agyc")
+        cdir = platform.get_cache_dir(base_home) if platform is not None else os.path.join(base_home, ".cache", "agyc")
     else:
         cdir = CACHE_DIR
 
@@ -1663,54 +1778,90 @@ def maybe_notify_low_quota(
     if sock_path is not None:
         eff_sock: str | None = sock_path
     elif base_home != REAL_HOME:
-        cand_sock = os.path.join(base_home, ".config", "herdr", "herdr.sock")
-        eff_sock = cand_sock if os.path.exists(cand_sock) else None
+        if platform is not None:
+            cand_sock = platform.default_herdr_socket_path(base_home)
+        else:
+            cand_sock = os.path.join(base_home, ".config", "herdr", "herdr.sock")
+        eff_sock = cand_sock if (cand_sock and os.path.exists(cand_sock)) else None
     else:
         eff_sock = None
-        for sc in (
+        sock_cands = []
+        if platform is not None:
+            sock_cands.append(platform.default_herdr_socket_path(base_home))
+        sock_cands.extend([
             os.environ.get("HERDR_SOCKET_PATH", "").strip(),
             os.path.join(base_home, ".config", "herdr", "herdr.sock"),
-            "/home/aidev/.config/herdr/herdr.sock",
-        ):
+        ])
+        if not IS_WINDOWS:
+            sock_cands.append("/home/aidev/.config/herdr/herdr.sock")
+        for sc in sock_cands:
             if sc and os.path.exists(sc):
                 eff_sock = sc
                 break
 
-    herdr_bin = os.path.join(base_home, ".local", "bin", "herdr")
-    if not os.path.isfile(herdr_bin) and base_home == REAL_HOME:
-        alt_bin = "/home/aidev/.local/bin/herdr"
-        if os.path.isfile(alt_bin):
-            herdr_bin = alt_bin
+    herdr_bin: str | None = None
+    if IS_WINDOWS:
+        import shutil
+        herdr_cands = [
+            os.environ.get("HERDR_BIN_PATH", "").strip(),
+            shutil.which("herdr.exe"),
+            shutil.which("herdr"),
+            os.path.join(base_home, ".local", "bin", "herdr.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "herdr", "herdr.exe") if os.environ.get("LOCALAPPDATA") else "",
+        ]
+        for hc in herdr_cands:
+            if hc and os.path.isfile(hc):
+                herdr_bin = hc
+                break
+    else:
+        import shutil
+        linux_cands = [
+            os.path.join(base_home, ".local", "bin", "herdr"),
+            "/home/aidev/.local/bin/herdr",
+            shutil.which("herdr"),
+        ]
+        for hc in linux_cands:
+            if hc and os.path.isfile(hc) and os.access(hc, os.X_OK):
+                herdr_bin = hc
+                break
 
     if test_cmd:
         can_notify = True
     else:
-        herdr_active = (os.environ.get("HERDR_ENV") == "1") or bool(eff_sock and os.path.exists(eff_sock))
-        can_notify = herdr_active and os.path.isfile(herdr_bin) and os.access(herdr_bin, os.X_OK)
+        herdr_active = (
+            (os.environ.get("HERDR_ENV") == "1")
+            or bool(os.environ.get("HERDR_PANE_ID"))
+            or bool(eff_sock and os.path.exists(eff_sock))
+        )
+        if IS_WINDOWS:
+            can_notify = herdr_active
+        else:
+            can_notify = herdr_active and bool(herdr_bin) and os.path.isfile(herdr_bin) and os.access(herdr_bin, os.X_OK)
 
     if not can_notify:
         return None
 
     locks_dir = os.path.join(cdir, "locks")
-    try:
-        os.makedirs(locks_dir, mode=0o700, exist_ok=True)
-    except Exception:
-        pass
+    if platform is not None:
+        try:
+            platform.ensure_private_dir(locks_dir, 0o700)
+        except Exception:
+            pass
+    else:
+        try:
+            os.makedirs(locks_dir, mode=0o700, exist_ok=True)
+        except Exception:
+            pass
 
     lock_path = os.path.join(locks_dir, f"low_quota_{safe_account}_{fam_norm}.lock")
-    lock_fd: int | None = None
-    try:
-        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except Exception:
-                pass
-        return None
-    except Exception:
-        lock_fd = None
+    file_lock = None
+    if platform is not None:
+        try:
+            file_lock = platform.acquire_file_lock(lock_path, blocking=False)
+        except BlockingIOError:
+            return None
+        except Exception:
+            file_lock = None
 
     try:
         # Re-check inside lock to avoid concurrent statusline + titleline race
@@ -1750,35 +1901,57 @@ def maybe_notify_low_quota(
         except Exception:
             pass
 
-        cmd_to_run: str | None = None
         if test_cmd:
             if test_cmd.lower() not in ("0", "none", "noop", "dry-run", "dry_run"):
-                cmd_to_run = test_cmd
+                if platform is not None:
+                    platform.send_low_quota_toast(title, body, herdr_bin=test_cmd)
+                else:
+                    try:
+                        import subprocess
+                        subprocess.Popen(
+                            [
+                                test_cmd,
+                                "notification",
+                                "show",
+                                "--position",
+                                "top-right",
+                                "--sound",
+                                "none",
+                                "--body",
+                                body,
+                                title,
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=not IS_WINDOWS,
+                        )
+                    except Exception:
+                        pass
         else:
-            cmd_to_run = herdr_bin
-
-        if cmd_to_run:
-            try:
-                import subprocess
-                subprocess.Popen(
-                    [
-                        cmd_to_run,
-                        "notification",
-                        "show",
-                        "--position",
-                        "top-right",
-                        "--sound",
-                        "none",
-                        "--body",
-                        body,
-                        title,
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
-            except Exception:
-                pass
+            if platform is not None:
+                platform.send_low_quota_toast(title, body, herdr_bin=herdr_bin)
+            elif herdr_bin:
+                try:
+                    import subprocess
+                    subprocess.Popen(
+                        [
+                            herdr_bin,
+                            "notification",
+                            "show",
+                            "--position",
+                            "top-right",
+                            "--sound",
+                            "none",
+                            "--body",
+                            body,
+                            title,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=not IS_WINDOWS,
+                    )
+                except Exception:
+                    pass
 
         return {
             "title": title,
@@ -1789,15 +1962,8 @@ def maybe_notify_low_quota(
             "suggested_plan": suggested[1] if suggested else None,
         }
     finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except Exception:
-                pass
-            try:
-                os.close(lock_fd)
-            except Exception:
-                pass
+        if file_lock is not None:
+            file_lock.release()
 
 
 def report_herdr_pane_metadata(
@@ -1891,26 +2057,53 @@ def report_herdr_pane_metadata(
         },
     }
 
-    try:
-        import _socket
-        raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
-        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.settimeout(0.05)
+    if platform is not None:
         try:
-            s.connect(sock_path)
-            s.sendall(raw)
-            s.recv(4096)
-        finally:
-            s.close()
-    except Exception:
-        pass
+            platform.query_herdr_ipc(sock_path, payload, timeout=0.05)
+        except Exception:
+            pass
 
 
-def get_session_conv_id() -> str | None:
+def get_session_conv_id(account: str = "agy01") -> str | None:
     """Detects conversation ID specific to THIS terminal instance of agy."""
-    env_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID")
-    if env_conv:
-        return env_conv
+    env_conv = os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or os.environ.get("AGYC_CONV_ID")
+    if env_conv and env_conv.strip():
+        return env_conv.strip()
+
+    if IS_WINDOWS:
+        # Avoid /proc on Windows; safely inspect conversations/*.db if available
+        cand_dirs = [
+            os.path.join(os.environ.get("ANTIGRAVITY_APP_DATA_DIR", ""), "conversations")
+            if os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+            else "",
+            os.path.join(REAL_HOME, ".agyc_homes", account, ".gemini", "antigravity-cli", "conversations"),
+            os.path.join(REAL_HOME, ".gemini", "antigravity-cli", "conversations"),
+        ]
+        best_cid: str | None = None
+        best_mtime: float = -1.0
+        for cdir in cand_dirs:
+            if not cdir or not os.path.isdir(cdir):
+                continue
+            try:
+                with os.scandir(cdir) as it:
+                    for entry in it:
+                        name = entry.name
+                        if not name.endswith(".db"):
+                            continue
+                        cid = name[:-3]
+                        if len(cid) == 36 and cid.count("-") == 4:
+                            try:
+                                mt = entry.stat().st_mtime
+                                if mt > best_mtime:
+                                    best_mtime = mt
+                                    best_cid = cid
+                            except OSError:
+                                pass
+            except OSError:
+                continue
+            if best_cid:
+                return best_cid
+        return None
 
     agy_pid = find_parent_agy_pid()
     if not agy_pid:
@@ -1940,16 +2133,19 @@ def get_session_conv_id() -> str | None:
 def find_active_transcript(conv_id: str | None = None, account: str = "agy01") -> str | None:
     """Finds the conversation transcript file for THIS specific terminal session."""
     if not conv_id:
-        conv_id = get_session_conv_id()
+        conv_id = get_session_conv_id(account=account)
     if not conv_id:
         return None
 
     candidate_bases = [
         os.environ.get("ANTIGRAVITY_APP_DATA_DIR"),
         os.path.join(REAL_HOME, ".agyc_homes", account, ".gemini", "antigravity-cli"),
-        os.path.expanduser("~/.gemini/antigravity-cli"),
         os.path.join(REAL_HOME, ".gemini", "antigravity-cli"),
     ]
+    if platform is not None:
+        base_dir = platform.get_base_dir(REAL_HOME)
+        if base_dir not in candidate_bases:
+            candidate_bases.append(base_dir)
 
     for base in candidate_bases:
         if not base or not os.path.isdir(base):
@@ -2117,7 +2313,7 @@ def resolve_conv_and_transcript(stdin_data: dict | None, account: str = "agy01")
             transcript_path = raw_tp.strip()
 
     if not conv_id:
-        conv_id = get_session_conv_id()
+        conv_id = get_session_conv_id(account=account)
 
     if not transcript_path and conv_id:
         transcript_path = find_active_transcript(conv_id, account=account)
@@ -2278,55 +2474,20 @@ def persist_pane_context(
 
 
 def read_stdin_json(max_wait_sec: float = 0.020) -> dict | None:
-    """Reads JSON from stdin using select.select + os.read(0, 65536) loop up to 20ms total."""
+    """Reads JSON from stdin non-blockingly up to `max_wait_sec` (default 20ms)."""
     try:
-        if sys.stdin.isatty():
+        if platform is None:
             return None
-        fd = sys.stdin.fileno()
-        os.set_blocking(fd, False)
-        deadline = time.monotonic() + max_wait_sec
-        chunks: list[bytes] = []
-
-        while True:
-            rem = deadline - time.monotonic()
-            if rem <= 0:
-                break
-            r, _, _ = select.select([fd], [], [], min(rem, 0.005))
-            if not r:
-                if chunks:
-                    raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
-                    if raw_str.startswith("{"):
-                        try:
-                            return json.loads(raw_str)
-                        except Exception:
-                            pass
-                continue
-
-            try:
-                chunk = os.read(fd, 65536)
-            except BlockingIOError:
-                continue
-            except Exception:
-                break
-
-            if not chunk:
-                break
-
-            chunks.append(chunk)
-            raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
-            if raw_str.startswith("{") and raw_str.endswith("}"):
-                try:
-                    return json.loads(raw_str)
-                except Exception:
-                    pass
-
-        if chunks:
-            raw_str = b"".join(chunks).decode("utf-8", errors="replace").strip()
-            if raw_str.startswith("{"):
-                return json.loads(raw_str)
+        raw = platform.read_stdin_nonblocking(max_wait_sec)
+        if not raw:
+            return None
+        raw_str = raw.decode("utf-8", errors="replace").strip()
+        if not raw_str.startswith("{"):
+            return None
+        data = json.loads(raw_str)
+        return data if isinstance(data, dict) else None
     except Exception:
-        pass
-    return None
+        return None
 
 
 def build_account_badge(account: str, plan_type: str | None) -> str:
@@ -2342,7 +2503,13 @@ def build_account_badge(account: str, plan_type: str | None) -> str:
 
 
 def main() -> None:
-    is_title_mode = ("--title" in sys.argv[1:]) or (os.path.basename(sys.argv[0]) == "agyc-titleline")
+    prog_base = os.path.basename(sys.argv[0]).lower()
+    for ext in (".cmd", ".exe", ".bat"):
+        if prog_base.endswith(ext):
+            prog_base = prog_base[: -len(ext)]
+            break
+    invoked_as = os.environ.pop("AGYC_INVOKED_AS", "").strip().lower()
+    is_title_mode = ("--title" in sys.argv[1:]) or (prog_base == "agyc-titleline") or (invoked_as == "agyc-titleline")
     stdin_data = read_stdin_json(0.020)
     has_stdin = isinstance(stdin_data, dict)
 
@@ -2499,6 +2666,8 @@ if __name__ == "__main__":
         alias = sys.argv[2]
         os.environ["HOME"] = REAL_HOME
         os.environ["AGYC_REAL_HOME"] = REAL_HOME
+        if IS_WINDOWS:
+            os.environ["USERPROFILE"] = REAL_HOME
         do_fetch_and_save_quota(alias)
         sys.exit(0)
     main()

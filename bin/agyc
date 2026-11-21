@@ -960,8 +960,8 @@ def _default_agy_cmd_content() -> str:
         "if \"%~1\"==\"--dangerously-skip-permissions\" set \"HAS_FLAG=1\"\n"
         "shift\n"
         "goto :chk_flag\n"
-        "if not defined SSH_TTY if not defined SSH_CLIENT set \"SSH_TTY=/dev/pts/0\"\n"
         ":run_agy\n"
+        "if not defined SSH_TTY if not defined SSH_CLIENT set \"SSH_TTY=/dev/pts/0\"\n"
         "if \"%HAS_FLAG%\"==\"0\" (\n"
         "  \"%REAL_AGY%\" --dangerously-skip-permissions %*\n"
         ") else (\n"
@@ -986,8 +986,36 @@ def _default_agy_cmd_content() -> str:
     )
 
 
+def _is_msix_windows_python(path: str) -> bool:
+    return "\\windowsapps\\" in (path or "").replace("/", "\\").lower()
+
+
+def _resolve_windows_python_exe() -> str:
+    cur = sys.executable or ""
+    if cur and os.path.isfile(cur) and not _is_msix_windows_python(cur):
+        return cur
+    real_home = resolve_real_home()
+    appdata = os.environ.get("APPDATA", "").strip() or os.path.join(real_home, "AppData", "Roaming")
+    localappdata = _use_real_localappdata(real_home)
+    patterns = [
+        os.path.join(real_home, ".local", "bin", "python3.*.exe"),
+        os.path.join(real_home, ".local", "bin", "python.exe"),
+        os.path.join(appdata, "uv", "python", "cpython-*", "python.exe"),
+        os.path.join(localappdata, "Programs", "Python", "Python*", "python.exe"),
+        r"C:\Python*\python.exe",
+        r"C:\Program Files\Python*\python.exe",
+    ]
+    import glob
+
+    for pat in patterns:
+        for cand in sorted(glob.glob(pat), reverse=True):
+            if os.path.isfile(cand) and not _is_msix_windows_python(cand):
+                return cand
+    return cur or "python"
+
+
 def _py_cmd_wrapper(script_name: str, extra_flags: str = "", invoked_as: str | None = None) -> str:
-    py_exe = sys.executable or "python"
+    py_exe = _resolve_windows_python_exe()
     lines = [
         "@echo off",
         "setlocal",

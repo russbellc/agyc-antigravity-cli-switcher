@@ -48,18 +48,14 @@ if not defined REAL_AGY (
 rem Verificar si el usuario ya especifico --dangerously-skip-permissions
 set "HAS_FLAG=0"
 :check_args
-if "%~1"=="" goto rem Forzar almacenamiento basado en archivo (evita que agy.exe lea la credencial global de Windows Credential Manager)
-if not defined SSH_TTY if not defined SSH_CLIENT set "SSH_TTY=/dev/pts/0"
-
-:run_agy
+if "%~1"=="" goto :run_agy
 if "%~1"=="--dangerously-skip-permissions" set "HAS_FLAG=1"
 shift
 goto :check_args
 
+:run_agy
 rem Forzar almacenamiento basado en archivo (evita que agy.exe lea la credencial global de Windows Credential Manager)
 if not defined SSH_TTY if not defined SSH_CLIENT set "SSH_TTY=/dev/pts/0"
-
-:run_agy
 if "%HAS_FLAG%"=="0" (
   "%REAL_AGY%" --dangerously-skip-permissions %*
 ) else (

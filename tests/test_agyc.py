@@ -1388,6 +1388,41 @@ class TestExportAndImport(unittest.TestCase):
             self.assertEqual(resp["result"]["panes"][0]["pane_id"], "w9:p1")
             self.assertEqual(seen_req[0]["method"], "pane.list")
 
+    def test_39_windows_python_prefers_native_over_msix_and_agy_cmd_valid(self) -> None:
+        self.assertTrue(
+            self.cli._is_msix_windows_python(
+                r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe"
+            )
+        )
+        self.assertFalse(
+            self.cli._is_msix_windows_python(r"C:\Users\dev\.local\bin\python3.14.exe")
+        )
+
+        native_py = os.path.join(self.home1, ".local", "bin", "python3.14.exe")
+        os.makedirs(os.path.dirname(native_py), exist_ok=True)
+        with open(native_py, "wb") as f:
+            f.write(b"MZ")
+
+        fake_msix = (
+            r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps"
+            r"\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe"
+        )
+        with mock.patch.object(self.cli.sys, "executable", fake_msix), mock.patch.object(
+            self.cli, "resolve_real_home", return_value=self.home1
+        ):
+            self.assertEqual(self.cli._resolve_windows_python_exe(), native_py)
+            wrapper_txt = self.cli._py_cmd_wrapper("agyc", invoked_as="agy01")
+            self.assertIn(f'set "AGYC_PY={native_py}"', wrapper_txt)
+            self.assertNotIn("WindowsApps", wrapper_txt)
+
+        agy_cmd_path = os.path.join(REPO_ROOT, "bin", "agy.cmd")
+        with open(agy_cmd_path, "r", encoding="utf-8") as f:
+            agy_cmd_txt = f.read()
+        for txt in (agy_cmd_txt, self.cli._default_agy_cmd_content()):
+            self.assertIn("goto :run_agy", txt)
+            self.assertNotIn("goto rem ", txt)
+            self.assertLess(txt.index(":run_agy"), txt.index("SSH_TTY=/dev/pts/0"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -79,35 +79,75 @@ function New-PyCmdWrapperContent {
 }
 
 function Find-Python310Plus {
-    $candidates = @(
-        @("python"),
-        @("py", "-3"),
-        @("python3")
-    )
-    foreach ($cand in $candidates) {
-        $exe = $cand[0]
-        $preArgs = @()
-        if ($cand.Count -gt 1) { $preArgs = $cand[1..($cand.Count - 1)] }
-        $cmdInfo = Get-Command $exe -ErrorAction SilentlyContinue
-        if (-not $cmdInfo) { continue }
+    param([string]$RealHome = $env:USERPROFILE)
+    $probeCode = "import os, sys; assert sys.version_info >= (3, 10); exe = sys.executable if os.path.exists(sys.executable) else ''; print(exe); print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"
+    $nativeSpecs = [System.Collections.Generic.List[object]]::new()
+    $msixSpecs = [System.Collections.Generic.List[object]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    $addSpec = {
+        param([string]$ExePath, [string[]]$PreArgs = @())
+        if ([string]::IsNullOrWhiteSpace($ExePath)) { return }
+        $key = "$ExePath|$($PreArgs -join ' ')"
+        if (-not $seen.Add($key)) { return }
+        if ($ExePath -match '(?i)\\WindowsApps\\') {
+            $msixSpecs.Add(@{ Exe = $ExePath; PreArgs = $PreArgs })
+        } else {
+            $nativeSpecs.Add(@{ Exe = $ExePath; PreArgs = $PreArgs })
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RealHome)) {
+        Get-ChildItem -Path (Join-Path $RealHome ".local\bin\python*.exe") -File -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | ForEach-Object { & $addSpec $_.FullName }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) {
+        Get-ChildItem -Path (Join-Path $env:APPDATA "uv\python\cpython-*\python.exe") -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | ForEach-Object { & $addSpec $_.FullName }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\Python\Python*\python.exe") -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | ForEach-Object { & $addSpec $_.FullName }
+    }
+    foreach ($pat in @("C:\Python*\python.exe", "C:\Program Files\Python*\python.exe")) {
+        Get-ChildItem -Path $pat -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | ForEach-Object { & $addSpec $_.FullName }
+    }
+    foreach ($candName in @("python", "python3", "py")) {
+        $cmds = Get-Command $candName -All -ErrorAction SilentlyContinue
+        foreach ($c in $cmds) {
+            if (-not $c.Source) { continue }
+            $pre = if ($candName -eq "py") { @("-3") } else { @() }
+            & $addSpec $c.Source $pre
+        }
+    }
+
+    $msixFallback = $null
+    foreach ($spec in (@($nativeSpecs) + @($msixSpecs))) {
         try {
-            $probeArgs = $preArgs + @("-S", "-c", "import os, sys; assert sys.version_info >= (3, 10); exe = sys.executable if os.path.exists(sys.executable) else ''; print(exe); print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
-            $out = & $exe @probeArgs 2>$null
+            $probeArgs = $spec.PreArgs + @("-S", "-c", $probeCode)
+            $out = & $spec.Exe @probeArgs 2>$null
             if ($LASTEXITCODE -eq 0 -and $out.Count -ge 2) {
                 $resolvedExe = "$($out[0])".Trim()
-                if (-not $resolvedExe) { $resolvedExe = $cmdInfo.Source }
-                return @{
-                    Cmd = $exe
-                    PreArgs = $preArgs
+                if (-not $resolvedExe) { $resolvedExe = $spec.Exe }
+                $info = @{
+                    Cmd = $resolvedExe
+                    PreArgs = @()
                     Executable = $resolvedExe
                     Version = "$($out[1])".Trim()
+                    IsMsix = ($resolvedExe -match '(?i)\\WindowsApps\\')
                 }
+                if ($info.IsMsix) {
+                    if (-not $msixFallback) { $msixFallback = $info }
+                    continue
+                }
+                return $info
             }
         } catch {
             continue
         }
     }
-    return $null
+    return $msixFallback
 }
 
 function Invoke-AgycPython {
@@ -147,13 +187,17 @@ Write-Host ""
 # -- Paso 1: Verificar requisitos ---------------------------------------------
 Write-Host "[1/7] Verificando requisitos..." -ForegroundColor White
 
-$PyInfo = Find-Python310Plus
+$PyInfo = Find-Python310Plus -RealHome $RealHome
 if (-not $PyInfo) {
     Write-Host "X Python 3.10+ no encontrado. Instala Python 3.10+ desde python.org o winget." -ForegroundColor Red
     exit 1
 }
 $PythonExe = $PyInfo.Executable
 Write-Host "  Python $($PyInfo.Version): $PythonExe" -ForegroundColor DarkGray
+if ($PyInfo.IsMsix) {
+    Write-Host "! Advertencia: Microsoft Store Python (WindowsApps) usa un contenedor AppX compartido." -ForegroundColor Yellow
+    Write-Host "  Se recomienda instalar Python nativo (uv python install o python.org) para sesiones largas." -ForegroundColor DarkGray
+}
 
 $AgyRealCandidates = @(
     (Join-Path $AgyBinDir "agy-real.exe"),
